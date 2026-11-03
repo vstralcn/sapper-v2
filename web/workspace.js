@@ -159,6 +159,7 @@ function openAgent(role="worker",parent="") {
   $("agent-parent").firstChild.value="";
   for(const a of state.agents.filter(a=>!a.id.startsWith('legacy-'))){const opt=element("option","",`${a.name||a.role_label} · ${a.id.slice(0,6)}`);opt.value=a.id;$("agent-parent").append(opt);}
   $("agent-parent").value=parent;
+  $("agent-basis").required=Boolean(parent);
   $("agent-scope-options").replaceChildren(...state.projects.map(p=>{
     const label=element("label","inline-check","");
     const input=document.createElement("input");input.type="checkbox";input.name="workspace_scope";input.value=p.id;
@@ -217,6 +218,7 @@ function renderAgentCard(a) {
   title.append(element("span","",a.name||a.role_label),element("span","badge",formatAgentStatus(a)));
   node.append(title,element("p","agent-sub",`${a.role_label} · ${a.execution_mode==="cli"?"原 CLI 流程":a.execution_mode==="print"?"限时单次":"原生交互"} · ${a.profile_name}`));
   if(a.parent_agent_id)node.append(element("p","agent-parent","派发自 "+a.parent_agent_id.slice(0,8)));
+  if(a.intent_id)node.append(element("p","agent-parent","派单意图 "+a.intent_id));
   if(a.shared_context){const c=a.shared_context;node.append(element("p","agent-context",contextStatus(c)));}
   node.append(element("p","agent-mission",a.mission));
   if(a.commander_monitor){
@@ -370,6 +372,7 @@ $("start-run").textContent="打开 Claude Code";
 $("start-run").onclick=()=>openAgent();
 $("new-agent").onclick=()=>openAgent();
 $("advanced-run").onclick=()=>openRun();
+$("agent-parent").onchange=()=>{$("agent-basis").required=Boolean($("agent-parent").value);};
 $("agent-role").onchange=()=>{$("agent-location").value=$("agent-role").value==="worker"?"root":"agent";updateRoleFields();};
 $("enable-workspace").onclick=()=>guarded(async()=>{
   await workspaceApi("enable",{method:"POST",body:{}});await refreshProjects();toast("项目级 hooks 与说明已接入，用户内容已保留");
@@ -398,6 +401,8 @@ submit("bind-form",async form=>{
 });
 submit("agent-form",async form=>{
   const data=Object.fromEntries(form);data.minutes=Number(data.minutes);
+  const basis=String(data.basis||"").trim();delete data.basis;
+  if(basis)data[/^i[0-9]+$/.test(basis)?"intent_id":"from"]=basis;
   data.workspace_scope=[state.project.id,...(data.role==="commander"?form.getAll("workspace_scope").filter(id=>id!==state.project.id):[])];
   data.skip_permissions=form.has("skip_permissions");data.watchdog=form.has("watchdog");data.request_id=crypto.randomUUID();
   const run=await workspaceApi("sessions",{method:"POST",body:data});$("agent-dialog").close();setTab("workspace");await refreshTask();

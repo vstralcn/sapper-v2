@@ -318,11 +318,16 @@ class Store:
         requires_confirmation: bool = False,
         title: str | None = None,
         doc: str | None = None,
+        *,
+        assigned_worker: str | None = None,
     ) -> dict:
         if not isinstance(description, str) or not description.strip():
             raise FGError("intent description cannot be empty")
         if not isinstance(creator, str) or not creator.strip():
             raise FGError("intent creator cannot be empty")
+        if assigned_worker is not None and (not isinstance(assigned_worker, str)
+                                            or not assigned_worker.strip() or requires_confirmation):
+            raise FGError("assignment needs a worker and an intent ready to be claimed")
         if not isinstance(from_ids, list) or any(not isinstance(fid, str) for fid in from_ids):
             raise FGError("intent `from` ids must be a list of strings")
         # A hyper-edge only needs each dependency once; de-duplicate model or
@@ -339,8 +344,8 @@ class Store:
                 "description": description.strip(),
                 "doc": (doc.strip() if doc and doc.strip() else None),
                 "creator": creator,
-                "status": "open",
-                "worker": None,
+                "status": "claimed" if assigned_worker else "open",
+                "worker": assigned_worker,
                 "requires_confirmation": requires_confirmation,
                 "confirmed_at": None,
                 "created_at": now_iso(),
@@ -535,9 +540,11 @@ class Store:
             self.save_intent(intent)
             return intent
 
-    def release_intent(self, iid: str, worker: str) -> dict:
+    def release_intent(self, iid: str, worker: str, *, if_owned: bool = False) -> dict:
         with self.locked():
             intent = self.get_intent(iid)
+            if if_owned and (intent["to"] is not None or intent.get("worker") != worker):
+                return intent
             if intent["to"] is not None:
                 raise FGError(f"intent {iid} already concluded")
             if intent.get("worker") and intent["worker"] != worker:
@@ -1787,7 +1794,7 @@ def cmd_flag(args) -> int:
     fact = store.add_fact(
         description=description,
         creator=args.creator,
-        source_intent=None,
+        source_intent=args.from_intent,
         title=args.title or "flag",
         kind="flag",
         data={"value": value, "challenge": challenge, "status": "recorded"},
@@ -4628,6 +4635,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("value", help="the flag string, e.g. flag{...}")
     sp.add_argument("--challenge", "-c", default=None, help="challenge id on the platform")
+    sp.add_argument("--from-intent", help="close this intent with the captured flag fact")
     sp.add_argument("--submit", action="store_true",
                     help="also submit via the arena API (requires .sapper/arena.json)")
     sp.add_argument("--title", "-t", default=None)

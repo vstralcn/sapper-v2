@@ -53,11 +53,17 @@ def check_hook():
 check_hook()
 if args[-1]=='SPAWN_SCOUT':
     worker=Path(os.environ['SAPPER_TEST_REPO'])/'docker/commander/worker.sh'
-    subprocess.run(['bash',str(worker),'spawn',root.name,'--role','scout','--p','--minutes','1','--mission','RECORD_EVIDENCE'],check=True)
+    seed=subprocess.check_output(['sapper','fact','challenge.txt is supplied','--creator',aid],text=True).strip()
+    second=subprocess.check_output(['sapper','fact','workspace contains one challenge directory','--creator',aid],text=True).strip()
+    subprocess.run(['bash',str(worker),'spawn',root.name,'--from',seed+','+second,'--role','scout','--p','--minutes','1','--mission','RECORD_EVIDENCE'],check=True)
 if '-p' in args:
     (root/'outputs').mkdir(exist_ok=True)
     (root/'outputs'/aid).write_text((root/'challenge.txt').read_text())
-    subprocess.run(['sapper','fact','fixture read the actual challenge','--creator',aid],check=True)
+    iid=os.environ.get('SAPPER_INTENT_ID')
+    if iid and args[-1]!='WAIT_FOR_INTERRUPT':
+        subprocess.run(['sapper','done',iid,'--worker',aid,'--fact','fixture read the actual challenge'],check=True)
+    else:
+        subprocess.run(['sapper','fact','fixture read the actual challenge','--creator',aid],check=True)
     if args[-1]=='WAIT_FOR_INTERRUPT':
         def interrupted(*_):
             print(json.dumps({'type':'result','subtype':'interrupted','result':'saved original evidence'}),flush=True)
@@ -119,6 +125,42 @@ class WorkspaceBindingTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_assignment_launch_failure_releases_same_intent_for_retry(self):
+        manager = self.app.workspaces
+        pid = manager.bind({"path": str(self.question)})["id"]
+        manager.enable(pid, {})
+        manager._capabilities = dict(available=True, session_id=True, resume=True, append_system=True)
+        store = self.app.store(pid)
+        basis = store.add_fact("fixture archive supplied", "user")["id"]
+        with mock.patch.object(manager, "agent", return_value={"workspace_id": pid, "desired_state": "running"}):
+            with self.assertRaisesRegex(WorkspaceError, "派单需要"):
+                manager.create_session(pid, {"parent_agent_id": "parent", "mission": "inspect archive"})
+        with self.assertRaisesRegex(sapper.FGError, "does not exist"):
+            manager.create_session(pid, {"from": "f998", "mission": "inspect archive"})
+        self.assertEqual(store.list_intents(), [])
+        with mock.patch.object(self.app, "start", side_effect=WebError("no tmux", 503)):
+            with self.assertRaisesRegex(WorkspaceError, "--intent i001"):
+                manager.create_session(pid, {"from": basis, "mission": "inspect archive"})
+        intent, = store.list_intents()
+        self.assertEqual((intent["status"], intent["worker"], intent["to"]), ("open", None, None))
+        with mock.patch.object(self.app, "start", return_value={"id": "test-run"}) as start:
+            manager.create_session(pid, {"intent_id": intent["id"], "mission": "check the header first"})
+            native = start.call_args.kwargs["native"]
+            self.assertEqual(native["env"]["SAPPER_INTENT_ID"], intent["id"])
+            self.assertEqual(native["argv"][-1], "inspect archive\n派发补充：check the header first")
+            with self.assertRaisesRegex(sapper.FGError, "claimed by"):
+                manager.create_session(pid, {"intent_id": intent["id"]})
+            gated = store.add_intent([basis], "requires approval", "user", requires_confirmation=True)
+            with self.assertRaisesRegex(sapper.FGError, "requires confirmation"):
+                manager.create_session(pid, {"intent_id": gated["id"]})
+            start.assert_called_once()
+        with contextlib.redirect_stdout(None):
+            self.assertEqual(sapper.main(["--store", str(store.root), "flag", "fixture-flag",
+                                          "--from-intent", intent["id"], "--creator", native["agent_id"]]), 0)
+        result = store.get_fact(store.get_intent(intent["id"])["to"])
+        self.assertEqual((result["kind"], result["source_intent"]), ("flag", intent["id"]))
+        self.assertEqual(sapper.validate_graph(store), [])
 
     def test_binding_is_stable_and_does_not_write_to_existing_question(self):
         before = list(self.question.iterdir())
@@ -358,7 +400,9 @@ class NativeWorkspaceTests(unittest.TestCase):
         def short_budget(pid, data, *, native):
             return start(pid, data, native={**native, "timeout_seconds": 1})
         with mock.patch.object(self.app, "start", side_effect=short_budget):
-            run = self.app.workspaces.create_session(self.pid, {"execution_mode": "print", "mission": "WAIT_FOR_INTERRUPT"})
+            store = self.app.store(self.pid)
+            basis = store.add_fact("fixture input exists", "user")["id"]
+            run = self.app.workspaces.create_session(self.pid, {"from": basis, "execution_mode": "print", "mission": "WAIT_FOR_INTERRUPT"})
         rid, aid = run["id"], run["agent_id"]
         self.until(lambda: self.app.run_info(rid)["status"] == "timed_out")
         self.until(lambda: self.app.tmux("has-session", "-t", run["session"]).returncode != 0)
@@ -366,9 +410,13 @@ class NativeWorkspaceTests(unittest.TestCase):
         time.sleep(3.2)
         self.assertEqual(self.app.workspaces.agent(aid)["run_ids"], [rid])
         self.assertEqual((self.question / "outputs" / aid).read_text(), "read this original question")
+        self.assertIsNone(store.get_intent(run["intent_id"])["to"])
         resumed = self.app.workspaces.resume(aid, {"minutes": 2, "continuation": "VERIFY_EXISTING_EVIDENCE"})
         self.until(lambda: self.app.run_info(resumed["id"])["status"] == "exited")
         self.assertEqual(resumed["claude_session_id"], run["claude_session_id"])
+        intent, = store.list_intents()
+        self.assertEqual(intent["id"], resumed["intent_id"])
+        self.assertEqual(store.get_fact(intent["to"])["source_intent"], run["intent_id"])
         self.assertEqual(resumed["timeout_seconds"], 120)
         calls = [json.loads(line) for line in (self.base / "calls.jsonl").read_text().splitlines()]
         self.assertEqual(calls[-1]["flag"], "--resume")
@@ -399,7 +447,8 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.assertEqual(json.loads(resumed.stdout)["claude_session_id"], run["claude_session_id"])
 
     def test_delete_running_role_preserves_other_workspace_and_evidence(self):
-        run = self.launch(role="general", location="agent")
+        basis = self.app.store(self.pid).add_fact("challenge supplied", "operator")["id"]
+        run = self.launch(role="general", location="agent", **{"from": [basis]})
         aid = run["agent_id"]
         directory = Path(self.app.workspaces.agent(aid)["cwd"])
         (directory / "evidence.txt").write_text("keep this result")
@@ -412,6 +461,8 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.until(lambda: "NATIVE_READY" in self.app.log(survivor["id"])["text"])
 
         self.app.workspaces.delete_agent(aid)
+        released = self.app.store(self.pid).get_intent(run["intent_id"])
+        self.assertEqual((released["worker"], released["status"], released["to"]), (None, "open", None))
         self.assertEqual(self.app.run_info(run["id"])["status"], "stopped")
         self.assertNotEqual(self.app.tmux("has-session", "-t", run["session"]).returncode, 0)
         self.assertEqual(self.app.tmux("has-session", "-t", survivor["session"]).returncode, 0)
@@ -434,7 +485,8 @@ class NativeWorkspaceTests(unittest.TestCase):
 
     def test_delete_parent_keeps_child_running_and_resumable(self):
         parent = self.launch(role="general")
-        child = self.launch(parent_agent_id=parent["agent_id"])
+        basis = self.app.store(self.pid).add_fact("fixture present", "test")["id"]
+        child = self.launch(parent_agent_id=parent["agent_id"], **{"from": basis})
         self.app.workspaces.delete_agent(parent["agent_id"])
         a = self.app.workspaces.agent(child["agent_id"])
         self.assertIsNone(a["parent_agent_id"])
@@ -481,7 +533,14 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.assertEqual((Path(scout["cwd"]) / "CLAUDE.md").read_text(), "@../../CLAUDE.md\n")
         self.assertEqual((self.question / "outputs" / scout["id"]).read_text(), "read this original question")
         facts = self.app.store(self.pid).list_facts()
-        self.assertTrue(any(f.get("creator") == scout["id"] for f in facts))
+        intent, = self.app.store(self.pid).list_intents()
+        result = next(f for f in facts if f.get("creator") == scout["id"])
+        self.assertEqual(intent["from"], ["f001", "f002"])
+        self.assertEqual((intent["creator"], intent["worker"]), (commander["agent_id"], scout["id"]))
+        self.assertEqual((intent["id"], intent["to"], intent["status"]), (scout["intent_id"], result["id"], "done"))
+        self.assertEqual(result["source_intent"], intent["id"])
+        agent = next(a for a in self.app.workspaces.strategy_board([self.pid])["agents"] if a["id"] == scout["id"])
+        self.assertEqual((agent["intent_status"], agent["result_fact"]), ("done", result["id"]))
         self.assertEqual(sapper.validate_graph(self.app.store(self.pid)), [])
 
     def test_terminal_raw_input_resize_and_log_source(self):
@@ -572,7 +631,8 @@ class NativeWorkspaceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SAPPER_MAX_WORKERS": "1"}):
             with self.assertRaises(WorkspaceError):
                 self.app.workspaces.create_session(p["id"], {"parent_agent_id": commander["agent_id"]})
-        second = self.app.workspaces.create_session(p["id"], {"mission": "other", "parent_agent_id": commander["agent_id"]})
+        basis = self.app.store(p["id"]).add_fact("other workspace input", "test")["id"]
+        second = self.app.workspaces.create_session(p["id"], {"mission": "other", "from": basis, "parent_agent_id": commander["agent_id"]})
         self.until(lambda: "NATIVE_READY" in self.app.log(second["id"])["text"])
         self.app.workspaces.stop_workspace(self.pid)
         self.assertEqual(self.app.run_info(first["id"])["status"], "stopped")
@@ -582,7 +642,7 @@ class NativeWorkspaceTests(unittest.TestCase):
         with self.assertRaises(WorkspaceError):
             self.app.workspaces.create_session(self.pid, {"parent_agent_id": commander["agent_id"]})
         self.assertEqual(len(self.app.store(self.pid).list_facts()), 1)
-        self.assertEqual(len(self.app.store(p["id"]).list_facts()), 1)
+        self.assertEqual(len(self.app.store(p["id"]).list_facts()), 2)
         self.app.workspaces.stop_workspace(p["id"])
         self.assertEqual(self.app.workspaces.agent(commander["agent_id"])["desired_state"], "stopped")
         self.assertEqual(self.app.run_info(second["id"])["status"], "stopped")

@@ -665,7 +665,7 @@ class Console:
                     "command": shlex.join(argv), "cwd": cwd,
                     "profile_name": profile["name"] if profile else "继承原环境"}
             if native:
-                info.update({k: native[k] for k in ("agent_id", "claude_session_id", "role", "timeout_seconds", "native_operation", "execution_mode", "output_format") if k in native})
+                info.update({k: native[k] for k in ("agent_id", "claude_session_id", "intent_id", "role", "timeout_seconds", "native_operation", "execution_mode", "output_format") if k in native})
             info["supervisor_version"] = 1
             private_json(run_dir / "run.json", info)
             private_json(run_dir / "launch.json", {"argv": argv, "env": env})

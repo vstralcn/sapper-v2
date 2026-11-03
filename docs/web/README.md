@@ -51,7 +51,7 @@
 
 新增工作区可绑定已有目录、项目级启用 hooks 与说明，在题目根目录打开原 Claude Code。辅助角色各用独立 cwd，共享原图；可选择同目录并行。每个新角色绑定原生 UUID，使用 `--resume UUID` 精确恢复。界面显示指挥官／将军／侦察兵／执行者／验证者、父子派发、模型、任务、目录与图贡献；watchdog 单独显示为脚本服务。
 
-Web 新建角色加载 `sapper-native-roles/3`：Commander 按原 4.6／4.10 条件派发，General 可按原规则派最多两个短时侦察／验证小队，并负责查看和回收；新增阶段成果保存、续时与原会话恢复说明。`board --json` 提供真实图证据、HELP／REPORT、Flag 状态、父子角色和限时运行观测；不会新增强制派兵或平台提交授权。创建窗口可直接核对实际基础提示词和来源。
+Web 新建角色加载 `sapper-native-roles/4`：Commander 按原 4.6／4.10 条件派发，General 可按原规则派最多两个短时侦察／验证小队，并负责查看和回收；新增阶段成果保存、续时与原会话恢复说明。`board --json` 提供真实图证据、HELP／REPORT、Flag 状态、父子角色和限时运行观测；不会新增强制派兵或平台提交授权。创建窗口可直接核对实际基础提示词和来源。
 
 受管交互式指挥官恢复时会发送继续消息，并可由 watchdog 以真实读板回执确认续轮；详见[指挥官续轮](./14-commander-liveness.md)。其他 TUI 角色的恢复语义仍见[恢复规划](./12-resume-continuation-plan.md)，旧后台 shell 不会随历史恢复。限时 print 会话已补上流式观测、运行中续时、分阶段停止和恢复后的继续消息，详见[生命周期修复](./13-print-run-lifecycle.md)。
 
@@ -64,3 +64,8 @@ Web 新建角色加载 `sapper-native-roles/3`：Commander 按原 4.6／4.10 条
 已有题目目录直接在网页文件夹选择器中点选并绑定，无需启动时增加允许目录。网页选择“打开题目目录 → 启用 sapper → 打开 Claude Code”，详见[启动与使用](./05-running.md)。
 
 首版的核心验收是：相同任务和配置下，从网页与从原终端启动使用同一 agent、同一命令／工具／记忆与恢复机制；界面能管理和观察，不接管 agent 的解题策略。
+
+
+工作区指挥官派单时，先在目标工作区用 `sapper graph` 选取已有依据，再运行 `worker.sh spawn <工作区> --from f001,f003 --mission "验证读入长度"`。已有合适的开放任务可用 `--intent i002` 领取。首次侦察先把确实收到的题面或附件记为起点。Web 启动子角色时在“派单依据”输入相同的 ID。工作区、依据和结果均使用原来的共享图。
+
+子角色可从 `$SAPPER_INTENT_ID` 读取派单。中途的独立验证可另建 intent，最终用 `sapper done "$SAPPER_INTENT_ID" --worker "$SAPPER_AGENT_ID" --fact "已验证结果"` 结束本次任务。捕获 flag 本身就是交付时可用 `sapper flag VALUE -c CHALLENGE --from-intent "$SAPPER_INTENT_ID" --creator "$SAPPER_AGENT_ID"`。限时退出或暂停保留未完成任务供原会话恢复；改派时先停止原角色并用 `sapper release i002 --worker <原角色ID>` 释放，再用 `--intent i002` 派给新角色。发送消息、恢复旧会话不会创建新任务。

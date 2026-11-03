@@ -372,7 +372,7 @@ class Workspaces:
         for agent in agents:
             row = {k: agent.get(k) for k in (
                 "id", "workspace_id", "workspace_scope", "parent_agent_id", "role",
-                "role_label", "name", "status", "pane_id", "execution_mode",
+                "role_label", "name", "status", "pane_id", "execution_mode", "intent_id",
                 "created_at", "minutes", "desired_state", "timeout_seconds", "deadline_epoch", "activity", "stop_reason")}
             row["mission"] = (agent.get("mission") or "")[:500]
             compact_agents.append(row)
@@ -382,6 +382,11 @@ class Workspaces:
             try:
                 graph = self.app.graph(wid)
                 facts, intents = graph["facts"], graph["intents"]
+                by_intent = {i["id"]: i for i in intents}
+                for agent in compact_agents:
+                    if agent["workspace_id"] == wid and agent["intent_id"] in by_intent:
+                        assignment = by_intent[agent["intent_id"]]
+                        agent.update(intent_status=assignment["status"], result_fact=assignment["to"])
                 kinds, flags = {}, {}
                 help_notes, reports, latest = [], [], ""
                 for fact in facts:
@@ -411,7 +416,7 @@ class Workspaces:
                     if sapper.is_open(intent):
                         open_intents.append({k: intent.get(k) for k in (
                             "id", "title", "description", "status", "worker",
-                            "creator", "created_at", "requires_confirmation", "confirmed_at")})
+                            "creator", "created_at", "requires_confirmation", "confirmed_at", "from")})
                 graph_data = {"status": graph["project"]["status"], "goal": graph["project"]["goal"],
                               "facts_total": sum(f.get("id") != "goal" for f in facts),
                               "kinds": kinds, "flags": flags, "open_intents": open_intents[:20],
@@ -495,14 +500,6 @@ class Workspaces:
         location = data.get("location", "root" if role == "worker" and not parent else "agent")
         cwd = Path(existing["cwd"]) if existing else root if location == "root" else root / ".sapper-agents" / aid
         self.app.inside(cwd, root)
-        if cwd != root and not existing:
-            cwd.mkdir(parents=True, exist_ok=False)
-            (cwd / ".sapper").symlink_to(root / ".sapper", target_is_directory=True)
-            # Hooks are opt-in at exactly this cwd; do not rely on ancestor discovery.
-            settings = cwd / ".claude/settings.json"
-            sapper._load_settings_patch().add(settings, str(REPO / "lib/sapper-hook.py"))
-            # Relative import avoids whitespace parsing in absolute paths.
-            (cwd / "CLAUDE.md").write_text("@../../CLAUDE.md\n")
         scope = (existing or {}).get("workspace_scope") or data.get("workspace_scope") or [pid]
         if not isinstance(scope, list) or any(not isinstance(i, str) for i in scope):
             raise WorkspaceError("工作区范围格式不正确")
@@ -510,26 +507,26 @@ class Workspaces:
             self.app.project(wid)
         if not scope or (not existing and pid not in scope) or (role != "commander" and scope != [pid]):
             raise WorkspaceError("只有指挥官可关联多个工作区，且范围必须包含当前工作区")
-        mission = (existing or {}).get("mission") or text(data, "mission", project["goal"])
+        iid = existing.get("intent_id") if existing else text(data, "intent_id")
+        from_ids = [] if existing else data.get("from", [])
+        if isinstance(from_ids, str):
+            from_ids = sapper.parse_from(text(data, "from"))
+        if not isinstance(from_ids, list) or any(not isinstance(f, str) for f in from_ids):
+            raise WorkspaceError("派单依据必须是 fact ID 列表")
+        if iid and from_ids:
+            raise WorkspaceError("派单请选择已有 intent 或依据 fact，两者只需一种")
+        if parent and not existing and not (iid or from_ids):
+            raise WorkspaceError("派单需要 --intent iNNN 或 --from fNNN；首次探索请先记录题面或附件等已知事实")
+        store = self.app.store(pid)
+        intent = store.get_intent(iid) if iid else None
+        mission = (existing or {}).get("mission") or text(data, "mission")
+        if intent and not existing:
+            briefing = mission if mission != intent["description"] else ""
+            mission = intent["description"] + ("\n派发补充：" + briefing if briefing else "")
+        mission = mission or project["goal"]
         context = self.app.global_context()
         shared = sapper_context.prompt(context)
         role_prompt = self.role_prompt(role, project, scope)
-        argv = [self.app.claude_bin, "--resume" if existing else "--session-id", sid]
-        if profile:
-            argv += ["--model", profile["model"]]
-        if data.get("skip_permissions") or (existing or {}).get("skip_permissions"):
-            argv += ["--dangerously-skip-permissions"]
-        if cwd != root and cap.get("add_dir"):
-            argv += ["--add-dir", str(root)]
-        argv += ["--append-system-prompt", "\n\n".join(p for p in (role_prompt, shared) if p)]
-        if mode == "print":
-            argv += ["-p", "--output-format", "stream-json", "--verbose"]
-        if not existing or mode == "print" or role == "commander":
-            continuation = mission
-            if existing:
-                continuation = (text(data, "continuation") if "continuation" in data else
-                                "继续原任务。先核对共享图和已保存文件，保留有效成果，从未完成的步骤继续；不要仅因恢复而重复探索。\n原任务：" + mission)
-            argv += [continuation]
         record = existing or {"id": aid, "workspace_id": pid, "workspace_scope": scope,
                               "role": role, "role_source": "original-launch-parameters",
                               "parent_agent_id": parent, "claude_session_id": sid,
@@ -543,28 +540,71 @@ class Workspaces:
         record["desired_state"] = "running"
         record["role_prompt_version"] = sapper_roles.PROMPT_VERSION
         record["role_prompt_sources"] = list(sapper_roles.ROLE_SPECS[role].sources)
-        record["role_prompt_sha256"] = hashlib.sha256(role_prompt.encode()).hexdigest()
         record["context_revision"] = context["revision"] if shared and cap.get("append_system") else 0
         record["minutes"] = minutes
         for key in ("external_session", "external_pane"):
             record.pop(key, None)
-        self.save_agent(record)
-        if data.get("watchdog") and role == "commander" and not existing:
-            self.start_watchdog(pid)
-        env = {"SAPPER_MODE": "workspace", "SAPPER_WEB_STATE": str(self.app.state),
-               "SAPPER_WORKSPACE_ID": pid, "SAPPER_WORKSPACE_PATH": str(root), "SAPPER_AGENT_ID": aid,
-               "SAPPER_PARENT_AGENT_ID": parent or "", "SAPPER_WORKSPACE_ALLOWED_ROOTS": json.dumps([str(r) for r in self.app.workspace_roots]),
-               "SAPPER_CLAUDE_BIN": self.app.claude_bin, "SAPPER_TMUX_SOCKET": self.app.tmux_socket or ""}
-        env[sapper_context.PROMPT_ENV] = str(record["context_revision"]) if record["context_revision"] else ""
+        # Keep the same graph identity across supervised runs. Process exit
+        # alone never concludes an intent.
+        active_intent = None
+        if from_ids:
+            active_intent = store.add_intent(from_ids, mission, parent or "user", assigned_worker=aid)
+        elif iid and not (existing and intent["to"] is not None):
+            active_intent = store.claim_intent(iid, aid)
         try:
+            if active_intent:
+                iid = record["intent_id"] = active_intent["id"]
+                role_prompt += (f"\nAssigned graph intent: {iid}; source facts: {', '.join(active_intent['from'])}. "
+                                "Read these before work. SAPPER_INTENT_ID identifies your assigned result.")
+            elif iid:
+                role_prompt += f"\nPrevious graph intent {iid} already concluded to {intent['to']}."
+            record["role_prompt_sha256"] = hashlib.sha256(role_prompt.encode()).hexdigest()
+            argv = [self.app.claude_bin, "--resume" if existing else "--session-id", sid]
+            if profile:
+                argv += ["--model", profile["model"]]
+            if data.get("skip_permissions") or (existing or {}).get("skip_permissions"):
+                argv += ["--dangerously-skip-permissions"]
+            if cwd != root and cap.get("add_dir"):
+                argv += ["--add-dir", str(root)]
+            argv += ["--append-system-prompt", "\n\n".join(p for p in (role_prompt, shared) if p)]
+            if mode == "print":
+                argv += ["-p", "--output-format", "stream-json", "--verbose"]
+            if not existing or mode == "print" or role == "commander":
+                continuation = mission
+                if existing:
+                    continuation = (text(data, "continuation") if "continuation" in data else
+                                    "继续原任务。先核对共享图和已保存文件，保留有效成果，从未完成的步骤继续；不要仅因恢复而重复探索。\n原任务：" + mission)
+                argv += [continuation]
+            if cwd != root and not existing:
+                cwd.mkdir(parents=True, exist_ok=False)
+                (cwd / ".sapper").symlink_to(root / ".sapper", target_is_directory=True)
+                # Hooks are opt-in at exactly this cwd; do not rely on ancestor discovery.
+                settings = cwd / ".claude/settings.json"
+                sapper._load_settings_patch().add(settings, str(REPO / "lib/sapper-hook.py"))
+                # Relative import avoids whitespace parsing in absolute paths.
+                (cwd / "CLAUDE.md").write_text("@../../CLAUDE.md\n")
+            self.save_agent(record)
+            if data.get("watchdog") and role == "commander" and not existing:
+                self.start_watchdog(pid)
+            env = {"SAPPER_MODE": "workspace", "SAPPER_WEB_STATE": str(self.app.state),
+                   "SAPPER_INTENT_ID": active_intent["id"] if active_intent else "",
+                   "SAPPER_WORKSPACE_ID": pid, "SAPPER_WORKSPACE_PATH": str(root), "SAPPER_AGENT_ID": aid,
+                   "SAPPER_PARENT_AGENT_ID": parent or "", "SAPPER_WORKSPACE_ALLOWED_ROOTS": json.dumps([str(r) for r in self.app.workspace_roots]),
+                   "SAPPER_CLAUDE_BIN": self.app.claude_bin, "SAPPER_TMUX_SOCKET": self.app.tmux_socket or ""}
+            env[sapper_context.PROMPT_ENV] = str(record["context_revision"]) if record["context_revision"] else ""
             run = self.app.start(pid, {**data, "kind": "claude-native", "profile_id": profile_id}, native={
                 "argv": argv, "cwd": str(cwd), "env": env, "agent_id": aid, "claude_session_id": sid,
-                "role": role, "execution_mode": mode,
+                "role": role, "execution_mode": mode, "intent_id": iid or None,
                 "output_format": "stream-json" if mode == "print" else None,
                 "timeout_seconds": int(record["minutes"]) * 60 if mode == "print" else None})
-        except (sapper.FGError, OSError):
+        except Exception as exc:
+            if active_intent:
+                store.release_intent(iid, aid, if_owned=True)
             record["desired_state"] = "stopped"
             self.save_agent(record)
+            if active_intent:
+                raise WorkspaceError(f"启动失败，请查看任务 {iid}；开放任务可用 --intent {iid} 重派：{exc}",
+                                     getattr(exc, "status", 409)) from exc
             raise
         record.update(run_id=run["id"], updated_at=sapper.now_iso())
         record["run_ids"].append(run["id"])
@@ -618,6 +658,8 @@ class Workspaces:
         else:
             self.mark_stopped(aid)
         a = self.agent(aid)
+        if a.get("intent_id"):
+            self.app.store(a["workspace_id"]).release_intent(a["intent_id"], aid, if_owned=True)
         a.update(deleted_at=sapper.now_iso(), desired_state="stopped")
         self.save_agent(a)
         # Surviving children become independent roles and remain resumable.
@@ -716,6 +758,9 @@ def worker(argv):
     parser.add_argument("target", nargs="?")
     parser.add_argument("body", nargs="?")
     parser.add_argument("--mission", default="")
+    assignment = parser.add_mutually_exclusive_group()
+    assignment.add_argument("--from", dest="from_ids", default="", help="依据的 fact ID，以逗号分隔")
+    assignment.add_argument("--intent", default="", help="领取已有 intent ID")
     parser.add_argument("--role", choices=list(ROLES), default=None)
     parser.add_argument("--general", action="store_true")
     parser.add_argument("--minutes", type=int)
@@ -762,6 +807,8 @@ def worker(argv):
         candidates = [p for p in app.projects() if p["id"] in scope and args.target in (p["id"], p["name"])]
         if len(candidates) != 1:
             raise WorkspaceError("派发目标不在当前指挥官的明确工作区范围内")
+        if not (args.from_ids or args.intent):
+            raise WorkspaceError("spawn 需要 --from fNNN 或 --intent iNNN。首次派单请先记录题面等已知事实。")
         profile = args.profile
         if args.model:
             parent_profile = next((p for p in app.config()["profiles"] if p["id"] == (manager.agent(parent).get("profile_id") if parent else None)), {})
@@ -770,7 +817,7 @@ def worker(argv):
         run = manager.create_session(candidates[0]["id"], {
             "role": "general" if args.general else args.role or "worker", "parent_agent_id": parent,
             "execution_mode": "print" if args.p else "tui", "minutes": args.minutes if args.minutes is not None else 10,
-            "mission": args.mission or candidates[0]["goal"], "name": args.name or "",
+            "mission": args.mission, "from": args.from_ids, "intent_id": args.intent, "name": args.name or "",
             "profile_id": profile or (manager.agent(parent).get("profile_id") if parent else ""),
             "skip_permissions": manager.agent(parent).get("skip_permissions", False) if parent else False})
         print(json.dumps(run, ensure_ascii=False))
