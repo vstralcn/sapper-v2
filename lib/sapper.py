@@ -27,6 +27,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1446,7 +1447,12 @@ def run_claude(
         raise FGError("claude timeout must be at least 1 second")
     if not isinstance(model, str) or not model.strip():
         raise FGError("claude model cannot be empty")
-    prefix = os.environ.get("SAPPER_BIN", "claude").split()
+    try:
+        prefix = shlex.split(os.environ.get("SAPPER_BIN", "claude"))
+    except ValueError as exc:
+        raise FGError("SAPPER_BIN command has invalid quoting") from exc
+    if not prefix:
+        raise FGError("SAPPER_BIN command cannot be empty")
     argv = prefix + [
         "-p",
         "--output-format", "json",
@@ -1454,6 +1460,13 @@ def run_claude(
     ]
     if skip_permissions:
         argv.append("--dangerously-skip-permissions")
+    import sapper_context
+    context = sapper_context.load()
+    shared = sapper_context.prompt(context)
+    engine_env = None
+    if os.environ.get(sapper_context.CONTEXT_ENV):
+        append_system = "\n\n".join(p for p in (append_system, shared) if p)
+        engine_env = {sapper_context.PROMPT_ENV: str(context["revision"]) if shared else ""}
     if append_system:
         argv += ["--append-system-prompt", append_system]
     engine = prefix[0]
@@ -1463,6 +1476,7 @@ def run_claude(
         try:
             return _run_engine_once(
                 argv, prompt, timeout, cwd, engine,
+                env={**os.environ, **engine_env} if engine_env is not None else None,
             )
         except FGError as exc:
             last_error = exc
@@ -1485,7 +1499,7 @@ def run_claude(
     raise last_error
 
 
-def _run_engine_once(argv, prompt, timeout, cwd, engine) -> dict:
+def _run_engine_once(argv, prompt, timeout, cwd, engine, *, env=None) -> dict:
     try:
         proc = subprocess.run(
             argv,
@@ -1494,6 +1508,7 @@ def _run_engine_once(argv, prompt, timeout, cwd, engine) -> dict:
             text=True,
             timeout=timeout,
             cwd=str(cwd),
+            env=env,
         )
     except FileNotFoundError:
         raise FGError(f"`{engine}` CLI not found on PATH; install it or fix SAPPER_BIN.")
@@ -1903,7 +1918,9 @@ def cmd_kb(args) -> int:
             print("read full entries with: sapper kb show <id>")
             return 0
         if args.action == "import":
-            target = Path(args.target)
+            if not (args.path or args.target):
+                raise FGError("kb import needs a path or --path")
+            target = Path(args.path or args.target)
             if not target.exists():
                 raise FGError(f"import path not found: {target}")
             files = sorted(target.glob("*.md")) if target.is_dir() else [target]
@@ -2324,7 +2341,7 @@ def _active_workers(session: str) -> set[str]:
     proc = _tmux("list-windows", "-t", session, "-F", "#W", check=False)
     if proc.returncode != 0:
         return set()
-    return {w[2:] for w in proc.stdout.split() if w.startswith("w-")}
+    return {w[2:] for w in proc.stdout.splitlines() if w.startswith("w-")}
 
 
 def _hire_worker(cfg: dict, target: str, minutes: int, max_steps: int = 8,
@@ -2338,10 +2355,11 @@ def _hire_worker(cfg: dict, target: str, minutes: int, max_steps: int = 8,
         return False
     if _tmux("has-session", "-t", session, check=False).returncode != 0:
         _tmux("new-session", "-d", "-s", session, "-n", "commander")
+    _sync_managed_tmux(session)
     engine = _sapper_engine_prefix()
     base = Path(cfg.get("_base_dir", ".")).resolve()
     command = (
-        f"cd {base} && {engine} --store {root}/{target}/.sapper auto "
+        f"cd {shlex.quote(str(base))} && {engine} --store {shlex.quote(str(Path(root) / target / '.sapper'))} auto "
         f"--minutes {minutes} --max-steps {max_steps}{(' ' + extra) if extra else ''}"
     )
     _tmux("new-window", "-d", "-t", session, "-n", window)
@@ -2458,7 +2476,7 @@ def cmd_command(args) -> int:
         if action == "hire":
             spawned = _hire_worker(fleet_cfg, target, minutes,
                                    max_steps=args.max_steps,
-                                   extra=" ".join(passthrough[1:]))
+                                   extra=shlex.join(passthrough))
             tag = "hired" if spawned else "already has a worker"
             print(f"[command] hire {target} for {minutes}m -> {tag} ({note})")
             time.sleep(args.poll_seconds)
@@ -2505,11 +2523,32 @@ FLEET_TEMPLATE = {
 }
 
 
+def _tmux_argv(*args: str) -> list[str]:
+    socket = os.environ.get("SAPPER_TMUX_SOCKET")
+    return ["tmux", *(["-L", socket] if socket else []), *args]
+
+
 def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    proc = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    proc = subprocess.run(_tmux_argv(*args), capture_output=True, text=True)
     if check and proc.returncode != 0:
         raise FGError(f"tmux {' '.join(args[:2])} failed: {proc.stderr.strip()[:200]}")
     return proc
+
+
+def _sync_managed_tmux(session: str) -> None:
+    """A native fleet inherits the selected Web launch environment."""
+    if not os.environ.get("SAPPER_WEB_STATE"):
+        return
+    for key in ("PATH", "SAPPER_ROOT", "SAPPER_MODEL", "SAPPER_BIN", "SAPPER_TMUX_SOCKET",
+                "SAPPER_WEB_STATE", "SAPPER_GLOBAL_CONTEXT_FILE", "SAPPER_CONTEXT_PROMPT_REVISION",
+                "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"):
+        if key in os.environ:
+            _tmux("set-environment", "-t", session, key, os.environ[key])
+        else:
+            _tmux("set-environment", "-u", "-t", session, key)
 
 
 def _fleet_load(path: Path) -> dict:
@@ -2527,7 +2566,7 @@ def _fleet_load(path: Path) -> dict:
 def _sapper_engine_prefix() -> str:
     """Absolute, PATH-independent way to invoke this CLI in generated
     commands (tmux panes may not have ~/.local/bin on PATH)."""
-    return f"python3 {Path(__file__).resolve()}"
+    return shlex.join([sys.executable, str(Path(__file__).resolve())])
 
 
 def _fleet_pane_command(cfg: dict, pane: dict, base_dir: Path | None = None) -> str:
@@ -2536,14 +2575,14 @@ def _fleet_pane_command(cfg: dict, pane: dict, base_dir: Path | None = None) -> 
     deadline = cfg.get("deadline")
     engine = _sapper_engine_prefix()
     if ptype == "command":
-        cmd = f"{engine} command --root {root}"
+        cmd = f"{engine} command --root {shlex.quote(str(root))}"
         if deadline:
             cmd += f" --deadline {deadline}"
         extra = pane.get("extra_args", "")
         cmd += f" {extra}" if extra else ""
     elif ptype.startswith("auto:"):
         name = ptype.split(":", 1)[1]
-        cmd = f"{engine} --store {root}/{name}/.sapper auto"
+        cmd = f"{engine} --store {shlex.quote(str(Path(root) / name / '.sapper'))} auto"
         if deadline:
             cmd += f" --deadline {deadline}"
         extra = pane.get("extra_args", "")
@@ -2552,11 +2591,11 @@ def _fleet_pane_command(cfg: dict, pane: dict, base_dir: Path | None = None) -> 
         command = pane.get("command")
         if not isinstance(command, str) or not command.strip():
             raise FGError("shell pane needs a 'command'")
-        return command
+        cmd = command
     else:
         raise FGError(f"unknown fleet pane type {ptype!r}")
     if base_dir is not None:
-        cmd = f"cd {base_dir} && {cmd}"
+        cmd = f"cd {shlex.quote(str(base_dir))} && {cmd}"
     return cmd
 
 
@@ -2575,6 +2614,7 @@ def cmd_fleet(args) -> int:
         if _tmux("has-session", "-t", session, check=False).returncode == 0:
             raise FGError(f"tmux session {session!r} already exists; `sapper fleet down` first")
         _tmux("new-session", "-d", "-s", session)
+        _sync_managed_tmux(session)
         first = True
         for pane in cfg["panes"]:
             name = str(pane.get("name") or pane.get("type"))
@@ -2662,7 +2702,7 @@ def cmd_sweep(args) -> int:
     if not root.is_dir():
         raise FGError(f"sweep root {root} is not a directory")
     graph_dirs = sorted(
-        p.parent for p in root.glob("*/.sapper/project.json")
+        p.parent.parent for p in root.glob("*/.sapper/project.json")
     )
     if not graph_dirs:
         raise FGError(f"no */.sapper/project.json found under {root}")
@@ -2672,7 +2712,7 @@ def cmd_sweep(args) -> int:
     if args.minutes_per < 1:
         raise FGError("--minutes-per must be at least 1")
 
-    cli = [sys.executable, str(Path(__file__).resolve()), "auto"]
+    cli = [sys.executable, str(Path(__file__).resolve())]
     passthrough = ["--model", args.model]
     if args.skip_permissions:
         passthrough.append("--skip-permissions")
@@ -3570,6 +3610,8 @@ def cmd_view(args) -> int:
 
 
 def _try_open(path: Path) -> bool:
+    if os.environ.get("SAPPER_WEB_STATE"):
+        return False  # The browser UI offers the exported file; do not open the server desktop.
     import shutil
     import subprocess
     opener = (
@@ -3667,6 +3709,8 @@ def _view_serve(store: Store, args) -> int:
 
 
 def _try_open_url(url: str) -> None:
+    if os.environ.get("SAPPER_WEB_STATE"):
+        return
     import shutil
     import subprocess
     opener = shutil.which("xdg-open") or shutil.which("open")
@@ -3989,7 +4033,7 @@ def _save_peers(store: Store, data: dict) -> None:
 def _tmux_target_exists(target: str) -> bool:
     try:
         proc = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", target, "#{pane_id}"],
+            _tmux_argv("display-message", "-p", "-t", target, "#{pane_id}"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -4008,7 +4052,7 @@ def _tmux_discover() -> list[dict]:
     )
     try:
         proc = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", fmt],
+            _tmux_argv("list-panes", "-a", "-F", fmt),
             capture_output=True,
             text=True,
             timeout=5,
@@ -4039,8 +4083,8 @@ def _tmux_discover() -> list[dict]:
 
 def _paste_tmux(target: str, text: str) -> None:
     try:
-        subprocess.run(["tmux", "load-buffer", "-"], input=text, text=True, check=True)
-        subprocess.run(["tmux", "paste-buffer", "-t", target], check=True)
+        subprocess.run(_tmux_argv("load-buffer", "-"), input=text, text=True, check=True)
+        subprocess.run(_tmux_argv("paste-buffer", "-t", target), check=True)
     except FileNotFoundError:
         raise FGError("tmux not found on PATH")
     except subprocess.CalledProcessError as exc:
@@ -4050,7 +4094,7 @@ def _paste_tmux(target: str, text: str) -> None:
 def _capture_tmux(target: str, lines: int) -> str:
     try:
         proc = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-J", "-t", target, "-S", f"-{lines}"],
+            _tmux_argv("capture-pane", "-p", "-J", "-t", target, "-S", f"-{lines}"),
             capture_output=True,
             text=True,
             timeout=5,
@@ -4276,6 +4320,20 @@ sapper capture <peer>             # read recent output from an authorized peer p
 # --------------------------------------------------------------------------- #
 # argparse
 # --------------------------------------------------------------------------- #
+def cmd_web(args) -> int:
+    """Start the optional Web control surface without changing agent execution."""
+    from sapper_web import main as web_main
+    argv = ["--root", args.root, "--state", args.state,
+            "--host", args.host, "--port", str(args.port),
+            "--public-url", args.public_url, "--url-prefix", args.url_prefix]
+    if args.tmux_socket:
+        argv += ["--tmux-socket", args.tmux_socket]
+    for root in args.workspace_root:
+        argv += ["--workspace-root", root]
+    argv += ["--claude-bin", args.claude_bin]
+    return web_main(argv)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sapper",
@@ -4284,6 +4342,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--store", default=DEFAULT_STORE, help=f"graph dir (default: {DEFAULT_STORE})")
     p.add_argument("--version", action="version", version=f"sapper {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("web", help="control existing sapper graphs and tmux sessions in a browser")
+    sp.add_argument("--root", default=str(_skill_root() / "runs"), help="managed task root")
+    sp.add_argument("--state", default=str(_skill_root() / ".sapper-web"), help="private Web state directory")
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--port", type=int, default=8766)
+    sp.add_argument("--public-url", default="")
+    sp.add_argument("--url-prefix", default="")
+    sp.add_argument("--tmux-socket", default=None)
+    sp.add_argument("--workspace-root", action="append", default=[], help="optional directory picker shortcut; directories can also be selected in the Web UI")
+    sp.add_argument("--claude-bin", default=os.environ.get("SAPPER_CLAUDE_BIN", "claude"))
+    sp.set_defaults(func=cmd_web)
 
     sp = sub.add_parser("init", help="create a fact graph in --store")
     sp.add_argument("--origin", default="", help="where this task came from")

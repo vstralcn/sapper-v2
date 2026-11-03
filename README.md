@@ -179,6 +179,16 @@ Multi-stage deep-dive chains (an industry report puts their success rate at
 
 ## 6. Quick Start
 
+Basic Web controls, using the original CLI, tmux sessions, and fact graph:
+
+```bash
+python3 lib/sapper.py web                 # http://127.0.0.1:8766/
+# Read the login token in another terminal: cat .sapper-web/token
+```
+
+Includes tasks, graph records, hints, original command launches, tmux snapshots
+and input controls, logs, and attachments. The home page shows an overall view. Global shared context is configurable through startup prompts and hooks. Workspace mode binds existing folders, launches/resumes native Claude sessions by ID, and tracks roles and dispatches. Choose existing task folders directly in the Web folder picker; no startup allowlist is required. See [Web usage and limits](docs/web/05-running.md). Model profiles support Messages, Responses and Chat Completions, model discovery and connection tests; see [protocol details](docs/web/10-model-protocols.md).
+
 ```bash
 bash install.sh                      # symlink the sapper CLI (stdlib-only, zero deps)
 sapper setup --goal "assess http://target" --agents

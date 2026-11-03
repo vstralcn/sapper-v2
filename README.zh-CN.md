@@ -118,6 +118,15 @@ nvwabase status                          # 看板与可干前沿
 
 ## 六、快速开始
 
+基础网页控制台（保留原 CLI、tmux 与事实图）：
+
+```bash
+python3 lib/sapper.py web                 # http://127.0.0.1:8766/
+# 在另一个终端查看登录口令：cat .sapper-web/token
+```
+
+默认首页显示总体概览；支持全局环境提示词／hooks 配置、绑定题目原目录、原 Claude Code 启动／精确恢复、角色派发、实时 PTY 终端、事实／意图／hint、日志和附件。已有题目目录直接在网页文件夹选择器中点选并绑定，无需启动时配置允许目录。接入已有目录及功能边界见 [Web 启动与使用](docs/web/05-running.md)。 模型配置支持 Messages／Responses／Chat Completions 协议、获取模型及连接测试，见[模型协议说明](docs/web/10-model-protocols.md)。
+
 ```bash
 bash install.sh                      # 符号链接 sapper CLI（纯标准库，零依赖）
 sapper setup --goal "assess http://target" --agents

@@ -1,0 +1,860 @@
+"""Workspace/session adapter for the original Claude Code and sapper tools.
+
+No model API implementation lives here. The worker/watchdog command adapters
+are enabled only by SAPPER_MODE=workspace; original competition paths remain.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import functools
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+import sapper
+import sapper_context
+import sapper_roles
+from sapper_commander import CommanderMonitor, WatchdogLog
+
+REPO = Path(__file__).resolve().parent.parent
+ROLES = sapper_roles.ROLES
+START_MARK = "<!-- sapper-workspace:start -->"
+END_MARK = "<!-- sapper-workspace:end -->"
+TERMINAL_STATES = {"exited", "failed", "stopped", "interrupted", "timed_out"}
+
+
+class WorkspaceError(sapper.FGError):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def read(path, default=None):
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def text(data, key, default="", limit=20000):
+    value = data.get(key, default)
+    if not isinstance(value, str) or len(value) > limit or "\x00" in value:
+        raise WorkspaceError(f"{key} 必须为文本（最多 {limit} 字符）")
+    return value.strip()
+
+
+def serialized(method):
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        with self.lifecycle():
+            return method(self, *args, **kwargs)
+    return call
+
+
+class Workspaces:
+    def __init__(self, console):
+        self.app = console
+        self._capabilities = None
+        self._in_lifecycle = False
+        self.commander = CommanderMonitor(self)
+
+    @contextlib.contextmanager
+    def lifecycle(self):
+        # Web requests, worker children and watchdog are separate processes.
+        # Serialize their launches/stops, including nested calls in this manager.
+        with self.app.lock:
+            if self._in_lifecycle:
+                yield
+                return
+            with self.app.config_lock():
+                self._in_lifecycle = True
+                try:
+                    yield
+                finally:
+                    self._in_lifecycle = False
+
+    def allowed(self, path):
+        path = Path(path).expanduser().resolve()
+        if path.is_relative_to(self.app.state):
+            raise WorkspaceError("Web 私有凭据目录不能绑定为题目工作区", 403)
+        if not path.is_dir():
+            raise WorkspaceError("执行机上的目录不存在", 404)
+        return path
+
+    def bindings(self):
+        return self.app.config().get("workspaces", [])
+
+    def bound_projects(self):
+        projects = []
+        for binding in self.bindings():
+            try:
+                path = self.allowed(binding["path"])
+                store = sapper.Store(path / ".sapper")
+                item = {**binding, "name": binding.get("name") or path.name,
+                        "relative_path": str(path), "status": "not_enabled", "facts": 0,
+                        "open_intents": 0, "enabled": False, "mode": "workspace"}
+                if store.exists():
+                    self.app.inside(store.root, path)
+                    with store.locked():
+                        project = store.load_project()
+                        item.update(goal=project["goal"], status=project["status"], enabled=True,
+                                    facts=sum(f["id"] != "goal" for f in store.list_facts()),
+                                    open_intents=sum(sapper.is_open(i) for i in store.list_intents()))
+                projects.append(item)
+            except (WorkspaceError, sapper.FGError, OSError):
+                continue
+        return projects
+
+    def directories(self, path=""):
+        if not path:
+            # Starting points for the picker, not an allowlist. Binding an
+            # existing directory is an authenticated Web action.
+            roots = dict.fromkeys([self.app.root, Path.home().resolve(),
+                                   Path(self.app.root.anchor), *self.app.workspace_roots])
+            available = []
+            for root in roots:
+                try:
+                    available.append(str(self.allowed(root)))
+                except (WorkspaceError, OSError):
+                    continue
+            return {"roots": available}
+        directory = self.allowed(path)
+        children = []
+        for p in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
+            if p.name.startswith(".") or not p.is_dir():
+                continue
+            try:
+                resolved = self.allowed(p)
+                children.append({"name": p.name, "path": str(resolved),
+                                 "has_graph": (resolved / ".sapper/project.json").exists()})
+            except (WorkspaceError, OSError):
+                continue
+            if len(children) >= 200:
+                break
+        return {"path": str(directory),
+                "parent": str(directory.parent) if directory.parent != directory else None,
+                "directories": children}
+
+    def bind(self, data):
+        value = text(data, "path")
+        if not value:
+            raise WorkspaceError("请选择执行机上的目录")
+        path = self.allowed(value)
+        with self.app.config_lock():
+            cfg = self.app.config()
+            existing = next((p for p in cfg.get("workspaces", []) if p["path"] == str(path)), None)
+            if existing:
+                return existing
+            discovered = next((p for p in self.app._scan_projects() if p["path"] == str(path)), None)
+            record = {"id": discovered["id"] if discovered else uuid.uuid4().hex[:16],
+                      "path": str(path), "name": text(data, "name", path.name, 100) or path.name,
+                      "goal": text(data, "goal", path.name) or path.name,
+                      "created_at": sapper.now_iso()}
+            cfg.setdefault("workspaces", []).append(record)
+            sapper.atomic_write_json(self.app.config_path, cfg)
+        self.app.audit("workspace.bound", workspace=record["id"], path=str(path))
+        return record
+
+    def inspect(self, pid):
+        project = self.app.project(pid)
+        root = Path(project["path"])
+        settings = root / ".claude/settings.json"
+        hooks = read(settings, {}).get("hooks", {})
+        hook_file = str(REPO / "lib/sapper-hook.py")
+        installed = {event: any(hook_file in h.get("command", "")
+                                for group in hooks.get(event, []) for h in group.get("hooks", []))
+                     for event in ("SessionStart", "UserPromptSubmit")}
+        bridge = root / ".claude/sapper-workspace.md"
+        return {"workspace": project, "graph": (root / ".sapper/project.json").is_file(),
+                "hooks": installed, "instructions": bridge.exists(),
+                "claude_md": (root / "CLAUDE.md").exists(), "agents_md": (root / "AGENTS.md").exists(),
+                "claude": self.capabilities(), "path": str(root),
+                "role_catalog": sapper_roles.catalog(),
+                "role_prompt_version": sapper_roles.PROMPT_VERSION}
+
+    @serialized
+    def enable(self, pid, data):
+        project = self.app.project(pid)
+        root = Path(project["path"])
+        # Check every managed path before invoking setup. Never follow a bridge
+        # symlink out of the selected workspace or replace a user-owned file.
+        for rel in (".sapper", ".claude", ".claude/settings.json", "AGENTS.md", "CLAUDE.md", ".claude/sapper-workspace.md"):
+            self.app.inside(root / rel, root)
+        bridge = root / ".claude/sapper-workspace.md"
+        if bridge.exists() and not bridge.read_text().startswith("<!-- generated by sapper web -->"):
+            raise WorkspaceError(".claude/sapper-workspace.md 已有用户内容，请先选择其他文件名或移开该文件", 409)
+        claude = root / "CLAUDE.md"
+        old = claude.read_text() if claude.exists() else ""
+        if (START_MARK in old) != (END_MARK in old):
+            raise WorkspaceError("CLAUDE.md 的 sapper 受管块不完整，请先修复标记", 409)
+        settings = root / ".claude/settings.json"
+        if settings.exists():
+            sapper._load_settings_patch().validate(settings)
+        goal = text(data, "goal", project["goal"]) or project["goal"]
+        proc = subprocess.run([sys.executable, str(REPO / "lib/sapper.py"), "--store", str(root / ".sapper"),
+                               "setup", "--goal", goal, "--agents"], cwd=root,
+                              capture_output=True, text=True, timeout=15)
+        if proc.returncode:
+            raise WorkspaceError("项目级启用失败：" + proc.stderr.strip())
+        agents = root / "AGENTS.md"
+        same = agents.exists() and claude.exists() and agents.samefile(claude)
+        spec = sapper._AGENTS_SPEC.format(store=str(root / ".sapper"), marker=sapper._AGENTS_MARKER)
+        content = "<!-- generated by sapper web -->\n"
+        if not same:
+            content += "@../AGENTS.md\n\n"
+        if sapper._AGENTS_MARKER not in agents.read_text():
+            content += spec
+        else:
+            content += "Use the original sapper instructions and shared graph above.\n"
+        bridge.write_text(content)
+        managed = f"{START_MARK}\n@.claude/sapper-workspace.md\n{END_MARK}"
+        if START_MARK in old:
+            if END_MARK not in old:
+                raise WorkspaceError("CLAUDE.md 的 sapper 受管块不完整，请先修复标记", 409)
+            new = re.sub(re.escape(START_MARK) + r".*?" + re.escape(END_MARK), lambda m: managed, old, flags=re.S)
+        else:
+            new = old + ("\n\n" if old else "") + managed + "\n"
+        if new != old:
+            claude.write_text(new)
+        self.app.audit("workspace.enabled", workspace=pid)
+        return self.inspect(pid)
+
+    def capabilities(self):
+        if self._capabilities is not None:
+            return self._capabilities
+        try:
+            proc = subprocess.run([self.app.claude_bin, "--help"], capture_output=True, text=True, timeout=5)
+            output = proc.stdout + proc.stderr
+            self._capabilities = {"available": proc.returncode == 0, "binary": self.app.claude_bin,
+                                  **{name: flag in output for name, flag in (
+                                      ("session_id", "--session-id"), ("resume", "--resume"),
+                                      ("add_dir", "--add-dir"), ("append_system", "--append-system-prompt"))}}
+        except (OSError, subprocess.TimeoutExpired):
+            self._capabilities = {"available": False, "binary": self.app.claude_bin}
+        return self._capabilities
+
+    def agent_path(self, aid):
+        if not re.fullmatch(r"[a-f0-9]{16}", aid):
+            raise WorkspaceError("agent ID 不正确")
+        return self.app.state / "agents" / (aid + ".json")
+
+    def agent(self, aid, *, include_deleted=False):
+        record = read(self.agent_path(aid))
+        if record is None or (record.get("deleted_at") and not include_deleted):
+            raise WorkspaceError("角色会话不存在", 404)
+        return record
+
+    def save_agent(self, record):
+        sapper.atomic_write_json(self.agent_path(record["id"]), record)
+
+    def agents(self, pid=None):
+        all_panes = self.app.panes()
+        panes = {p["session"]: p for p in all_panes}
+        runs = {r["id"]: r for r in self.app.runs()}
+        results = []
+        hidden_panes = set()
+        context = self.app.global_context()
+        for path in (self.app.state / "agents").glob("*.json"):
+            a = read(path)
+            if a.get("deleted_at"):
+                # Unregistering an attached terminal must not rediscover it as
+                # an unlabelled role. The terminal itself remains accessible.
+                hidden_panes.update(p["id"] for p in all_panes
+                                    if p["id"] == a.get("external_pane")
+                                    and p["session"] == a.get("external_session"))
+                continue
+            if pid and pid not in a.get("workspace_scope", [a["workspace_id"]]):
+                continue
+            run = runs.get(a.get("run_id"), {})
+            pane = panes.get(run.get("session") or a.get("external_session"))
+            if a.get("external_pane"):
+                pane = next((p for p in all_panes if p["id"] == a["external_pane"]), None)
+            if pane and a.get("external_pane") and pane["id"] != a["external_pane"]:
+                pane = None
+            results.append({**a, "status": run.get("status", "unknown"), "exit_code": run.get("exit_code"),
+                            "activity": run.get("activity", {}), "deadline_epoch": run.get("deadline_epoch"),
+                            "stop_reason": run.get("stop_reason"),
+                            "timeout_seconds": run.get("timeout_seconds"), "supervisor_version": run.get("supervisor_version"),
+                            "pane_id": pane["id"] if pane else None,
+                            "role_label": ROLES.get(a["role"], a["role"]),
+                            "can_resume": bool(a.get("claude_session_id")) and not pane})
+            if a["role"] == "commander" and not a.get("legacy") and a.get("execution_mode") == "tui":
+                results[-1]["commander_monitor"] = self.commander.view(a["id"])
+            checked = sapper_context.receipt(self.app.state, a["id"])
+            results[-1]["shared_context"] = {"launch_revision": a.get("context_revision", 0),
+                "hook_revision": checked.get("revision", 0) if checked else 0,
+                "latest_revision": context["revision"], "enabled": context["enabled"],
+                "hook_checked_at": checked.get("checked_at") if checked else None}
+            if a.get("external_session") and pane:
+                results[-1]["status"] = "running" if not pane["dead"] else "exited"
+        known_panes = {a.get("pane_id") for a in results} | hidden_panes
+        service_sessions = {r.get("session") for r in runs.values() if r.get("role") == "watchdog"}
+        for pane in all_panes:
+            if pane["id"] in known_panes or pane["session"] in service_sessions or (pid and pane["project_id"] != pid and pane.get("role") != "commander"):
+                continue
+            results.append({"id": "legacy-" + pane["id"][1:], "workspace_id": pid or pane["project_id"],
+                            "role": pane.get("role", "unassigned"), "role_label": "原指挥官" if pane.get("role") == "commander" else "角色未标注",
+                            "name": pane["name"], "profile_name": "原配置（未登记）", "execution_mode": "tui",
+                            "cwd": pane["path"], "pane_id": pane["id"], "mission": "已有终端，未推断其职责或父子关系",
+                            "claude_session_id": None, "created_at": "", "legacy": True, "can_resume": False,
+                            "status": "exited" if pane["dead"] else "running"})
+        return sorted(results, key=lambda a: a["created_at"])
+
+    @serialized
+    def attach(self, pid, data):
+        pane = self.app.pane(text(data, "pane_id"))
+        if pane["project_id"] != pid and pane.get("role") != "commander":
+            raise WorkspaceError("该终端不属于所选工作区", 403)
+        if any(a.get("pane_id") == pane["id"] and not a["id"].startswith("legacy-") for a in self.agents()):
+            raise WorkspaceError("该终端已经登记，无需重复接入", 409)
+        role = data.get("role", "worker")
+        if role not in ROLES:
+            raise WorkspaceError("角色不正确")
+        sid = text(data, "claude_session_id") or None
+        if sid:
+            try:
+                sid = str(uuid.UUID(sid))
+            except ValueError as exc:
+                raise WorkspaceError("原生会话 ID 应为 UUID；未知时留空，不猜测最近会话") from exc
+        record = {"id": uuid.uuid4().hex[:16], "workspace_id": pid, "workspace_scope": [pid],
+                  "role": role, "role_source": "user-attached", "legacy": True,
+                  "name": text(data, "name", pane["name"], 100), "parent_agent_id": None,
+                  "cwd": pane["path"], "claude_session_id": sid, "external_session": pane["session"],
+                  "external_pane": pane["id"], "execution_mode": "tui", "mission": text(data, "mission", "已有会话，用户显式登记"),
+                  "created_at": sapper.now_iso(), "run_ids": [], "profile_id": "", "profile_name": "原会话配置",
+                  "desired_state": "running", "minutes": 10}
+        self.save_agent(record)
+        return record
+
+    def role_prompt(self, role, project, scope=None):
+        scope = scope or [project["id"]]
+        projects = [self.app.project(wid) for wid in scope]
+        return sapper_roles.render(
+            role, root=Path(project["path"]),
+            worker_script=REPO / "docker/commander/worker.sh",
+            workspace_id=project["id"], workspace_name=project["name"],
+            workspace_scope=[{"id": p["id"], "name": p["name"]} for p in projects])
+
+    def role_info(self, pid, role, scope=None):
+        if role not in ROLES:
+            raise WorkspaceError("角色不正确")
+        project = self.app.project(pid)
+        scope = list(dict.fromkeys(scope or [pid]))
+        if pid not in scope or (role != "commander" and scope != [pid]):
+            raise WorkspaceError("只有指挥官可预览多个工作区，且范围必须包含当前工作区")
+        for wid in scope:
+            self.app.project(wid)
+        prompt = self.role_prompt(role, project, scope)
+        spec = sapper_roles.ROLE_SPECS[role]
+        return {"id": role, "label": spec.label, "summary": spec.summary,
+                "sources": list(spec.sources), "prompt_version": sapper_roles.PROMPT_VERSION,
+                "prompt": prompt}
+
+    def strategy_board(self, scope):
+        """Real workspace evidence needed by the native commander doctrine.
+
+        This is deliberately an observation adapter, not a scheduler: it reports
+        graph and process state without inferring that a quiet role is stuck.
+        """
+        agents = []
+        seen = set()
+        for wid in scope:
+            for agent in self.agents(wid):
+                if agent["id"] in seen:
+                    continue
+                seen.add(agent["id"])
+                agents.append(agent)
+        compact_agents = []
+        for agent in agents:
+            row = {k: agent.get(k) for k in (
+                "id", "workspace_id", "workspace_scope", "parent_agent_id", "role",
+                "role_label", "name", "status", "pane_id", "execution_mode",
+                "created_at", "minutes", "desired_state", "timeout_seconds", "deadline_epoch", "activity", "stop_reason")}
+            row["mission"] = (agent.get("mission") or "")[:500]
+            compact_agents.append(row)
+        workspaces = []
+        for wid in scope:
+            project = self.app.project(wid)
+            try:
+                graph = self.app.graph(wid)
+                facts, intents = graph["facts"], graph["intents"]
+                kinds, flags = {}, {}
+                help_notes, reports, latest = [], [], ""
+                for fact in facts:
+                    if fact.get("id") == "goal":
+                        continue
+                    kind = fact.get("kind") or "untyped"
+                    kinds[kind] = kinds.get(kind, 0) + 1
+                    if kind == "flag":
+                        status = (fact.get("data") or {}).get("status") or "recorded"
+                        flags[status] = flags.get(status, 0) + 1
+                    created = fact.get("created_at") or ""
+                    latest = max(latest, created)
+                    searchable = " ".join((str(fact.get("title") or ""),
+                                           str(fact.get("description") or ""),
+                                           json.dumps(fact.get("data") or {}, ensure_ascii=False)))
+                    row = {"id": fact.get("id"), "creator": fact.get("creator"),
+                           "created_at": created,
+                           "summary": (fact.get("title") or fact.get("description") or "")[:300]}
+                    if "[HELP]" in searchable:
+                        help_notes.append(row)
+                    if "[REPORT]" in searchable:
+                        reports.append(row)
+                open_intents = []
+                for intent in intents:
+                    latest = max(latest, intent.get("created_at") or "",
+                                 intent.get("claimed_at") or "", intent.get("concluded_at") or "")
+                    if sapper.is_open(intent):
+                        open_intents.append({k: intent.get(k) for k in (
+                            "id", "title", "description", "status", "worker",
+                            "creator", "created_at", "requires_confirmation", "confirmed_at")})
+                graph_data = {"status": graph["project"]["status"], "goal": graph["project"]["goal"],
+                              "facts_total": sum(f.get("id") != "goal" for f in facts),
+                              "kinds": kinds, "flags": flags, "open_intents": open_intents[:20],
+                              "help": help_notes[-10:], "reports": reports[-10:],
+                              "last_graph_activity": latest or None}
+            except (sapper.FGError, OSError, KeyError, TypeError) as exc:
+                graph_data = {"status": "unavailable", "goal": project.get("goal", ""),
+                              "error": str(exc)}
+            workspaces.append({"workspace_id": wid, "name": project["name"],
+                               "path": project["path"], **graph_data,
+                               "agents": [a for a in compact_agents if wid in a.get("workspace_scope", [a["workspace_id"]])]})
+        try:
+            maximum = int(os.environ.get("SAPPER_MAX_WORKERS", "8"))
+        except ValueError:
+            maximum = None
+        return {"generated_at": sapper.now_iso(), "workspaces": workspaces,
+                "agents": compact_agents,
+                "limits": {"max_workers": maximum, "global_budget": None},
+                "observation_note": "进程存活、终端输出和图进展分别报告；本看板不把安静状态自动判为卡死。"}
+
+    @serialized
+    def create_session(self, pid, data, existing=None):
+        project = self.app.project(pid)
+        root = Path(project["path"])
+        if not (root / ".sapper/project.json").is_file():
+            raise WorkspaceError("请先在工作区点击“启用 sapper”，再启动角色会话", 409)
+        if not (root / ".claude/sapper-workspace.md").exists():
+            raise WorkspaceError("请先启用工作区接入，以载入原 sapper 的 hooks 与说明", 409)
+        if data.get("request_id") and not existing:
+            for run in self.app.runs(pid):
+                if run.get("request_id") == data["request_id"] and run.get("agent_id"):
+                    return run
+        cap = self.capabilities()
+        if not cap.get("available") or not cap.get("session_id") or not cap.get("resume"):
+            raise WorkspaceError("当前 Claude CLI 缺少明确会话 ID／恢复能力，请选择支持这些参数的原 CLI；不会自动升级", 409)
+        if not cap.get("append_system"):
+            raise WorkspaceError("该 Claude CLI 不支持 --append-system-prompt，无法可靠加载角色基础职责；请使用支持该参数的原 CLI", 409)
+        role = (existing or {}).get("role") or data.get("role", "worker")
+        if role not in ROLES:
+            raise WorkspaceError("角色不正确")
+        mode = (existing or {}).get("execution_mode") or data.get("execution_mode", "tui")
+        if mode not in ("tui", "print"):
+            raise WorkspaceError("执行形式不正确")
+        parent = (existing or {}).get("parent_agent_id") or data.get("parent_agent_id") or None
+        if parent:
+            parent_record = self.agent(parent)
+            if parent_record.get("desired_state") != "running":
+                raise WorkspaceError("父角色已停止，不再派发新的子任务", 409)
+            if pid not in parent_record.get("workspace_scope", [parent_record["workspace_id"]]):
+                raise WorkspaceError("父角色不属于这个工作区", 403)
+            if not existing:
+                try:
+                    maximum = int(os.environ.get("SAPPER_MAX_WORKERS", "8"))
+                except ValueError as exc:
+                    raise WorkspaceError("SAPPER_MAX_WORKERS 必须是整数") from exc
+                active = [a for a in self.agents() if a.get("pane_id") and a["role"] != "commander" and not a["id"].startswith("legacy-")]
+                if len(active) >= maximum:
+                    raise WorkspaceError("原 worker 并发上限已达到", 409)
+        aid = existing["id"] if existing else uuid.uuid4().hex[:16]
+        sid = existing["claude_session_id"] if existing else str(uuid.uuid4())
+        profile_id = (existing or {}).get("profile_id") or data.get("profile_id") or ""
+        profile = next((p for p in self.app.config()["profiles"] if p["id"] == profile_id), None)
+        if profile_id and profile is None:
+            raise WorkspaceError("角色模型配置已不存在，请先选择配置", 409)
+        if profile and profile.get("engine_prefix"):
+            raise WorkspaceError("原 -p 包装器不一定支持交互式 Claude；此入口请选择原环境或普通模型配置", 409)
+        minutes = data.get("minutes", (existing or {}).get("minutes", 10))
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= 1440:
+            raise WorkspaceError("minutes 必须在 1–1440 之间")
+        snapshot = {k: profile.get(k, "anthropic" if k == "protocol" else "") for k in ("name", "model", "base_url", "protocol")} if profile else None
+        if existing and existing.get("profile_snapshot"):
+            old = existing["profile_snapshot"]
+            if not snapshot or any(old.get(k, "anthropic" if k == "protocol" else "") != snapshot[k] for k in ("model", "base_url", "protocol")):
+                raise WorkspaceError("模型、协议或网关地址已变化，不能静默改变原会话；请还原配置或新建角色会话", 409)
+        if existing:
+            for a in self.agents():
+                if a["claude_session_id"] == sid and a.get("pane_id"):
+                    if a.get("run_id"):
+                        return self.app.run_info(a["run_id"])
+                    raise WorkspaceError("已接入的原会话仍在运行", 409)
+        location = data.get("location", "root" if role == "worker" and not parent else "agent")
+        cwd = Path(existing["cwd"]) if existing else root if location == "root" else root / ".sapper-agents" / aid
+        self.app.inside(cwd, root)
+        if cwd != root and not existing:
+            cwd.mkdir(parents=True, exist_ok=False)
+            (cwd / ".sapper").symlink_to(root / ".sapper", target_is_directory=True)
+            # Hooks are opt-in at exactly this cwd; do not rely on ancestor discovery.
+            settings = cwd / ".claude/settings.json"
+            sapper._load_settings_patch().add(settings, str(REPO / "lib/sapper-hook.py"))
+            # Relative import avoids whitespace parsing in absolute paths.
+            (cwd / "CLAUDE.md").write_text("@../../CLAUDE.md\n")
+        scope = (existing or {}).get("workspace_scope") or data.get("workspace_scope") or [pid]
+        if not isinstance(scope, list) or any(not isinstance(i, str) for i in scope):
+            raise WorkspaceError("工作区范围格式不正确")
+        for wid in scope:
+            self.app.project(wid)
+        if not scope or (not existing and pid not in scope) or (role != "commander" and scope != [pid]):
+            raise WorkspaceError("只有指挥官可关联多个工作区，且范围必须包含当前工作区")
+        mission = (existing or {}).get("mission") or text(data, "mission", project["goal"])
+        context = self.app.global_context()
+        shared = sapper_context.prompt(context)
+        role_prompt = self.role_prompt(role, project, scope)
+        argv = [self.app.claude_bin, "--resume" if existing else "--session-id", sid]
+        if profile:
+            argv += ["--model", profile["model"]]
+        if data.get("skip_permissions") or (existing or {}).get("skip_permissions"):
+            argv += ["--dangerously-skip-permissions"]
+        if cwd != root and cap.get("add_dir"):
+            argv += ["--add-dir", str(root)]
+        argv += ["--append-system-prompt", "\n\n".join(p for p in (role_prompt, shared) if p)]
+        if mode == "print":
+            argv += ["-p", "--output-format", "stream-json", "--verbose"]
+        if not existing or mode == "print" or role == "commander":
+            continuation = mission
+            if existing:
+                continuation = (text(data, "continuation") if "continuation" in data else
+                                "继续原任务。先核对共享图和已保存文件，保留有效成果，从未完成的步骤继续；不要仅因恢复而重复探索。\n原任务：" + mission)
+            argv += [continuation]
+        record = existing or {"id": aid, "workspace_id": pid, "workspace_scope": scope,
+                              "role": role, "role_source": "original-launch-parameters",
+                              "parent_agent_id": parent, "claude_session_id": sid,
+                              "execution_mode": mode, "cwd": str(cwd), "mission": mission,
+                              "profile_id": profile_id, "profile_name": profile["name"] if profile else "继承原环境",
+                              "created_at": sapper.now_iso(), "run_ids": [],
+                              "name": text(data, "name", ROLES[role], 100), "profile_snapshot": snapshot,
+                              "skip_permissions": bool(data.get("skip_permissions")),
+                              "minutes": minutes}
+        record.setdefault("claude_config_dir", str(Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")))
+        record["desired_state"] = "running"
+        record["role_prompt_version"] = sapper_roles.PROMPT_VERSION
+        record["role_prompt_sources"] = list(sapper_roles.ROLE_SPECS[role].sources)
+        record["role_prompt_sha256"] = hashlib.sha256(role_prompt.encode()).hexdigest()
+        record["context_revision"] = context["revision"] if shared and cap.get("append_system") else 0
+        record["minutes"] = minutes
+        for key in ("external_session", "external_pane"):
+            record.pop(key, None)
+        self.save_agent(record)
+        if data.get("watchdog") and role == "commander" and not existing:
+            self.start_watchdog(pid)
+        env = {"SAPPER_MODE": "workspace", "SAPPER_WEB_STATE": str(self.app.state),
+               "SAPPER_WORKSPACE_ID": pid, "SAPPER_WORKSPACE_PATH": str(root), "SAPPER_AGENT_ID": aid,
+               "SAPPER_PARENT_AGENT_ID": parent or "", "SAPPER_WORKSPACE_ALLOWED_ROOTS": json.dumps([str(r) for r in self.app.workspace_roots]),
+               "SAPPER_CLAUDE_BIN": self.app.claude_bin, "SAPPER_TMUX_SOCKET": self.app.tmux_socket or ""}
+        env[sapper_context.PROMPT_ENV] = str(record["context_revision"]) if record["context_revision"] else ""
+        try:
+            run = self.app.start(pid, {**data, "kind": "claude-native", "profile_id": profile_id}, native={
+                "argv": argv, "cwd": str(cwd), "env": env, "agent_id": aid, "claude_session_id": sid,
+                "role": role, "execution_mode": mode,
+                "output_format": "stream-json" if mode == "print" else None,
+                "timeout_seconds": int(record["minutes"]) * 60 if mode == "print" else None})
+        except (sapper.FGError, OSError):
+            record["desired_state"] = "stopped"
+            self.save_agent(record)
+            raise
+        record.update(run_id=run["id"], updated_at=sapper.now_iso())
+        record["run_ids"].append(run["id"])
+        self.save_agent(record)
+        self.app.audit("agent.resumed" if existing else "agent.started", agent=aid, role=role, workspace=pid)
+        return run
+
+    @serialized
+    def resume(self, aid, data):
+        with self.app.lock:
+            a = self.agent(aid)
+            if not a.get("claude_session_id"):
+                raise WorkspaceError("原生会话 ID 未知，不能猜测恢复；请使用原会话入口", 409)
+            return self.create_session(a["workspace_id"], data, existing=a)
+
+    @serialized
+    def extend(self, aid, data):
+        a = self.agent(aid)
+        if not a.get("run_id"):
+            raise WorkspaceError("该角色没有受管运行可续时", 409)
+        return self.app.extend(a["run_id"], data)
+
+    def mark_stopped(self, aid):
+        # Historical run controls may still refer to a deleted role.
+        a = self.agent(aid, include_deleted=True)
+        if a.get("deleted_at"):
+            return
+        a.update(desired_state="stopped", stopped_at=sapper.now_iso())
+        self.save_agent(a)
+
+    @serialized
+    def stop_agent(self, aid):
+        a = self.agent(aid)
+        self.mark_stopped(aid)
+        if a.get("external_session") and not a.get("run_id"):
+            row = next((r for r in self.agents(a["workspace_id"]) if r["id"] == aid), {})
+            if row.get("pane_id"):
+                return self.app.send(row["pane_id"], {"key": "C-c"}) | {"message": "已发送原中断键；旧 watchdog 仍按原规则运行"}
+            return {"status": "not_running"}
+        return self.app.stop(a["run_id"]) if a.get("run_id") else {"status": "not_running"}
+
+    @serialized
+    def delete_agent(self, aid):
+        a = self.agent(aid, include_deleted=True)
+        if a.get("deleted_at"):
+            return {"deleted_agent": aid}
+        # Reuse managed process-group shutdown; external terminals are only
+        # unregistered because their lifecycle is not owned by this service.
+        if a.get("run_id"):
+            self.stop_agent(aid)
+        else:
+            self.mark_stopped(aid)
+        a = self.agent(aid)
+        a.update(deleted_at=sapper.now_iso(), desired_state="stopped")
+        self.save_agent(a)
+        # Surviving children become independent roles and remain resumable.
+        # Retain the original relationship for historical attribution.
+        detached = []
+        for path in (self.app.state / "agents").glob("*.json"):
+            child = read(path)
+            if child.get("parent_agent_id") == aid and not child.get("deleted_at"):
+                child.update(parent_agent_id=None, deleted_parent_agent_id=aid)
+                self.save_agent(child)
+                detached.append(child["id"])
+        self.app.audit("agent.deleted", agent=aid, workspace=a["workspace_id"], detached_children=detached)
+        return {"deleted_agent": aid}
+
+    def message(self, aid, data):
+        a = next((a for a in self.agents() if a["id"] == aid), None)
+        if a and a.get("native_operation"):
+            self.app.store(a["workspace_id"]).add_hint(text(data, "text"), "web-user")
+            return {"status": "saved", "message": "已写入原 hint，后续原生调度步骤读取；不表示当前模型已采用"}
+        if a and a.get("execution_mode") == "print":
+            self.app.store(a["workspace_id"]).add_hint(text(data, "text"), "web-user")
+            return {"status": "saved", "message": "已写入共享 hint；单次 print 会话不接收终端输入，后续读图时可见，不代表已采用"}
+        if not a or not a.get("pane_id"):
+            raise WorkspaceError("该角色当前没有活动终端，请先恢复会话或保存为 hint", 409)
+        return self.app.send(a["pane_id"], {"text": text(data, "text")})
+
+    def pause_commander_input(self, pane):
+        """A user's native interrupt is also an explicit exit from auto turns."""
+        for path in (self.app.state / "agents").glob("*.json"):
+            a = read(path)
+            if (a.get("role") == "commander" and a.get("execution_mode") == "tui"
+                    and a.get("run_id") and not a.get("deleted_at") and not a.get("legacy")
+                    and self.app.run_info(a["run_id"]).get("session") == pane["session"]):
+                self.commander.configure(a["id"], "paused", "用户通过原生终端中断；可在角色卡片启用续轮")
+
+    @serialized
+    def start_watchdog(self, pid):
+        for service in self.services(pid):
+            if service["status"] in ("running", "starting"):
+                return service
+        service_id = uuid.uuid4().hex[:16]
+        env = {"SAPPER_MODE": "workspace", "SAPPER_WEB_STATE": str(self.app.state),
+               "SAPPER_WORKSPACE_ID": pid, "SAPPER_TMUX_SOCKET": self.app.tmux_socket or "",
+               "SAPPER_WORKSPACE_ALLOWED_ROOTS": json.dumps([str(r) for r in self.app.workspace_roots]),
+               "SAPPER_CLAUDE_BIN": self.app.claude_bin}
+        run = self.app.start(pid, {"kind": "workspace-watchdog"}, native={
+            "argv": ["bash", str(REPO / "docker/commander/watchdog.sh")],
+            "cwd": self.app.project(pid)["path"], "env": env, "role": "watchdog"})
+        service = {"id": service_id, "workspace_id": pid, "run_id": run["id"], "role": "watchdog", "type": "script"}
+        sapper.atomic_write_json(self.app.state / "services" / (service_id + ".json"), service)
+        return service
+
+    def services(self, pid):
+        runs = {r["id"]: r for r in self.app.runs()}
+        panes = {p["session"]: p["id"] for p in self.app.panes()}
+        return [{**s, "status": runs.get(s["run_id"], {}).get("status", "unknown"),
+                 "pane_id": panes.get(runs.get(s["run_id"], {}).get("session"))}
+                for p in (self.app.state / "services").glob("*.json")
+                if (s := read(p))["workspace_id"] == pid]
+
+    @serialized
+    def stop_workspace(self, pid):
+        # Stop keep-alive before agents; shared commanders retain their other scope.
+        for s in self.services(pid):
+            self.app.stop(s["run_id"])
+        stopped = []
+        for a in self.agents(pid):
+            if not re.fullmatch(r"[a-f0-9]{16}", a["id"]):
+                continue
+            scope = a.get("workspace_scope", [a["workspace_id"]])
+            if a["role"] == "commander" and len(scope) > 1:
+                record = self.agent(a["id"])
+                record["workspace_scope"] = [w for w in scope if w != pid]
+                self.save_agent(record)
+            else:
+                self.stop_agent(a["id"])
+                stopped.append(a["id"])
+        return {"stopped_agents": stopped}
+
+
+def console_from_environment():
+    from sapper_web import Console
+    state = os.environ.get("SAPPER_WEB_STATE")
+    if not state:
+        raise WorkspaceError("工作区模式需要 SAPPER_WEB_STATE")
+    roots = json.loads(os.environ.get("SAPPER_WORKSPACE_ALLOWED_ROOTS", "[]"))
+    return Console(Path(os.environ.get("SAPPER_ROOT", str(REPO / "runs"))), Path(state),
+                   os.environ.get("SAPPER_TMUX_SOCKET") or None,
+                   workspace_roots=[Path(p) for p in roots],
+                   claude_bin=os.environ.get("SAPPER_CLAUDE_BIN", "claude"))
+
+
+def worker(argv):
+    parser = argparse.ArgumentParser(description="原 worker CLI 的显式本地工作区接入")
+    parser.add_argument("action", choices=["spawn", "kill", "msg", "peek", "list", "board", "hint", "extend", "resume", "control"])
+    parser.add_argument("target", nargs="?")
+    parser.add_argument("body", nargs="?")
+    parser.add_argument("--mission", default="")
+    parser.add_argument("--role", choices=list(ROLES), default=None)
+    parser.add_argument("--general", action="store_true")
+    parser.add_argument("--minutes", type=int)
+    parser.add_argument("--model")
+    parser.add_argument("--profile")
+    parser.add_argument("--name")
+    parser.add_argument("--gw")
+    parser.add_argument("--engine", default="claude")
+    parser.add_argument("--close", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--reason", default="")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--p", "-p", action="store_true")
+    modes.add_argument("--tui", action="store_true")
+    args = parser.parse_args(argv)
+    app = console_from_environment()
+    manager = app.workspaces
+    wid = os.environ.get("SAPPER_WORKSPACE_ID")
+    parent = os.environ.get("SAPPER_AGENT_ID") or None
+    scope = manager.agent(parent).get("workspace_scope", [wid]) if parent else [wid]
+    if args.action == "list":
+        rows, seen = [], set()
+        for workspace_id in scope:
+            for agent in manager.agents(workspace_id):
+                if agent["id"] not in seen:
+                    rows.append(agent)
+                    seen.add(agent["id"])
+        print(json.dumps(rows, ensure_ascii=False))
+        return 0
+    if args.action == "board":
+        board = manager.strategy_board(scope)
+        print(json.dumps(board, ensure_ascii=False), flush=True)
+        if parent:
+            manager.commander.record_board(parent, os.environ.get("SAPPER_RUN_ID"), board)
+        return 0
+    if args.action == "control":
+        if not parent:
+            raise WorkspaceError("control 需要当前受管指挥官身份")
+        print(json.dumps(manager.commander.configure(parent, args.target, args.reason), ensure_ascii=False))
+        return 0
+    if args.action == "spawn":
+        if args.engine != "claude" or args.gw:
+            raise WorkspaceError("本地工作区请用角色模型配置；原 --gw/其他引擎分支仍可在原比赛模式使用")
+        candidates = [p for p in app.projects() if p["id"] in scope and args.target in (p["id"], p["name"])]
+        if len(candidates) != 1:
+            raise WorkspaceError("派发目标不在当前指挥官的明确工作区范围内")
+        profile = args.profile
+        if args.model:
+            parent_profile = next((p for p in app.config()["profiles"] if p["id"] == (manager.agent(parent).get("profile_id") if parent else None)), {})
+            chosen = app.save_profile({**parent_profile, "id": "", "name": "worker " + args.model, "model": args.model})
+            profile = chosen["id"]
+        run = manager.create_session(candidates[0]["id"], {
+            "role": "general" if args.general else args.role or "worker", "parent_agent_id": parent,
+            "execution_mode": "print" if args.p else "tui", "minutes": args.minutes if args.minutes is not None else 10,
+            "mission": args.mission or candidates[0]["goal"], "name": args.name or "",
+            "profile_id": profile or (manager.agent(parent).get("profile_id") if parent else ""),
+            "skip_permissions": manager.agent(parent).get("skip_permissions", False) if parent else False})
+        print(json.dumps(run, ensure_ascii=False))
+        return 0
+    if args.action == "hint":
+        targets = [p for p in app.projects() if p["id"] in scope and args.target in (p["id"], p["name"])]
+        if len(targets) != 1:
+            raise WorkspaceError("hint 目标不在工作区范围内")
+        app.store(targets[0]["id"]).add_hint(args.body or "", parent or "commander")
+        return 0
+    a = manager.agent(args.target) if args.target else None
+    if a and a["workspace_id"] not in scope:
+        raise WorkspaceError("不能操作其他工作区角色")
+    if args.action == "extend":
+        print(json.dumps(manager.extend(a["id"], {"minutes": args.minutes}), ensure_ascii=False))
+    elif args.action == "resume":
+        data = {"minutes": args.minutes} if args.minutes is not None else {}
+        if args.mission:
+            data["continuation"] = args.mission
+        print(json.dumps(manager.resume(a["id"], data), ensure_ascii=False))
+    elif args.action == "kill":
+        if args.close:
+            raise WorkspaceError("本地工作区没有平台实例，不执行 --close 或自动交卷")
+        print(json.dumps(manager.stop_agent(a["id"])))
+    elif args.action == "msg":
+        print(json.dumps(manager.message(a["id"], {"text": args.body or ""}), ensure_ascii=False))
+    elif args.action == "peek":
+        row = next(r for r in manager.agents() if r["id"] == a["id"])
+        if a.get("execution_mode") == "print" and a.get("run_id"):
+            print(json.dumps({k: row.get(k) for k in ("id", "status", "deadline_epoch", "activity")}, ensure_ascii=False))
+            print(app.log(a["run_id"])["text"])
+        else:
+            print(app.capture(row["pane_id"])["text"] if row.get("pane_id") else app.log(a["run_id"])["text"])
+    return 0
+
+
+def watch():
+    app = console_from_environment()
+    wid = os.environ["SAPPER_WORKSPACE_ID"]
+    retries = {}
+    status_log = WatchdogLog()
+    print(f"[watchdog] workspace={wid} poll=3s heartbeat=60s; 状态变化立即记录", flush=True)
+    while True:
+        rows = app.workspaces.agents()
+        commanders = 0
+        for a in rows:
+            if wid not in a.get("workspace_scope", [a["workspace_id"]]):
+                continue
+            if a["role"] == "commander" and not a.get("legacy") and a.get("execution_mode") == "tui":
+                commanders += 1
+                try:
+                    app.workspaces.commander.tick(a["id"], rows)
+                    line = status_log.line(a["id"], app.workspaces.commander.view(a["id"]))
+                    if line:
+                        print(line, flush=True)
+                except (sapper.FGError, OSError, ValueError) as exc:
+                    print(f"[watchdog] commander {a['id']}: {exc}", flush=True)
+                continue
+            if a.get("native_operation"):
+                continue  # Original CLI workflows have no single native session to resume.
+            if a.get("desired_state") != "running" or a.get("pane_id"):
+                continue
+            if a["status"] in ("stopped", "timed_out"):
+                continue
+            if a["status"] == "exited" and a.get("exit_code") == 0:
+                continue
+            if a["status"] not in TERMINAL_STATES or retries.get(a["id"], 0) >= 2:
+                continue
+            retries[a["id"]] = retries.get(a["id"], 0) + 1
+            try:
+                app.workspaces.resume(a["id"], {})
+                app.audit("watchdog.resumed", agent=a["id"], workspace=wid)
+            except (sapper.FGError, OSError) as exc:
+                print(f"[watchdog] {a['id']}: {exc}", flush=True)
+        if not commanders:
+            line = status_log.line("workspace-" + wid, {"phase": "no_managed_commander"})
+            if line:
+                print(line, flush=True)
+        time.sleep(3)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(watch() if sys.argv[1:2] == ["watch"] else worker(sys.argv[2:]))
+    except (sapper.FGError, OSError) as exc:
+        print(f"[workspace] {exc}", file=sys.stderr)
+        raise SystemExit(1)

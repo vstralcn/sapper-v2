@@ -8,6 +8,7 @@ venv/
 # Rendered graph snapshots / local artifacts (generated, not source)
 *.html
 !lib/view_template.html
+!web/index.html
 fact-graph.html
 
 # Per-project fact-graph data — belongs in the *using* project, not here.
@@ -30,3 +31,8 @@ HANDOVER.md
 PREP-INTERVIEW.md
 docker/ENV-COMMANDER.md
 COMMANDER-HANDOVER.md
+
+# Local Web console state (credentials, task workspaces and captured output)
+.sapper-web/
+.sapper-agents/
+/runs/

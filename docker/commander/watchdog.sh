@@ -26,6 +26,16 @@
 # re-send worker missions — the commander re-briefs amnesiac panes.
 set -o pipefail
 
+if [[ "${SAPPER_MODE:-}" == workspace ]]; then
+  exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/lib/sapper_workspace.py" watch
+fi
+
+# Opt-in shared context; an unset path retains the original CLI command.
+CLAUDE_LAUNCH=claude
+if [[ -n "${SAPPER_GLOBAL_CONTEXT_FILE:-}" ]]; then
+  printf -v CLAUDE_LAUNCH '%q %q exec %q' python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/lib/sapper_context.py" claude
+fi
+
 ROOT="${SAPPER_ROOT:-/work/runs}"
 LOG="$ROOT/drive.log"
 # Model tiers (SKILL 4.9): the commander runs SMART; each worker keeps the tier
@@ -328,7 +338,7 @@ relaunch_pane() {  # relaunch_pane <win> <cwd> <model> — claude TUI, same wind
     local provider=deepseek; [[ "$DS_BASE_URL" == https://api.deepseek.com* ]] && provider=deepseek-local
     cmd="cd '$cwd' && DEEPSEEK_API_KEY='$DS_KEY' codex --skip-git-repo-check -c model_provider=$provider -c model='$model' --dangerously-bypass-approvals-and-sandbox 2>&1; echo DRIVE_PANE_EXITED; exec sleep infinity"
   else
-    cmd="cd '$cwd' && $gw_env claude $RESUME_FLAG --model '$model' --effort max --dangerously-skip-permissions 2>&1; echo DRIVE_PANE_EXITED; exec sleep infinity"
+    cmd="cd '$cwd' && $gw_env $CLAUDE_LAUNCH $RESUME_FLAG --model '$model' --effort max --dangerously-skip-permissions 2>&1; echo DRIVE_PANE_EXITED; exec sleep infinity"
   fi
   # archived mission (TUI workers): re-brief after the window comes back —
   # a fresh post-restart session would otherwise sit at an empty prompt

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#162b39">
+  <title>Sapper · 任务工作台</title>
+  <script src="theme.js"></script>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="vendor/xterm.css">
+  <link rel="stylesheet" href="workspace.css">
+  <link rel="stylesheet" href="agent-topology.css">
+  <link rel="stylesheet" href="overview.css">
+  <link rel="stylesheet" href="native.css">
+  <script src="vendor/xterm.js" defer></script>
+  <script src="vendor/addon-fit.js" defer></script>
+  <script src="app.js" defer></script>
+  <script src="agent-topology-model.js" defer></script>
+  <script src="agent-topology.js" defer></script>
+  <script src="workspace.js" defer></script>
+  <script src="overview.js" defer></script>
+  <script src="native.js" defer></script>
+</head>
+<body>
+  <section id="login" class="login-screen">
+    <div class="login-brand"><span class="brand-mark">s</span><span>Sapper <small>Web console</small></span></div>
+    <div class="theme-switch login-theme" role="group" aria-label="全局主题"><button type="button" data-theme-choice="light" aria-pressed="false">浅色</button><button type="button" data-theme-choice="dark" aria-pressed="false">深色</button></div>
+    <form id="login-form" class="login-box">
+      <span class="section-label">连接你的 agent</span>
+      <h1>原来的能力，<br>更顺手的工作台。</h1>
+      <p>在浏览器查看任务、操作会话、补充信息。你的 agent 继续按原来的方式工作。</p>
+      <label>访问口令<input id="access-token" type="password" autocomplete="current-password" required placeholder="输入启动时生成的访问口令"></label>
+      <p class="field-help">口令保存在服务启动时提示的 <code>.sapper-web/token</code> 文件中。</p>
+      <button class="button primary" type="submit">进入工作台 <span aria-hidden="true">↗</span></button>
+      <p id="login-error" role="alert" class="error-text"></p>
+    </form>
+    <div class="login-foot">现有 CLI · tmux 会话 · 原生事实意图图</div>
+  </section>
+
+  <div id="workspace" class="workspace" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="./"><span class="brand-mark">s</span><span>Sapper<small>任务工作台</small></span></a>
+      <button id="home-button" class="sidebar-link home-link active">▦ 总体概览</button>
+      <button id="new-project" class="button new-project">＋ 新建任务</button>
+      <button id="bind-workspace" class="button bind-workspace">▱ 打开题目目录</button>
+      <div class="sidebar-heading"><span>工作目录中的任务</span><button id="refresh-projects" class="icon-button" aria-label="刷新任务">↻</button></div>
+      <nav id="project-list" aria-label="任务列表"></nav>
+      <div class="sidebar-bottom">
+        <button id="native-button" class="sidebar-link"><span>⌘</span> 原生功能</button>
+        <button id="context-button" class="sidebar-link"><span>◎</span> 全局上下文</button>
+        <button id="profiles-button" class="sidebar-link"><span>◈</span> 模型配置 <span id="profile-count" class="count">0</span></button>
+        <button id="knowledge-button" class="sidebar-link"><span>▤</span> 知识库</button>
+        <div class="environment"><span class="status-dot"></span><span id="environment-status">正在连接</span><button id="logout" class="icon-button" aria-label="退出登录">↪</button></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar"><div class="topbar-location"><span class="small-logo">s</span> 工作空间 <span class="slash">/</span> <span id="breadcrumb">任务</span></div><div class="topbar-actions"><span id="connection" class="connection">● 已连接</span><div class="theme-switch" role="group" aria-label="全局主题"><button type="button" data-theme-choice="light" aria-pressed="false">浅色</button><button type="button" data-theme-choice="dark" aria-pressed="false">深色</button></div></div></header>
+      <section id="overview" class="overview-page" hidden>
+        <div class="overview-heading"><div><h1>总体概览</h1><p>查看所有题目的进展、角色和可用环境。</p></div><button id="overview-bind" class="button primary">打开题目目录</button></div>
+        <div id="overview-summary" class="overview-summary" aria-label="总体统计"></div>
+        <div class="overview-grid"><div class="overview-main">
+          <section class="overview-section"><div class="panel-heading"><h2>工作区</h2><button id="overview-create" class="text-button">＋ 新建任务</button></div><div id="overview-projects"></div></section>
+          <section class="overview-section"><div class="panel-heading"><h2>角色动态</h2><span class="muted">只显示已登记的实际会话</span></div><div id="overview-agents"></div></section>
+          <section class="overview-section"><div class="panel-heading"><h2>最近运行</h2></div><div id="overview-runs"></div></section>
+        </div><aside class="overview-aside">
+          <section class="overview-context"><div class="panel-heading"><h2>共享环境</h2><button id="overview-context-edit" class="text-button">配置</button></div><p id="overview-context-state"></p><p id="overview-context-description" class="field-help"></p><p class="field-help">服务器、本机工具、远端目录等信息，统一提供给各角色。</p></section>
+          <section class="overview-machine"><h2>执行机</h2><dl id="overview-machine"></dl><p class="field-help">此处是运行 Web 服务的机器，远端资源由共享环境声明。</p></section>
+        </aside></div>
+      </section>
+      <section id="empty-state" class="empty-state" hidden>
+        <div class="empty-symbol" aria-hidden="true">⌘</div>
+        <h1>让任务有一个清晰的入口。</h1>
+        <p>新建一个任务，或将已有 <code>.sapper</code> 目录放入工作根目录。<br>已有任务会自动发现，原数据保持原样。</p>
+        <code id="root-path" class="path-block"></code>
+        <button class="button primary" id="empty-create">新建第一个任务</button>
+      </section>
+
+      <section id="project-workspace" hidden>
+        <div class="project-heading"><div><div class="project-kicker"><span id="project-name"></span><span id="project-status" class="badge"></span></div><h1 id="project-goal"></h1><p id="project-path" class="project-path"></p></div><button class="button primary" id="start-run">▶ 启动原 agent</button></div>
+        <div class="metrics"><div><strong id="fact-count">0</strong><span>事实记录</span></div><div><strong id="intent-count">0</strong><span>待办意图</span></div><div><strong id="pane-count">0</strong><span>活动终端</span></div><div><strong id="hint-count">0</strong><span>人工补充</span></div><span class="original-note">使用原 CLI 与 .sapper 数据</span></div>
+        <div class="workspace-actions"><button id="enable-workspace" class="button">启用 sapper</button><span id="workspace-readiness" class="field-help">正在检查接入</span><button id="workspace-native" class="text-button">原生功能</button><button id="advanced-run" class="text-button">高级原命令</button><button id="stop-workspace" class="text-button danger">停止本工作区</button></div>
+        <div class="tabs" role="tablist" aria-label="任务视图"><button data-tab="workspace" role="tab" aria-selected="false">题目工作区</button><button data-tab="agents" role="tab" aria-selected="false">角色与协作</button><button data-tab="memory" class="active" role="tab" aria-selected="true">事实与意图</button><button data-tab="console" role="tab" aria-selected="false">运行记录</button><button data-tab="files" role="tab" aria-selected="false">文件与附件</button><button id="graph-button" class="tab-end">查看原生图 ↗</button></div>
+        <section id="tab-workspace" class="tab-panel" hidden><div class="workspace-grid"><aside class="workspace-files"><div class="panel-heading"><h2>题目文件</h2><button id="workspace-file-up" class="text-button">上层</button></div><p id="workspace-file-path" class="field-help">工作区根目录</p><div id="workspace-file-list"></div></aside><div class="workspace-terminal"><div class="native-toolbar"><select id="native-pane" aria-label="选择角色终端"></select><button id="terminal-control" class="button">接管输入</button></div><div id="native-terminal" aria-label="Claude Code 原生终端"></div><div class="native-footer"><span id="native-mode">选择或启动角色会话</span><span>原 tmux PTY · 会话独立于网页</span></div></div><aside class="workspace-agents"><div class="panel-heading"><h2>角色与协作</h2><button id="new-agent" class="text-button">＋ 派发</button></div><div id="agent-list" class="agent-preview"></div><div id="service-list"></div></aside></div></section>
+
+        <section id="tab-agents" class="tab-panel" hidden><div id="agent-topology" class="agent-topology"></div></section>
+
+        <section id="tab-memory" class="tab-panel">
+          <div class="native-memory-tools"><form id="recall-form" class="inline-form"><input id="recall-query" required placeholder="检索原图历史：事实、意图和详细文档线索" aria-label="原生记忆检索"><button class="button" type="submit">检索记忆</button></form><div><button id="native-validate" class="text-button">校验原图</button><button id="native-frontier" class="text-button">可执行意图</button><button id="native-brainstorm" class="text-button">头脑风暴</button><button id="native-complete" class="text-button">完成项目</button></div></div><div id="recall-results" hidden></div>
+          <div class="memory-grid">
+            <div class="records"><div class="panel-heading"><h2>事实记录 <span id="facts-total"></span></h2><button id="add-fact" class="text-button">＋ 添加事实</button></div><div id="facts-list"></div></div>
+            <div class="intents"><div class="panel-heading"><h2>执行意图</h2><button id="add-intent" class="text-button">＋ 添加意图</button></div><div id="intents-list"></div></div>
+          </div>
+          <div class="hints-panel"><div class="panel-heading"><h2>人工补充</h2><span class="muted">写入原 hint，供 agent 后续读取</span></div><div id="hints-list"></div><form id="hint-form" class="inline-form"><textarea id="hint-content" rows="2" placeholder="补充线索、纠正条件，或说明下一步方向…" required></textarea><button class="button primary" type="submit">保存补充</button></form></div>
+        </section>
+
+        <section id="tab-console" class="tab-panel" hidden>
+          <div class="console-grid"><div class="terminal-section"><div class="terminal-toolbar"><label>原生终端<select id="pane-select" aria-label="选择终端"></select></label><button id="refresh-terminal" class="icon-button" aria-label="刷新终端">↻</button><span class="terminal-tag">2 秒快照</span></div><pre id="terminal-output" class="terminal-output" tabindex="0">尚无终端。启动原 agent、打开终端，或接入该目录中已有的 tmux 会话。</pre><div class="terminal-keys"><button data-key="C-c">Ctrl C · 中断</button><button data-key="Escape">Esc</button><button data-key="Tab">Tab</button><button data-key="Up">↑</button><button data-key="Down">↓</button><button data-key="Enter">Enter</button><button id="worker-manage">原 worker 管理</button></div><form id="terminal-form" class="terminal-input"><input id="terminal-text" aria-label="发送到终端的内容" placeholder="向选中的原会话发送文字…" required autocomplete="off"><button class="button primary" type="submit">发送 ↵</button></form><p class="field-help">发送表示已输入终端。是否读取或采用，请以原 agent 的回应为准。</p></div>
+          <aside class="run-sidebar"><div class="panel-heading"><h2>运行记录</h2><button id="open-shell" class="text-button">＋ 终端</button></div><div id="runs-list"></div></aside></div>
+          <div id="log-panel" class="log-panel" hidden><div class="panel-heading"><h2 id="log-title">运行输出</h2><div><label class="inline-check"><input id="follow-log" type="checkbox" checked> 跟随输出</label><button id="close-log" class="text-button">收起</button></div></div><pre id="log-output" tabindex="0"></pre><p class="field-help">新限时角色显示流式活动摘要；下载保留原始输出。活动或静默都不能单独证明有效进展或卡住。其他运行保留原终端日志。</p></div>
+        </section>
+
+        <section id="tab-files" class="tab-panel" hidden><div class="panel-heading"><div><h2>任务文件</h2><p class="field-help">上传的附件会自动记入 hint，不会向其他会话自动发送。</p></div><label class="button primary upload-label">↑ 上传附件<input id="upload-file" type="file" hidden></label></div><div class="file-breadcrumb"><button id="files-root" class="text-button">工作目录</button><span id="files-path"></span><button id="files-up" class="text-button">返回上层</button></div><div id="files-list"></div></section>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="native-dialog" class="native-dialog"><div class="dialog-heading"><h2>原生功能</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">使用表单调用原 sapper CLI。保留原参数、工具和调度循环；本轮不提供 TSecBench 平台操作。命令在所选工作区运行，输出进入原运行记录。</p>
+    <form id="native-form"><div class="native-selection"><label>执行工作区<select id="native-project" required></select></label><label>原生命令<select id="native-operation" required></select></label><label>模型配置<select id="native-profile"></select></label></div><p id="native-command-help" class="field-help"></p><div id="native-fields" class="native-fields"></div><div class="native-form-actions"><button id="native-preview-button" class="button" type="button">预览原命令</button><button id="native-execute" class="button primary" type="submit" disabled>执行原命令</button></div></form>
+    <section id="native-preview" hidden><h3>实际执行内容</h3><p id="native-preview-cwd" class="field-help"></p><pre id="native-preview-command"></pre><pre id="native-preview-fleet" hidden></pre><p id="native-preview-note" class="field-help"></p></section>
+    <details class="native-config"><summary>原生编队配置／提示词模板</summary><div class="inline-form"><input id="native-config-path" aria-label="原生配置文件" list="native-config-options" value="fleet.json"><datalist id="native-config-options"><option value="fleet.json">fleet.json · 编队</option value="templates/reason.md">reason.md · 推理</option><option value="templates/explore.md">explore.md · 执行</option><option value="templates/verify.md">verify.md · 验证</option><option value="templates/brainstorm.md">brainstorm.md · 头脑风暴</option><option value="templates/blindspot.md">blindspot.md · 盲点</option><option value="templates/command.md">command.md · 指挥官</option></datalist><button id="native-config-load" class="button" type="button">读取配置</button></div><textarea id="native-config-content" rows="12" aria-label="原生配置内容" disabled></textarea><p class="field-help">可填写编队 JSON 的相对路径或选择模板。模板首次读取显示仓库原版；首次保存补齐缺失的原版模板，保留已有模板，不改仓库默认。编队沿用原 session／panes 结构；停止原生编队使用 fleet down。</p><button id="native-config-save" class="button" type="button" disabled>保存工作区配置</button></details>
+  </dialog>
+  <dialog id="native-output-dialog" class="wide-dialog"><div class="dialog-heading"><h2>原命令输出</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><pre id="native-output-text" class="file-preview"></pre><a id="native-output-download" class="button" download>下载运行日志</a></dialog>
+  <dialog id="intent-action-dialog"><form id="intent-action-form"><div class="dialog-heading"><h2 id="intent-action-title"></h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><input name="action" type="hidden"><input name="id" type="hidden"><label>执行者标签<input name="worker" value="web-user" required></label><div id="intent-result-fields"><label>结果标题<input name="title"></label><label>已确认的结果<textarea name="description" rows="3"></textarea></label><label>证据与详细文档<textarea name="doc" rows="4"></textarea></label><label>结果类型<select name="kind"><option value="">普通事实</option><option value="note">note</option><option value="host">host</option><option value="service">service</option><option value="cred">cred</option><option value="vuln">vuln</option><option value="loot">loot</option><option value="flag">flag</option></select></label><label>结构化数据（每行 key=value）<textarea name="data" rows="2"></textarea></label></div><p class="field-help">通过原 Store 操作，保留领取者和确认门槛校验；未确认的意图不能直接完成。</p><div class="dialog-actions"><button class="button primary" type="submit">执行图操作</button></div></form></dialog>
+  <dialog id="context-dialog" class="wide-dialog"><form id="context-form">
+    <div class="dialog-heading"><h2>全局上下文</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div>
+    <p class="dialog-intro">统一填写服务器信息、本机环境、工具和使用约定。适用于本 Web 服务管理的各工作区与角色，不修改用户全局 Claude 设置。</p>
+    <div class="context-controls"><label class="inline-check"><input id="context-enabled" name="enabled" type="checkbox">启用全局上下文</label><span id="context-revision" class="badge"></span></div>
+    <label for="context-content">共享文本 <span class="muted">支持 Markdown，最多 12,000 字符</span></label>
+    <textarea id="context-content" name="content" rows="12" maxlength="12000" placeholder="例如：&#10;本机：macOS arm64，已安装 Python 3、Docker。&#10;辅助执行机：Linux x86_64，SSH 别名 x64-debug。&#10;远端目录：/work/sapper/&lt;任务名&gt;。&#10;用途：运行、调试本机无法原生执行的程序。&#10;执行前确认程序架构与依赖。"></textarea>
+    <fieldset class="context-channels"><legend>注入方式</legend>
+      <label class="inline-check"><input id="context-prompt" name="prompt_enabled" type="checkbox">启动提示词：新建、派发和恢复时追加到原角色说明</label>
+      <label class="inline-check"><input id="context-hook" name="hook_enabled" type="checkbox">会话 hooks：开始会话及发送消息时检查最新版本</label>
+    </fieldset>
+    <p class="field-help">这里填写的文本不会作为 shell 脚本执行。启动提示词已提供同一版本时，hook 不重复输出该文本；启用 hooks 后，运行中会话在后续消息时读取更新；仅启用启动提示词时需新建或恢复会话。保存不代表模型已采用，角色面板会显示启动版本及最近 hook 检查版本。</p>
+    <p class="field-help">关闭后停止后续注入，已进入会话历史的内容会保留。SSH 认证继续使用原环境配置。</p>
+    <div class="dialog-actions"><button id="context-reload" class="button" type="button">重新读取</button><button class="button primary" type="submit">保存全局配置</button></div>
+  </form></dialog>
+  <dialog id="confirm-dialog"><div class="dialog-heading"><h2>确认操作</h2></div><p id="confirm-message" class="dialog-intro"></p><div class="dialog-actions"><button id="confirm-cancel" class="button" type="button">取消</button><button id="confirm-accept" class="button primary" type="button">确认操作</button></div></dialog>
+  <dialog id="bind-dialog" class="wide-dialog"><form id="bind-form">
+    <div class="dialog-heading"><h2>选择题目文件夹</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div>
+    <p class="dialog-intro">打开文件夹后，点击“选择此文件夹”。文件保持原位置。</p>
+    <input name="path" id="bind-path" type="hidden">
+    <div id="directory-roots" class="directory-roots" role="group" aria-label="常用位置"></div>
+    <div class="directory-picker">
+      <div class="directory-toolbar"><button id="directory-up" class="button" type="button" disabled>↑ 上一级</button><nav id="directory-breadcrumbs" aria-label="当前位置"></nav></div>
+      <div id="directory-list" role="group" aria-label="子文件夹"></div>
+    </div>
+    <p id="directory-status" class="field-help" role="status" aria-live="polite"></p>
+    <div class="form-row"><label>显示名称 <span class="muted">选填</span><input name="name"></label><label>任务目标 <span class="muted">选填</span><input name="goal"></label></div>
+    <p class="field-help">这里显示运行 sapper 的机器上的文件夹。</p>
+    <div class="dialog-actions"><button class="button dialog-close" type="button">取消</button><button id="directory-select" class="button primary" type="submit" disabled>选择此文件夹</button></div>
+  </form></dialog>
+  <dialog id="agent-dialog" class="wide-dialog"><form id="agent-form"><div class="dialog-heading"><h2>启动原 Claude Code 角色</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div><p class="dialog-intro">主执行者默认在题目根目录工作；其他角色使用独立目录并共享原 .sapper 图。每个角色有明确的 Claude 会话 ID。</p><div class="form-row"><label>角色<select name="role" id="agent-role"><option value="worker">执行者／士兵</option><option value="commander">指挥官</option><option value="general">将军</option><option value="scout">侦察兵</option><option value="verifier">验证者</option><option value="custom">自定义职责</option></select></label><label>模型配置<select name="profile_id" id="agent-profile"></select></label></div><section id="agent-role-info" class="agent-role-info"><p id="agent-role-summary">正在读取角色基础职责…</p><p id="agent-role-source" class="field-help"></p><details><summary>查看实际追加的基础提示词</summary><pre id="agent-role-prompt"></pre></details></section><div class="form-row"><label>父角色<select name="parent_agent_id" id="agent-parent"><option value="">无／独立主会话</option></select></label><label>执行形式<select name="execution_mode"><option value="tui">原交互式 Claude Code</option><option value="print">限时单次 Claude Code --print</option></select></label></div><label>角色名称 <span class="muted">选填</span><input name="name" placeholder="例如 代码审计／附件分析"></label><label>任务说明<textarea name="mission" id="agent-mission" rows="4" required></textarea></label><div class="form-row"><label>工作目录<select name="location" id="agent-location"><option value="root">题目根目录</option><option value="agent">独立角色目录，共享图与题目资料</option></select></label><label>单次任务时限（分钟）<input name="minutes" type="number" min="1" max="1440" value="10"></label></div><fieldset id="agent-scope" hidden><legend>指挥官可派发的工作区</legend><div id="agent-scope-options"></div><p class="field-help">当前工作区必选；只可增加已启用的题目。各题记忆与子角色仍分别保存。</p></fieldset><label class="inline-check"><input name="skip_permissions" type="checkbox"> 使用原 --dangerously-skip-permissions 选项</label><label class="inline-check watchdog-option"><input name="watchdog" id="agent-watchdog" type="checkbox"> 指挥官启动后启用 watchdog（保活与自动续轮；唤醒会调用模型）</label><div class="dialog-actions"><button class="button dialog-close" type="button">取消</button><button class="button primary" type="submit">启动角色</button></div></form></dialog>
+  <dialog id="agent-message-dialog"><form id="agent-message-form"><div class="dialog-heading"><h2 id="agent-message-title">给角色补充说明</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div><textarea id="agent-message-text" required rows="5" aria-label="角色消息"></textarea><p id="agent-message-help" class="field-help">发送到选定角色的真实终端，不代表模型已读取或采用。</p><div class="dialog-actions"><button class="button primary" type="submit">发送说明</button></div></form></dialog>
+  <dialog id="attach-agent-dialog"><form id="attach-agent-form"><div class="dialog-heading"><h2>登记已有角色</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div><input name="pane_id" type="hidden"><label>实际职责<select name="role"><option value="worker">执行者</option><option value="commander">指挥官</option><option value="general">将军</option><option value="scout">侦察兵</option><option value="verifier">验证者</option><option value="custom">自定义职责</option></select></label><label>显示名称<input name="name"></label><label>已知 Claude 会话 UUID <span class="muted">未知请留空</span><input name="claude_session_id"></label><p class="field-help">不移动目录、不重启会话。未知 ID 不会用“最近会话”猜测恢复。旧 watchdog 继续按原规则运行。</p><div class="dialog-actions"><button class="button primary" type="submit">登记</button></div></form></dialog>
+
+  <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2>新建任务</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">在工作根目录创建一个目录，使用原 sapper 初始化事实图。</p><label>目录名<input name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,63}" placeholder="例如 reverse-analysis"></label><label>任务目标<textarea name="goal" required rows="3" placeholder="描述要解决的问题与期望结果"></textarea></label><label>已有资料与约束 <span class="muted">选填</span><textarea name="context" rows="3" placeholder="将保存为原 hint"></textarea></label><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">创建任务</button></div></form></dialog>
+
+  <dialog id="run-dialog"><form id="run-form"><div class="dialog-heading"><h2>启动原 agent</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">在独立 tmux 会话调用原命令。页面关闭后继续运行。</p><div class="form-row"><label>运行方式<select name="kind" id="run-kind"><option value="auto">sapper auto · 自主推进</option><option value="dispatch">sapper dispatch · 单步调度</option><option value="shell">交互式终端</option><option value="custom">自定义原命令</option></select></label><label>模型配置<select name="profile_id" id="run-profile"><option value="">继承原环境</option></select></label></div><div id="auto-options" class="form-row"><label>运行时长（分钟）<input name="minutes" type="number" min="1" max="1440" value="10"></label><label>最多步骤<input name="max_steps" type="number" min="1" max="1000" value="8"></label></div><label id="dispatch-options" hidden>调度目标<input name="target" value="reason" placeholder="reason / verify / intent ID"></label><label id="custom-options" hidden>原命令<input name="command" placeholder="例如 sapper status；参数按原样传递"><span class="field-help">按参数列表执行。需要管道时显式使用 bash -lc；密钥请放环境或配置中。</span></label><div id="agent-options" class="checkbox-group"><label><input type="checkbox" name="skip_permissions"> 沿用原 --skip-permissions 选项</label><label><input type="checkbox" name="verify"> auto 后验证</label><label><input type="checkbox" name="dry_run"> 试运行／仅输出提示词</label></div><p class="field-help">未勾选的参数不会被默认添加；引擎、工具与提示词仍由原 sapper 决定。</p><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">启动</button></div></form></dialog>
+
+  <dialog id="record-dialog"><form id="record-form"><div class="dialog-heading"><h2 id="record-heading">添加记录</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><input type="hidden" name="action"><label id="record-from-label" hidden>来源事实<select name="from" id="record-from" multiple size="4"></select><span class="field-help">按住 Ctrl／Command 可选择多个事实，goal 不能作为来源。</span></label><label>短标题 <span class="muted">选填</span><input name="title"></label><label>说明<textarea name="description" rows="3" required></textarea></label><label id="record-kind-label">事实类型<select name="kind"><option value="">不指定类型</option><option>note</option><option>host</option><option>service</option><option>cred</option><option>vuln</option><option>loot</option><option>flag</option></select></label><label>详细文档 <span class="muted">选填</span><textarea name="doc" rows="4"></textarea></label><label id="record-confirm-label" class="inline-check" hidden><input type="checkbox" name="requires_confirmation"> 该意图需要确认后执行</label><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">保存记录</button></div></form></dialog>
+
+  <dialog id="detail-dialog" class="wide-dialog"><div class="dialog-heading"><h2 id="detail-title">记录详情</h2><button class="dialog-close icon-button" aria-label="关闭">×</button></div><div id="detail-meta" class="muted"></div><p id="detail-description"></p><label>详细文档<textarea id="detail-doc" rows="12"></textarea></label><div class="dialog-actions"><button class="button dialog-close">关闭</button><button class="button primary" id="save-doc">保存文档</button></div></dialog>
+
+  <dialog id="profiles-dialog" class="wide-dialog"><div class="dialog-heading"><h2>模型配置</h2><button class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">为各角色配置模型和接口协议。Responses／Chat Completions 通过本机协议适配接入原 Claude Code，工具仍由原 agent 执行。</p><div id="profiles-list"></div><details class="profile-bridges"><summary>后台协议适配服务</summary><p class="field-help">服务在关闭网页后继续供原 agent／编队使用。停止会中断正在使用它的模型请求；新启动的角色会自动重建服务。</p><button id="profile-bridges-refresh" class="text-button" type="button">刷新服务状态</button><div id="profile-bridges-list"></div></details>
+    <form id="profile-form" class="profile-form"><input type="hidden" name="id">
+      <div class="form-row"><label>配置名称<input name="name" required placeholder="例如 主力模型"></label><label>接口协议<select name="protocol" id="profile-protocol"><option value="anthropic">Anthropic Messages</option><option value="responses">OpenAI Responses · /responses</option><option value="chat_completions">OpenAI Chat Completions · /chat/completions</option></select></label></div>
+      <label>API 地址 <span class="muted">空白则继承对应协议环境或官方地址</span><input name="base_url" type="url" placeholder="https://your-gateway.example/v1"></label><p id="profile-protocol-help" class="field-help"></p>
+      <label>API Key <span class="muted">编辑时留空保留原密钥</span><input name="api_key" type="password" autocomplete="new-password"></label><label class="inline-check"><input type="checkbox" name="clear_key"> 清除已保存密钥，改为继承对应协议环境</label>
+      <label>模型 ID<input name="model" id="profile-model" list="profile-models" required placeholder="手动填写，或先获取模型列表"><datalist id="profile-models"></datalist></label>
+      <div class="profile-probe-actions"><button type="button" id="profile-fetch-models" class="button">获取模型</button><button type="button" id="profile-test" class="button">测试连接</button><span class="field-help">使用当前表单，可在保存前测试；文本生成测试会调用所选模型。</span></div>
+      <p id="profile-probe-result" class="profile-probe-result" role="status" aria-live="polite" hidden></p>
+      <div id="profile-model-picker" hidden><label>筛选模型<input id="profile-model-filter" type="search" placeholder="输入模型名称"></label><div id="profile-model-options" class="profile-model-options"></div></div>
+      <details><summary>高级设置</summary><div class="form-row"><label>请求超时（秒）<input name="timeout_seconds" type="number" min="5" max="600" value="120"></label><label>输出 token 上限<input name="max_output_tokens" type="number" min="0" max="131072" value="0"><span class="field-help">0 跟随原 agent；仅对协议适配生效。</span></label></div><label id="profile-token-field-label" hidden>Chat Completions token 参数<select name="token_field"><option value="max_completion_tokens">max_completion_tokens（标准）</option><option value="max_tokens">max_tokens（旧兼容网关）</option></select></label><label id="profile-engine-label">SAPPER_BIN <span class="muted">选填，仅 Messages 原 CLI 包装器</span><input name="engine_prefix" placeholder="符合原 sapper 调度协议的 CLI 包装命令"></label><p class="field-help">包装器须接受原 Claude 风格参数与 JSON 输出。工作区交互角色使用原 Claude Code。</p></details>
+      <p class="field-help">密钥仅保存在 Web 私有目录，读取配置时不回显。修改配置不热切换已有会话；模型列表可用不代表所选模型支持工具。</p><div class="dialog-actions"><button type="button" id="reset-profile" class="button">清空表单</button><button type="submit" class="button primary">保存配置</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="worker-dialog"><form id="worker-form"><div class="dialog-heading"><h2>原 worker 管理</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">直接调用原 worker.sh，保留 sapper-cmd 会话、平台环境和原有行为；不会新建另一套指挥官。</p><label>操作<select name="worker_action"><option value="list">查看 workers</option><option value="board">查看原看板</option><option value="spawn">派发 worker</option><option value="kill">停止 worker</option></select></label><label>题目／任务代号或 pane 名称<input name="worker_target" placeholder="spawn 填 code，kill 填 code 或 pane"></label><label>任务说明 <span class="muted">派发时选填</span><textarea name="mission" rows="3"></textarea></label><label class="inline-check"><input name="close_instance" type="checkbox"> 停止后同时交卷并关闭平台实例（原 --close）</label><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">执行原操作</button></div></form></dialog>
+
+  <dialog id="viewer-dialog" class="wide-dialog"><div class="dialog-heading"><h2 id="viewer-title"></h2><button class="dialog-close icon-button" aria-label="关闭">×</button></div><pre id="viewer-content" class="file-preview"></pre><a id="viewer-download" class="button" download>下载原文件</a></dialog>
+  <dialog id="run-budget-dialog"><form id="run-budget-form"><div class="dialog-heading"><h2>延长本次运行预算</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div><input name="run_id" type="hidden"><label>增加分钟数<input name="minutes" type="number" min="1" max="1440" value="10" required></label><p class="field-help">只增加当前运行预算，累计最多 1440 分钟。已经开始停止的任务需按原会话恢复。</p><div class="dialog-actions"><button class="button dialog-close" type="button">取消</button><button class="button primary" type="submit">延长预算</button></div></form></dialog>
+  <dialog id="graph-dialog" class="graph-dialog"><div class="dialog-heading"><h2>原生事实意图图</h2><button class="dialog-close icon-button" aria-label="关闭">×</button></div><iframe id="graph-frame" title="原 sapper 事实意图图"></iframe></dialog>
+  <dialog id="knowledge-dialog" class="wide-dialog"><div class="dialog-heading"><h2>原知识库</h2><button class="dialog-close icon-button" aria-label="关闭">×</button></div><form id="knowledge-form" class="inline-form"><input id="knowledge-query" placeholder="搜索技术、方法或关键词"><button class="button" type="submit">搜索</button></form><div class="native-knowledge-actions"><button id="kb-native-add" class="text-button">新增知识</button><button id="kb-native-import" class="text-button">导入 Markdown</button><button id="kb-native-all" class="text-button">完整知识库操作</button></div><div id="knowledge-list"></div></dialog>
+</body>
+</html>

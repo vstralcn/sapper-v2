@@ -25,6 +25,17 @@
 #     create, guarded sapper init, next free -wN index derived from live panes
 set -o pipefail
 
+# Explicit local workspace adapter. The original competition path below is unchanged.
+if [[ "${SAPPER_MODE:-}" == workspace ]]; then
+  exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/lib/sapper_workspace.py" worker "$@"
+fi
+
+# Opt-in shared context; an unset path retains the original CLI command.
+CLAUDE_LAUNCH=claude
+if [[ -n "${SAPPER_GLOBAL_CONTEXT_FILE:-}" ]]; then
+  printf -v CLAUDE_LAUNCH '%q %q exec %q' python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/lib/sapper_context.py" claude
+fi
+
 ROOT="${SAPPER_ROOT:-/work/runs}"
 LOG="$ROOT/drive.log"
 # Model tiers & gateways (SKILL 4.9, final doctrine): ALL-IN FLAGSHIP.
@@ -160,7 +171,7 @@ sync_session_env() {  # tmux new-window inherits the SESSION environment, not th
                       # PATH so the panes see the same tooling as the commander.
   local k v
   for k in PATH ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN SAPPER_MODEL \
-           SAPPER_MODEL_FLASH BENCHMARK_BASE_URL BENCHMARK_TOKEN; do
+           SAPPER_MODEL_FLASH BENCHMARK_BASE_URL BENCHMARK_TOKEN SAPPER_GLOBAL_CONTEXT_FILE; do
     v=${!k:-}
     [[ -n "$v" ]] && tmux set-environment -t "$SESSION" "$k" "$v" >/dev/null 2>&1 || true
   done
@@ -395,7 +406,7 @@ except Exception: pass' 2>/dev/null)
         "cd $dir && DEEPSEEK_API_KEY='$DS_KEY' codex --skip-git-repo-check -c model_provider=$provider -c model='$model' --dangerously-bypass-approvals-and-sandbox 2>&1; echo DRIVE_PANE_EXITED; exec sleep infinity"
     else
       tmux new-window -d -t "$SESSION" -n "$pane" \
-        "cd $dir && $gw_env claude --model '$model' --effort max --dangerously-skip-permissions 2>&1; echo DRIVE_PANE_EXITED; exec sleep infinity"
+        "cd $dir && $gw_env $CLAUDE_LAUNCH --model '$model' --effort max --dangerously-skip-permissions 2>&1; echo DRIVE_PANE_EXITED; exec sleep infinity"
     fi
   else
     if [[ "$engine" == codex ]]; then

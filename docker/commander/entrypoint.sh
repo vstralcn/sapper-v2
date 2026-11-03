@@ -21,6 +21,12 @@ set -uo pipefail
 log() { printf '[sapper-cmd] %s\n' "$*"; }
 die() { printf '[sapper-cmd] FATAL: %s\n' "$*" >&2; exit 1; }
 
+# Opt-in shared context; an unset path retains the original CLI command.
+CLAUDE_LAUNCH=claude
+if [[ -n "${SAPPER_GLOBAL_CONTEXT_FILE:-}" ]]; then
+  printf -v CLAUDE_LAUNCH '%q %q exec %q' python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/lib/sapper_context.py" claude
+fi
+
 ROOT="${SAPPER_ROOT:-/work/runs}"
 LOG="$ROOT/drive.log"
 MODEL="${SAPPER_MODEL:-glm-5.3[1m]}"   # commander brain: SMART tier
@@ -102,7 +108,7 @@ accept_dialogs() {  # accept_dialogs <window> <pane> -> 0 if a dialog was dismis
 }
 
 # ---- 5. tmux session: window 0 = 'commander' -------------------------------
-CMDER_CMD="cd '$CMD_HOME' && claude --model '$MODEL' --effort max --dangerously-skip-permissions 2>&1; echo DRIVE_PANE_EXITED; exec sleep infinity"
+CMDER_CMD="cd '$CMD_HOME' && $CLAUDE_LAUNCH --model '$MODEL' --effort max --dangerously-skip-permissions 2>&1; echo DRIVE_PANE_EXITED; exec sleep infinity"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   tmux kill-window -t "$SESSION:commander" 2>/dev/null || true
   tmux new-window -d -t "$SESSION" -n commander "$CMDER_CMD"

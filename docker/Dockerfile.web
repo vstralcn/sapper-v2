@@ -1,0 +1,11 @@
+# Optional Web entrypoint layered on the unchanged original tool environment.
+# Requires the existing sapper-agent:commander image; does not start commander.
+FROM sapper-agent:commander
+
+COPY --chown=agent:agent lib/ /opt/sapper/lib/
+COPY --chown=agent:agent web/ /opt/sapper/web/
+COPY --chown=agent:agent docker/commander/worker.sh docker/commander/watchdog.sh docker/commander/entrypoint.sh /opt/sapper/docker/commander/
+
+EXPOSE 8766
+ENTRYPOINT ["python3", "/opt/sapper/lib/sapper_web.py"]
+CMD ["--host", "0.0.0.0", "--root", "/work/runs", "--state", "/work/web-state", "--port", "8766"]
