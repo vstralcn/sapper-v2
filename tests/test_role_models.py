@@ -100,6 +100,43 @@ class RoleModelTests(unittest.TestCase):
         self.app.delete_profile(self.ds["id"])
         self.assertNotIn(self.ds["id"], [p["id"] for p in self.app.profiles()])
 
+    def test_workspace_overrides_global_and_inherits_when_cleared(self):
+        other = self.app.create_project({"name": "other", "goal": "separate defaults"})
+        self.assign({"scout": self.ds["id"], "general": self.ds["id"]})
+        config = self.app.save_role_models({"assignments": {"scout": self.glm["id"], "worker": ""},
+                                           "expected_revision": self.app.role_models()["revision"]}, self.pid)
+        self.assertEqual(config["global_assignments"]["scout"], self.ds["id"])
+        self.assertEqual(self.launch(role="scout")["profile_id"], self.glm["id"])
+        self.assertEqual(self.launch(role="general")["profile_id"], self.ds["id"])
+        self.assertEqual(self.launch(role="scout", profile_id="")["profile_id"], "")
+        self.assertEqual(self.app.role_profile_id("scout", {}, workspace_id=other["id"]), self.ds["id"])
+        self.assertEqual(Console(self.app.root, self.app.state).role_models(self.pid)["assignments"], config["assignments"])
+        with self.assertRaisesRegex(WebError, "先在角色默认模型"):
+            self.app.delete_profile(self.glm["id"])
+        with self.assertRaises(WebError) as stale:
+            self.app.save_role_models({"assignments": {}, "expected_revision": config["revision"] - 1}, self.pid)
+        self.assertEqual(stale.exception.status, 409)
+        self.app.save_role_models({"assignments": {}, "expected_revision": config["revision"]}, self.pid)
+        self.assertEqual(self.launch(role="scout")["profile_id"], self.ds["id"])
+
+    def test_automatic_child_uses_target_workspace_model(self):
+        other = self.app.create_project({"name": "target", "goal": "target workspace"})
+        self.app.workspaces.enable(other["id"], {})
+        self.assign({"scout": self.glm["id"]})
+        self.app.save_role_models({"assignments": {"scout": self.ds["id"]},
+                                  "expected_revision": self.app.role_models()["revision"]}, other["id"])
+        parent = self.launch(role="commander", profile_id=self.glm["id"], workspace_scope=[self.pid, other["id"]])
+        basis = self.app.store(other["id"]).add_fact("target evidence", "user")["id"]
+        env = {"SAPPER_AGENT_ID": parent["id"], "SAPPER_WORKSPACE_ID": self.pid}
+        with mock.patch.dict(os.environ, env), mock.patch("sapper_workspace.console_from_environment", return_value=self.app):
+            with contextlib.redirect_stdout(io.StringIO()):
+                worker(["spawn", other["id"], "--from", basis, "--role", "scout"])
+            self.assertEqual(self.start.call_args.args[1]["profile_id"], self.ds["id"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                worker(["spawn", other["id"], "--from", basis, "--role", "scout", "--model", "target-override"])
+            chosen = next(p for p in self.app.profiles() if p["id"] == self.start.call_args.args[1]["profile_id"])
+            self.assertEqual(chosen["protocol"], "chat_completions")
+
     def test_worker_cli_uses_target_role_and_preserves_explicit_flags(self):
         parent = self.launch(role="commander", profile_id=self.glm["id"])
         self.assign({"scout": self.ds["id"], "general": self.ds["id"]})

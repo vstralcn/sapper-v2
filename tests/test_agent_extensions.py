@@ -54,6 +54,29 @@ class ExtensionTests(unittest.TestCase):
         run = self.manager.create_session(self.pid, {"mission": "fixture", **data})
         return self.manager.agent(run["agent_id"])
 
+    def test_global_library_without_workspace_and_independent_selections(self):
+        app = Console(self.base / "empty-tasks", self.base / "empty-state")
+        ext = app.workspaces.extensions
+        app.workspaces._capabilities = {"available": False}
+        self.assertEqual(app.projects(), [])
+        data = ext.update(None, {"action": "save", "kind": "mcp", "name": "global-server",
+                                 "config": {"command": "fixture"}, "expected_revision": 0})
+        self.assertEqual(data["workspaces"], {})
+        self.assertEqual(len(ext.view()["mcp"]), 1)
+        with self.assertRaisesRegex(ExtensionError, "选择要配置的工作区"):
+            ext.update(None, {"action": "defaults", "selection": {"mcp_ids": [], "skill_ids": []}, "expected_revision": 1})
+        first = app.create_project({"name": "first", "goal": "first"})
+        second = app.create_project({"name": "second", "goal": "second"})
+        selection = {"mcp_ids": [data["mcp"][0]["id"]], "skill_ids": []}
+        ext.update(first["id"], {"action": "defaults", "selection": selection, "expected_revision": 1})
+        self.assertEqual(ext.view(first["id"])["selection"], selection)
+        self.assertEqual(ext.view(second["id"])["selection"]["mcp_ids"], [])
+        with self.assertRaisesRegex(ExtensionError, "取消此资源"):
+            ext.update(None, {"action": "delete", "kind": "mcp", "id": selection["mcp_ids"][0], "expected_revision": 2})
+        ext.update(first["id"], {"action": "defaults", "selection": {"mcp_ids": [], "skill_ids": []}, "expected_revision": 2})
+        ext.update(None, {"action": "delete", "kind": "mcp", "id": selection["mcp_ids"][0], "expected_revision": 3})
+        self.assertEqual(ext.view()["mcp"], [])
+
     def test_distinct_sessions_override_defaults_and_resume_original_snapshot(self):
         selection = self.resources()
         before = (self.root / ".claude/settings.json").read_bytes()

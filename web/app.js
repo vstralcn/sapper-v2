@@ -344,6 +344,7 @@ async function loadFiles() {
 function refreshProfiles() {
   $("profile-count").textContent = state.profiles.length;
   $("models-total").textContent = state.profiles.length;
+  $("settings-model-count").textContent = state.profiles.length;
   const select = $("run-profile");
   const selected = select.value;
   select.replaceChildren(element("option", "", "继承原环境"));
@@ -380,6 +381,7 @@ function refreshProfiles() {
   }
   renderRoleModels();
   refreshAgentModelOptions();
+  if (typeof renderWorkspaceModels === "function") renderWorkspaceModels(true);
 }
 function openRun(kind = "auto") {
   $("run-form").reset();

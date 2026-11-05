@@ -193,11 +193,13 @@ class AgentExtensions:
         return json.loads(self.path.read_text()) if self.path.exists() else {
             "revision": 0, "mcp": [], "skills": [], "workspaces": {}}
 
-    def view(self, pid):
-        self.app.project(pid)
+    def view(self, pid=None):
+        if pid is not None:
+            self.app.project(pid)
         cfg = self.read()
         return {"revision": cfg["revision"], "mcp": cfg["mcp"], "skills": cfg["skills"],
-                "selection": cfg["workspaces"].get(pid, EMPTY), "claude": self.manager.capabilities()}
+                "selection": cfg["workspaces"].get(pid, EMPTY), "workspaces": cfg["workspaces"],
+                "claude": self.manager.capabilities()}
 
     def select(self, cfg, selection):
         if not isinstance(selection, dict) or set(selection) != set(EMPTY):
@@ -211,12 +213,15 @@ class AgentExtensions:
 
     def update(self, pid, data):
         with self.manager.lifecycle():
-            self.app.project(pid)
+            if pid is not None:
+                self.app.project(pid)
             cfg = self.read()
             if type(data.get("expected_revision")) is not int or data["expected_revision"] != cfg["revision"]:
                 raise ExtensionError("资源配置已变化，请重新读取后保存", 409)
             action = data.get("action")
             if action == "defaults":
+                if pid is None:
+                    raise ExtensionError("请选择要配置的工作区")
                 cfg["workspaces"][pid] = self.select(cfg, data.get("selection"))
             elif action == "import_mcp":
                 servers = data.get("config", {}).get("mcpServers") if isinstance(data.get("config"), dict) else None

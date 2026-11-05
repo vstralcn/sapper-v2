@@ -358,13 +358,18 @@ class Console:
         return [{k: v for k, v in p.items() if k != "api_key"} | {"protocol": sapper_models.protocol(p), "has_key": bool(p.get("api_key"))}
                 for p in self.config()["profiles"]]
 
-    def role_models(self):
+    def role_models(self, pid=None):
+        if pid is not None:
+            self.project(pid)
         cfg = self.config()
-        return {"assignments": cfg.get("role_profiles", {}),
+        return {"assignments": cfg.get("workspace_role_profiles", {}).get(pid, {}) if pid is not None else cfg.get("role_profiles", {}),
+                "global_assignments": cfg.get("role_profiles", {}),
                 "revision": cfg.get("role_profiles_revision", 0),
                 "roles": [{"id": role, "label": label} for role, label in ROLES.items()]}
 
-    def save_role_models(self, data):
+    def save_role_models(self, data, pid=None):
+        if pid is not None:
+            self.project(pid)
         assignments = data.get("assignments")
         roles = ROLES
         if not isinstance(assignments, dict) or any(role not in roles for role in assignments):
@@ -384,14 +389,19 @@ class Console:
                     raise WebError("角色默认模型不能使用 CLI 包装器，请选择普通模型连接")
             # Missing entries follow the original inheritance rule. Empty entries
             # explicitly use the environment, even for children of another model.
-            cfg["role_profiles"] = assignments
+            if pid is None:
+                cfg["role_profiles"] = assignments
+            else:
+                cfg.setdefault("workspace_role_profiles", {})[pid] = assignments
             cfg["role_profiles_revision"] = revision + 1
             private_json(self.config_path, cfg)
-        self.audit("role_models.saved", revision=revision + 1, assignments=assignments)
-        return self.role_models()
+        self.audit("role_models.saved", workspace=pid, revision=revision + 1, assignments=assignments)
+        return self.role_models(pid)
 
-    def role_profile_id(self, role, data, fallback=""):
-        value = data["profile_id"] if "profile_id" in data else self.config().get("role_profiles", {}).get(role, fallback)
+    def role_profile_id(self, role, data, fallback="", *, workspace_id=None):
+        cfg = self.config()
+        defaults = {**cfg.get("role_profiles", {}), **cfg.get("workspace_role_profiles", {}).get(workspace_id, {})}
+        value = data["profile_id"] if "profile_id" in data else defaults.get(role, fallback)
         if not isinstance(value, str):
             raise WebError("模型连接 ID 必须为文本")
         return value
@@ -459,7 +469,8 @@ class Console:
         with self.config_lock():
             cfg = self.config()
             used = [label for role, label in ROLES.items()
-                    if cfg.get("role_profiles", {}).get(role) == pid]
+                    if cfg.get("role_profiles", {}).get(role) == pid or any(
+                        assignments.get(role) == pid for assignments in cfg.get("workspace_role_profiles", {}).values())]
             if used:
                 raise WebError("该连接用于角色默认模型：" + "、".join(used) + "；请先在角色默认模型中重新分配", 409)
             cfg["profiles"] = [p for p in cfg["profiles"] if p["id"] != pid]
@@ -1096,7 +1107,7 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             q = lambda name, default="": query.get(name, [default])[0]
             static_names = {"/", "/theme.js", "/app.js", "/style.css", "/workspace.js", "/extensions.js", "/workspace.css", "/overview.js", "/overview.css", "/native.js", "/native.css",
-                            "/agent-topology.js", "/agent-topology-model.js", "/agent-topology.css", "/models.js", "/models.css",
+                            "/agent-topology.js", "/agent-topology-model.js", "/agent-topology.css", "/models.js", "/models.css", "/settings.css",
                             "/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js"}
             if path in static_names and method == "GET":
                 filename = "index.html" if path == "/" else path[1:]
@@ -1166,6 +1177,8 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) == 5:
                     wid, action = parts[3:]
                     if method == "GET":
+                        if action == "role-models":
+                            return self.reply(200, app.role_models(wid))
                         if action == "extensions":
                             return self.reply(200, app.workspaces.extensions.view(wid))
                         if action == "inspect":
@@ -1177,6 +1190,8 @@ class Handler(BaseHTTPRequestHandler):
                             return self.reply(200, app.workspaces.role_info(wid, q("role") or "worker", scope))
                     elif method == "POST":
                         data = self.body()
+                        if action == "role-models":
+                            return self.reply(200, app.save_role_models(data, wid))
                         if action == "extensions":
                             return self.reply(200, app.workspaces.extensions.update(wid, data))
                         if action == "enable":
@@ -1214,6 +1229,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(200, app.projects())
                 if method == "POST":
                     return self.reply(201, app.create_project(self.body()))
+            if path == "/api/extensions":
+                if method == "GET":
+                    return self.reply(200, app.workspaces.extensions.view())
+                if method == "POST":
+                    return self.reply(200, app.workspaces.extensions.update(None, self.body()))
             if path == "/api/profiles":
                 if method == "GET":
                     return self.reply(200, app.profiles())

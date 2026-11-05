@@ -516,7 +516,7 @@ class Workspaces:
         # A resume retains its original route, including an empty environment
         # profile. Role defaults only select routes for newly created sessions.
         profile_id = existing.get("profile_id", "") if existing else self.app.role_profile_id(
-            role, data, parent_record.get("profile_id", "") if parent else "")
+            role, data, parent_record.get("profile_id", "") if parent else "", workspace_id=pid)
         profile = next((p for p in self.app.config()["profiles"] if p["id"] == profile_id), None)
         if profile_id and profile is None:
             raise WorkspaceError("角色模型配置已不存在，请先选择配置", 409)
@@ -863,7 +863,7 @@ def worker(argv):
         role = "general" if args.general else args.role or "worker"
         selection = {"profile_id": args.profile} if args.profile is not None else {}
         if args.model:
-            base_id = app.role_profile_id(role, selection, manager.agent(parent).get("profile_id", "") if parent else "")
+            base_id = app.role_profile_id(role, selection, manager.agent(parent).get("profile_id", "") if parent else "", workspace_id=candidates[0]["id"])
             base_profile = next((p for p in app.config()["profiles"] if p["id"] == base_id), {})
             if base_id and not base_profile:
                 raise WorkspaceError("角色模型配置已不存在，请先选择配置", 409)

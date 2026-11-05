@@ -2,6 +2,13 @@
 
 const ROLE_RULE = "__inherit_rule__";
 let roleModelConfig = null;
+let agentWorkspaceModels = null;
+let roleModelsDirty = false;
+
+function effectiveRoleAssignments() {
+  const local = agentWorkspaceModels?.pid === state.project?.id ? agentWorkspaceModels : null;
+  return {...(roleModelConfig?.assignments || {}), ...(local?.assignments || {})};
+}
 
 function profileOption(value, label) {
   const option = element("option", "", label);
@@ -12,17 +19,18 @@ function modelConnectionLabel(profile) {
   return `${profile.name} · ${profile.model}`;
 }
 function roleDefaultLabel(role) {
-  const assignments = roleModelConfig?.assignments || {};
+  const assignments = effectiveRoleAssignments();
   if (!(role in assignments)) return "沿用原有规则";
   if (!assignments[role]) return "继承原环境";
   const profile = state.profiles.find(p => p.id === assignments[role]);
   return profile ? modelConnectionLabel(profile) : "连接已失效，请重新分配";
 }
-async function loadRoleModels() {
+async function loadRoleModels(preserve = false) {
   roleModelConfig = await api("/role-models");
-  renderRoleModels(false);
+  if (!preserve) roleModelsDirty = false;
+  renderRoleModels(preserve && roleModelsDirty);
   refreshAgentModelOptions();
-  $("role-model-status").textContent = "已读取全局角色分配。";
+  $("role-model-status").textContent = roleModelsDirty ? "有未保存的角色分配。" : "已读取全局角色分配。";
 }
 function renderRoleModels(preserve = true) {
   if (!roleModelConfig) return;
@@ -41,7 +49,7 @@ function renderRoleModels(preserve = true) {
     const value = preserve && prior.has(role.id) ? prior.get(role.id) : Object.hasOwn(roleModelConfig.assignments, role.id) ? roleModelConfig.assignments[role.id] : ROLE_RULE;
     if (![...select.options].some(option => option.value === value)) select.append(profileOption(value, "连接已失效，请重新分配"));
     select.value = value;
-    select.onchange = () => { $("role-model-status").textContent = "有未保存的角色分配。"; };
+    select.onchange = () => { roleModelsDirty = true; $("role-model-status").textContent = "有未保存的角色分配。"; };
     row.append(name, select);
     return row;
   }));
@@ -61,7 +69,7 @@ function updateAgentModelHint() {
     $("agent-model-hint").textContent = "本次选择优先于角色默认配置。";
     return;
   }
-  const assignments = roleModelConfig?.assignments || {};
+  const assignments = effectiveRoleAssignments();
   if (role in assignments) {
     $("agent-model-hint").textContent = `将使用：${roleDefaultLabel(role)}`;
   } else {
@@ -77,15 +85,20 @@ function showModelTab(tab) {
     $( `model-${name}-panel`).hidden = !active;
   }
 }
-async function openModels(tab = "connections") {
+async function openModels(tab = "connections", openSettingsPage = true) {
+  if (openSettingsPage) {
+    await openSettings("models");
+    showModelTab(tab);
+    return;
+  }
   const [profiles, config] = await Promise.all([api("/profiles"), api("/role-models")]);
   state.profiles = profiles;
   roleModelConfig = config;
+  roleModelsDirty = false;
   refreshProfiles();
   renderRoleModels(false);
   $("role-model-status").textContent = "已读取全局角色分配。";
   showModelTab(tab);
-  if (!$("profiles-dialog").open) $("profiles-dialog").showModal();
 }
 function editProfile(profile, focus = true) {
   resetProfile();
@@ -110,15 +123,25 @@ document.querySelector('.model-tabs').onkeydown = event => {
 };
 $("new-profile").onclick = () => { resetProfile(); $("profile-form").elements.name.focus(); };
 $("topbar-models").onclick = () => guarded(() => openModels());
-$("agent-model-settings").onclick = () => guarded(() => openModels("roles"));
+$("agent-model-settings").onclick = () => guarded(() => openSettings("workspaces", state.project.id));
 $("agent-profile").onchange = updateAgentModelHint;
 $("agent-parent").addEventListener("change", updateAgentModelHint);
 $("reload-role-models").onclick = () => guarded(loadRoleModels);
 submit("role-model-form", async form => {
   const assignments = Object.fromEntries([...form].filter(([, value]) => value !== ROLE_RULE));
   roleModelConfig = await api("/role-models", {method: "POST", body: {assignments, expected_revision: roleModelConfig.revision}});
+  roleModelsDirty = false;
   renderRoleModels(false);
   refreshAgentModelOptions();
+  if (extensionWorkspace) {
+    const config = await api(`/workspaces/${extensionWorkspace}/role-models`);
+    workspaceModelConfig = config;
+    renderWorkspaceModels(workspaceModelsDirty);
+    if (state.project?.id === extensionWorkspace) {
+      agentWorkspaceModels = {pid: extensionWorkspace, ...config};
+      refreshAgentModelOptions();
+    }
+  }
   $("role-model-status").textContent = "角色分配已保存，将用于新启动的角色。";
   toast("角色默认模型已保存");
 });
