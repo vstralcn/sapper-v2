@@ -1,6 +1,21 @@
 # 模型配置：协议、模型发现与连接测试
 
-版本：v0.8 · 2026-11-02。
+更新：2026-11-04。
+
+## 全局角色默认模型
+
+顶部或侧栏“模型配置”打开统一配置窗口；启动角色窗口中的“配置角色默认模型”可直接进入角色分配页。
+
+- **模型连接**：左侧查看／编辑已保存连接，右侧填写模型、协议、地址和密钥，保留获取模型与测试连接功能。支持浅色、深色和窄屏布局。
+- **角色默认模型**：分别给指挥官、将军、执行者（worker）、侦察兵、验证者和自定义职责分配连接。例如先保存 GLM、DS 两个连接，再将指挥官／将军分配给 GLM，worker／侦察兵分配给 DS，点击“保存角色分配”。
+
+全局配置覆盖当前 Web 实例的所有工作区，同时用于网页启动和 `SAPPER_MODE=workspace` 下的 `worker.sh spawn`。选择优先级为：**本次明确指定的连接 → 角色默认连接 → 原有继承规则**。启动窗口展示当前角色默认值，允许单次覆盖。
+
+“沿用原有规则”表示不设置该角色默认值：自动派生子角色继承父角色连接，独立启动继承执行机环境。“继承原环境”是显式选择，即使父角色使用另一连接，也继承执行机环境。CLI 的 `--profile ID` 可覆盖默认值，`--profile ''` 显式继承环境；`--model MODEL` 以本次连接或角色默认／继承连接为基础，仅替换模型 ID。
+
+默认分配只影响新建会话。运行中会话不会热切换，恢复会话保持原连接（包括原环境选择）；原连接的模型、协议或地址发生变化时仍拒绝静默切换。角色默认值引用的连接需先解除分配才能删除；带 `SAPPER_BIN` 包装器的连接不能作为工作区角色默认模型。多个页面同时修改角色分配时，过期版本会提示重新读取，保留当前表单选择。
+
+原比赛／Docker 模式的模型调度保持原行为，这里的全局配置属于 Web 工作区模式。GLM、DeepSeek 等远端模型仍需自行填写实际可用的模型 ID、协议、地址和密钥；保存或分配配置不代表已验证远端工具调用兼容性。
 
 ## 使用方式
 
@@ -56,6 +71,7 @@ Responses／Chat Completions 按连接配置快照启动独立的本机进程，
 - 配置增加 `protocol/timeout_seconds/max_output_tokens/token_field`，旧配置未指定协议时默认为 `anthropic`；API 也接受 `response/completion` 别名。
 - `POST /api/profiles/models`：以当前表单获取模型；`POST /api/profiles/test`：当前表单连接测试。提供已保存 `id` 时可复用其密钥，响应不返回密钥。
 - `GET /api/profiles/bridges`：适配服务状态；`POST /api/profiles/bridges/{id}/stop`：停止选定服务，沿用认证与 CSRF。
+- `GET /api/role-models`：读取角色目录、`assignments` 和 `revision`；`POST /api/role-models`：提交 `assignments`、`expected_revision`。未包含的角色沿用原规则，空字符串表示显式继承环境。使用现有认证、CSRF、配置锁及原子私有文件保存，响应不包含密钥。
 - `lib/sapper_models.py` 负责协议与 HTTP 适配；原引擎未替换。只使用现有 Python 标准库，无新增 npm／pip 依赖。
 
 接口依据：[OpenAI 模型列表](https://developers.openai.com/api/reference/resources/models/methods/list)、[OpenAI 函数调用](https://developers.openai.com/api/docs/guides/function-calling)、[OpenAI 流式响应](https://developers.openai.com/api/docs/guides/streaming-responses)、[Messages 流式事件](https://platform.claude.com/docs/en/build-with-claude/streaming)、[Claude Code 环境变量与宿主管理路由](https://code.claude.com/docs/en/env-vars)。

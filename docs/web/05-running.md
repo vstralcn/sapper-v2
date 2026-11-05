@@ -6,11 +6,30 @@
 
 需要 Python 3.10+、tmux、已配置可用的原 Claude Code CLI。无需 pip、npm 或前端构建；xterm.js 及许可证随仓库提供。原工具、skills、MCP 和模型登录继续使用原环境。
 
-在仓库根目录运行：
+在仓库根目录使用管理脚本：
 
 ```bash
-python3 lib/sapper.py web
+./sapperctl start      # 后台启动；重复运行会报告已有实例
+./sapperctl status     # 查看 Web PID、当前 tmux socket 的受管会话数和在线模型桥数
+./sapperctl restart    # 只重启 Web；任务、watchdog 和模型桥继续运行
+./sapperctl stop-web   # 只关闭 Web
+./sapperctl stop       # 关闭 Web、当前实例的受管运行（含 watchdog）和模型桥
+./sapperctl claude-status  # 查看 Claude 用户级后台服务
+./sapperctl stop-claude    # 显式关闭 Claude transient daemon 及其后台会话
 ```
+
+macOS、Linux 和 Windows 的 WSL2 内使用相同命令，需让 Python 3.10+、tmux 和 Claude Code 在同一系统环境及用户下可用。Linux 使用 procps 的 `ps`，macOS 识别相对路径启动的旧服务时使用系统 `lsof`。Windows 在 WSL2 的终端里进入仓库目录执行。服务默认只监听本机，日志在所选状态目录的 `web-server.log`，登录口令在 `token` 文件中。
+
+同一用户从本仓库用默认参数执行的 `python3 lib/sapper.py web` 或 `python3 lib/sapper_web.py` 也能识别。对以前手动指定其他启动参数的服务，请从原入口停止并核对配置后再切换。共享 tmux 服务器上的其他会话、独立原生编队（用 `fleet down` 管理）、外部登记的终端和 Claude 用户级 daemon 各有自己的生命周期。`stop` 只控制本实例创建的任务以及经本状态目录凭据确认的模型桥。`stop-claude` 对应 Claude CLI 的 `daemon stop --any`，会关闭 Claude transient daemon 及其脱离终端运行的会话，影响 Claude 用户级服务，不属于单个 Sapper 实例；它需要单独显式调用。
+
+需要独立实例时，在首次启动指定专用目录、端口和 tmux socket。配置保存在该状态目录的 `sapperctl.json`，以后只需指定同一目录：
+
+```bash
+./sapperctl start --state "$HOME/.local/state/sapper-lab" --root "$HOME/sapper-tasks" --port 8877 --tmux-socket sapper-lab
+./sapperctl stop --state "$HOME/.local/state/sapper-lab"
+```
+
+直接以前台方式运行仍可用 `python3 lib/sapper.py web`。
 
 题目目录在网页文件夹选择器中点选后直接绑定，可选择执行机上当前服务用户有权限访问的已有目录，无需预先配置允许范围，也不要求复制到 `runs/`。文件夹选择器提供任务根目录、用户主目录、文件系统根目录和已绑定目录入口，支持点击面包屑或“上一级”导航；打开目标文件夹后点击“选择此文件夹”，无需填写路径。默认 `--root` 为仓库 `runs/`，用于新建任务和自动发现；旧参数 `--workspace-root` 继续兼容，作为可选目录快捷入口。Web 私有配置目录及其内部目录仍不能绑定或浏览。
 
@@ -32,6 +51,17 @@ cat .sapper-web/token
 2. 点击“启用 sapper”。复用原 `sapper setup --agents` 创建／保留 `.sapper`，合并项目级 hooks，并用受管导入连接原 sapper 说明。
 3. 点击“打开 Claude Code”，选择角色、模型、任务和目录，然后启动。
 4. 左侧看题目文件，中间操作真实终端，右侧管理角色；“事实与意图”“运行记录”“文件与附件”保留原基础操作。
+
+在“工作区操作”中可以设置 **AI 主动提交 flag**，默认关闭。设置按工作区保存到原图的 `.sapper/project.json`（`auto_submit_flags` 布尔值），不会影响其他题目。开启表示允许执行角色主动提交确认取得的 flag；关闭时仅记录，仍可按用户明确指令使用 `--submit`。指挥官继续负责协调，由执行者提交；侦察／验证等仅记录的任务可使用 `--no-submit`。
+
+```bash
+sapper flag 'flag{...}' -c <平台题目代码>       # 按工作区开关记录／提交
+sapper flag --id f001                         # 开启后补交已有记录
+sapper flag --id f001 --submit                # 明确提交已有记录，不受自动开关影响
+sapper flag 'flag{...}' -c <平台题目代码> --no-submit  # 本次只记录
+```
+
+提交沿用现有 Arena 平台适配，需要可用的平台配置／环境变量和正确的题目代码；开关不会使任意比赛网站自动兼容。只有平台返回 `correct: true` 才记为 submitted，错误 flag 记为 rejected；网络结果不确定时保留记录并要求核对平台状态，避免自动重复提交。已提交记录不会再次发送。保存开关本身不批量提交历史 flag：运行中角色在下一次 SessionStart／UserPromptSubmit hook 和读板时获取新设置，CLI 在调用时重新读取；不会打断当前工具调用。更改不依赖重启角色或 Web。
 
 主执行者默认 cwd 就是题目目录。辅助角色默认在 `题目/.sapper-agents/<agent-id>/`，`.sapper` 指向题目原图，使用原 CLI 的 `--add-dir` 访问题目资料。启动表单也允许选择共用题目根目录。目录分开用于协作与恢复，不是文件访问沙箱；同目录并行需要任务分工。
 

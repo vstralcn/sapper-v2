@@ -162,6 +162,22 @@ class HttpTests(unittest.TestCase):
         self.cookie = headers["Set-Cookie"].split(";", 1)[0]
         self.csrf = json.loads(body)["csrf"]
 
+    def test_role_models_require_auth_csrf_and_persist_under_subpath(self):
+        self.assertEqual(self.request("/api/role-models")[0], 401)
+        self.assertEqual(self.request("/api/role-models", "POST", {})[0], 401)
+        self.login()
+        profile = self.app.save_profile({"name": "routing fixture", "model": "test-model", "api_key": "private-routing-key"})
+        data = {"assignments": {"commander": profile["id"], "scout": ""}, "expected_revision": 0}
+        self.assertEqual(self.request("/api/role-models", "POST", data, {"X-Sapper-CSRF": ""})[0], 403)
+        status, _, body = self.request("/api/role-models", "POST", data)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["assignments"], data["assignments"])
+        self.assertNotIn(b"private-routing-key", body)
+        self.assertEqual(self.request("/api/role-models", "POST", data)[0], 409)
+        self.assertEqual(self.request("/api/profiles/" + profile["id"], "DELETE")[0], 409)
+        self.assertEqual(self.request("/models.js")[0], 200)
+        self.assertEqual(self.request("/models.css")[0], 200)
+
     def test_auth_csrf_origin_and_subpath(self):
         self.assertEqual(self.request("/")[0], 200)
         self.assertEqual(self.request("/api/projects")[0], 401)
@@ -199,6 +215,28 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["text"], "original evidence")
         self.assertEqual(self.request(bind, "POST", {"path": str(self.app.state)})[0], 403)
+
+    def test_workspace_submission_settings_require_auth_and_csrf_and_persist(self):
+        project = self.app.create_project({"name": "submission-policy", "goal": "fixture"})
+        other = self.app.create_project({"name": "other-policy", "goal": "fixture"})
+        path = f"/api/workspaces/{project['id']}/settings"
+        self.assertEqual(self.request(path, "POST", {"auto_submit_flags": True})[0], 401)
+        self.login()
+        self.assertEqual(self.request(path, "POST", {"auto_submit_flags": True}, {"X-Sapper-CSRF": "bad"})[0], 403)
+        self.assertFalse(self.app.workspaces.inspect(project["id"])["auto_submit_flags"])
+        for value in ("true", 1, None):
+            self.assertEqual(self.request(path, "POST", {"auto_submit_flags": value})[0], 400)
+        status, _, body = self.request(path, "POST", {"auto_submit_flags": True})
+        self.assertEqual((status, json.loads(body)), (200, {"auto_submit_flags": True}))
+        reloaded = Console(self.app.root, self.app.state)
+        self.assertTrue(reloaded.workspaces.inspect(project["id"])["auto_submit_flags"])
+        self.assertFalse(reloaded.workspaces.inspect(other["id"])["auto_submit_flags"])
+        prompt = reloaded.workspaces.role_info(project["id"], "worker")["prompt"]
+        self.assertIn("ON: the user authorizes proactive", prompt)
+        board = reloaded.workspaces.strategy_board([project["id"], other["id"]])
+        self.assertEqual([w["auto_submit_flags"] for w in board["workspaces"]], [True, False])
+        self.assertEqual(self.request(path, "POST", {"auto_submit_flags": False})[0], 200)
+        self.assertIn("OFF: record flags", reloaded.workspaces.role_info(project["id"], "worker")["prompt"])
 
     def test_delete_role_requires_auth_and_csrf_and_removes_it_from_lists(self):
         project = self.app.create_project({"name": "delete-role", "goal": "test deletion"})

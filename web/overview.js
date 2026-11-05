@@ -50,13 +50,16 @@ async function refreshOverview(){
     const detail=element("div","overview-project-meta");detail.append(element("span","badge",status),element("span","",`${p.facts} 条事实 · ${p.open_intents} 条待办`));
     row.append(info,detail,button("打开工作区","text-button",()=>guarded(()=>openProject(p))));projects.append(row);
   }
-  const agents=[...data.agents].sort((a,b)=>Number(!!b.pane_id)-Number(!!a.pane_id)||b.created_at.localeCompare(a.created_at)).slice(0,6);
+  const agents=[...data.agents].sort((a,b)=>Number(!!b.pane_id)-Number(!!a.pane_id)||b.created_at.localeCompare(a.created_at))
+    .filter((a,index)=>a.pane_id||index<6);
   $("overview-agents").replaceChildren(...(agents.length?agents.map(a=>{
     const row=element("div","overview-agent-row");
     const info=element("div","");const p=data.projects.find(p=>p.id===a.workspace_id)||data.projects.find(p=>a.workspace_scope?.includes(p.id));
-    info.append(element("strong","",a.name||a.role_label),element("p","",`${a.role_label} · ${p?.name||"原工作区"} · ${a.profile_name}`),element("p","agent-context",contextStatus(a.shared_context)));
+    info.append(element("strong","",a.name||a.role_label),element("p","overview-assignment",`分配任务：${a.mission?.trim()||"未记录"}`));
+    if(a.activity?.latest_message)info.append(element("p","overview-activity",`最近活动：${a.activity.latest_message}`));
+    info.append(element("p","",`${a.role_label} · ${p?.name||"原工作区"} · ${a.profile_name}`),element("p","agent-context",contextStatus(a.shared_context)));
     row.append(info,element("span","badge",formatAgentStatus(a)));
-    if(p)row.append(button("查看","text-button",()=>guarded(()=>openProject(p))));return row;
+    if(p)row.append(button("角色与协作","text-button",()=>guarded(()=>openProject(p,"agents"))));return row;
   }):[empty("暂无已登记的角色。进入工作区后启动 Claude Code 或派发协作角色。")])) ;
   $("overview-runs").replaceChildren(...(data.recent_runs.length?data.recent_runs.map(run=>{
     const row=element("div","overview-run-row"),p=data.projects.find(p=>p.id===run.project_id),info=element("div","");

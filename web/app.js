@@ -80,6 +80,7 @@ async function showWorkspace() {
   $("environment-status").textContent = health.tmux ? "tmux 可用 · 本地执行" : "未安装 tmux";
   $("environment-status").title = health.root;
   refreshProfiles();
+  await loadRoleModels();
   await refreshProjects();
 }
 
@@ -342,6 +343,7 @@ async function loadFiles() {
 }
 function refreshProfiles() {
   $("profile-count").textContent = state.profiles.length;
+  $("models-total").textContent = state.profiles.length;
   const select = $("run-profile");
   const selected = select.value;
   select.replaceChildren(element("option", "", "继承原环境"));
@@ -358,17 +360,17 @@ function refreshProfiles() {
   for (const profile of state.profiles) {
     const row = element("div", "profile-row");
     const info = element("div");
-    info.append(element("strong", "", profile.name), element("p", "", `${profileProtocolName(profile.protocol)} · ${profile.model} · ${profile.has_key ? "已保存密钥" : "继承环境密钥"}`), element("p", "", profile.base_url || "继承协议环境／官方地址"));
+    row.dataset.profileId = profile.id;
+    row.classList.toggle("selected", $("profile-form").elements.id.value === profile.id);
+    info.append(element("strong", "", profile.name), element("p", "profile-model-name", profile.model), element("p", "", `${profileProtocolName(profile.protocol)} · ${profile.has_key ? "已保存密钥" : "继承环境密钥"}`));
+    info.title = profile.base_url || "继承协议环境／官方地址";
     const actions = element("div", "profile-row-actions");
     actions.append(button("编辑", "text-button", () => {
-      resetProfile();
-      for (const name of ["id", "name", "model", "base_url", "engine_prefix", "protocol", "timeout_seconds", "max_output_tokens", "token_field"]) {
-        if (profile[name] != null) $("profile-form").elements[name].value = profile[name];
-      }
-      updateProfileProtocol();
+      editProfile(profile);
     }), button("删除", "text-button danger", () => guarded(async () => {
       if (!await confirmAction("删除该配置？已启动的原会话不会热切换或重启。")) return;
       await api(`/profiles/${profile.id}`, {method: "DELETE"});
+      if ($("profile-form").elements.id.value === profile.id) resetProfile();
       state.profiles = await api("/profiles");
       refreshProfiles();
       toast("配置已删除");
@@ -376,6 +378,8 @@ function refreshProfiles() {
     row.append(info, actions);
     list.append(row);
   }
+  renderRoleModels();
+  refreshAgentModelOptions();
 }
 function openRun(kind = "auto") {
   $("run-form").reset();
@@ -489,8 +493,8 @@ submit("worker-form", async data => {
   $("worker-dialog").close();
 });
 submit("profile-form", async data => {
-  await api("/profiles", {method: "POST", body: Object.fromEntries(data)});
-  resetProfile();
+  const saved = await api("/profiles", {method: "POST", body: Object.fromEntries(data)});
+  editProfile(saved, false);
   state.profiles = await api("/profiles");
   refreshProfiles();
   toast("模型配置已保存；现有会话保持原配置");
@@ -508,7 +512,7 @@ $("worker-manage").onclick = () => $("worker-dialog").showModal();
 $("pane-select").onchange = () => guarded(refreshTerminal);
 $("refresh-terminal").onclick = () => guarded(refreshTerminal);
 $("close-log").onclick = () => { state.log = null; $("log-panel").hidden = true; };
-$("profiles-button").onclick = () => { resetProfile(); $("profiles-dialog").showModal(); };
+$("profiles-button").onclick = () => guarded(() => openModels());
 $("reset-profile").onclick = resetProfile;
 $("knowledge-button").onclick = () => guarded(async () => { await loadKnowledge(); $("knowledge-dialog").showModal(); });
 function syncGraphTheme() {
@@ -578,7 +582,7 @@ const profileProtocolNames={anthropic:'Anthropic Messages',responses:'Responses'
 let profileModels=[],profileProbeGeneration=0;
 function profileProtocolName(value){return profileProtocolNames[value||'anthropic']||value;}
 function clearProfileProbe(){profileProbeGeneration++;profileModels=[];$("profile-models").replaceChildren();$("profile-model-options").replaceChildren();$("profile-model-picker").hidden=true;$("profile-probe-result").hidden=true;}
-function resetProfile(){ $("profile-form").reset();clearProfileProbe();updateProfileProtocol(); }
+function resetProfile(){ $("profile-form").reset();$("profile-form").elements.id.value="";$("profile-form").elements.api_key.placeholder='留空继承环境密钥';clearProfileProbe();updateProfileProtocol();$("profile-editor-title").textContent='新建模型连接';document.querySelectorAll('[data-profile-id]').forEach(row=>row.classList.remove('selected')); }
 function updateProfileProtocol(){
   const p=$("profile-protocol").value;
   $("profile-protocol-help").textContent=p==='anthropic'?'使用 Messages 服务根地址；留空继承 ANTHROPIC_BASE_URL。原配置默认保持此协议。':'填写 API 根地址（通常以 /v1 结尾），也可填写完整接口地址；留空继承 OPENAI_BASE_URL。密钥留空时继承 OPENAI_API_KEY。';

@@ -19,7 +19,7 @@ class AgentTopologyView {
       <div class="at-monitor">
         <section class="at-graph-shell" aria-label="Agent 派发拓扑">
           <div class="at-toolbar"><div class="at-scopes" aria-label="显示范围"><button data-at-scope="online" aria-pressed="false">活跃优先</button><button data-at-scope="active" aria-pressed="true">仅活跃</button><button data-at-scope="all" aria-pressed="false">显示全部</button></div><div class="at-search-wrap"><input data-at="search" type="search" placeholder="搜索名称、角色或任务" aria-label="搜索工作区 Agent" autocomplete="off" aria-expanded="false" aria-controls="at-search-results"><div data-at="results" id="at-search-results" class="at-search-results" hidden></div></div></div>
-          <div class="at-filters"><label>状态<select data-at="status" aria-label="筛选 Agent 状态"><option value="all">全部状态</option><option value="running">运行中</option><option value="waiting">等待中</option><option value="error">异常</option><option value="unknown">状态未确认</option><option value="idle">在线空闲</option><option value="offline">已离线</option></select></label><label>视图<select data-at="grouping" aria-label="Agent 分组方式"><option value="hierarchy">指挥关系</option><option value="role">按角色分组</option><option value="task">按任务说明分组</option></select></label><span></span><button data-at="expand">展开全部</button><button data-at="layout" title="状态刷新不会重排；此按钮主动重新排列">重新布局</button></div>
+          <div class="at-filters"><label>状态<select data-at="status" aria-label="筛选 Agent 状态"><option value="all">全部状态</option><option value="running">运行中</option><option value="waiting">等待中</option><option value="error">异常</option><option value="unknown">状态未确认</option><option value="idle">在线空闲</option><option value="offline">已离线</option></select></label><label>视图<select data-at="grouping" aria-label="Agent 分组方式"><option value="hierarchy">指挥关系</option><option value="role">按角色分组</option><option value="task">按任务说明分组</option></select></label><span></span><button data-at="expand">展开全部</button><button data-at="layout" title="筛选或隐藏节点后自动收拢；也可手动重新排列">重新布局</button></div>
           <div data-at="canvas" class="at-canvas" tabindex="0" aria-label="Agent 拓扑画布，拖动空白平移，滚轮缩放，方向键平移，加减键缩放，Home 适应画布">
             <div data-at="world" class="at-world"><svg class="at-edges" aria-hidden="true"><defs><marker id="at-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0 10 5 0 10Z" fill="var(--at-edge)"/></marker></defs><g data-at="edges"></g></svg><div data-at="nodes"></div></div>
             <div data-at="canvas-label" class="at-canvas-label"></div>
@@ -123,10 +123,21 @@ class AgentTopologyView {
     if (!this.current) return;
     const c = this.current;
     this.graph = c.grouping === "hierarchy" ? this.model.graph(this.rows, c) : this.model.grouped(this.rows, c);
-    if (layout) {
+    const positions = this.positions(), visible = new Set(this.graph.nodes.map(n => n.id));
+    const filterKey = JSON.stringify([c.scope, c.status, c.grouping,
+      [...(c.grouping === "hierarchy" ? c.collapsed : c.collapsedGroups)].sort()]);
+    const filtersChanged = c.filterKey !== undefined && c.filterKey !== filterKey;
+    // Keep ordinary refreshes and newly dispatched agents stable, but reclaim space
+    // when visibility changes. Cached positions of returning agents may be far away.
+    const hidden = c.visibleIds && [...c.visibleIds].some(id => !visible.has(id));
+    const restored = c.visibleIds && [...visible].some(id => !c.visibleIds.has(id) && positions.has(id));
+    if (layout || filtersChanged || hidden || restored) {
       if (c.grouping === "hierarchy") this.model.layout(this.graph, c.positions);
       else this.layoutGroups();
-    } else this.model.placeMissing(this.graph, this.positions());
+      c.needsFit = true;
+    } else this.model.placeMissing(this.graph, positions);
+    c.filterKey = filterKey;
+    c.visibleIds = visible;
     this.renderMetrics();
     this.renderNodes();
     this.renderEdges();
@@ -193,8 +204,9 @@ class AgentTopologyView {
         const hasChildren = this.rows.some(child => this.graph.parent.get(child.id) === a.id);
         const hidden = c.collapsed.has(a.id) ? [...this.model.descendants(a.id, this.graph.parent)].filter(id => this.rows.some(child => child.id === id && this.model.matches(child, c.scope, c.status))).length : 0;
         el.className = `at-node at-status-${a.observation.status}${a.id === c.selected ? " at-selected" : ""}${n.context ? " at-context" : ""}${near && !near.has(a.id) ? " at-dim" : ""}`;
-        label = `${this.name(a)}，${this.role(a)}，${this.presence(a)}，${this.model.labels[a.observation.status]}，${a.mission || "任务未提供"}`;
-        html = `<div class="at-node-header"><span class="at-avatar">${this.escape(({commander: "C", general: "G", scout: "S", worker: "W", verifier: "V"})[a.role] || "A")}</span><strong>${this.escape(this.name(a))}</strong><span class="at-presence ${a.observation.presence === "online" ? "at-online" : ""}">${this.presence(a)}</span></div><div class="at-node-sub"><span>${this.escape(this.role(a))}${n.context ? " · 上级上下文" : ""}</span>${this.tag(a)}</div><p class="at-node-mission" title="${this.escape(a.mission)}">${this.escape(a.mission || "任务未提供")}</p>${c.grouping === "hierarchy" && hasChildren ? `<button class="at-fold" data-at-fold="${this.escape(a.id)}" aria-label="${c.collapsed.has(a.id) ? "展开" : "折叠"}${this.escape(this.name(a))}的下级" aria-expanded="${!c.collapsed.has(a.id)}">${c.collapsed.has(a.id) ? "+" : "−"}</button>${c.collapsed.has(a.id) ? `<span class="at-fold-count">${hidden} 个匹配的下级已折叠</span>` : ""}` : ""}`;
+        const goal = this.model.shortGoal(a);
+        label = `${this.name(a)}，${goal}，${this.role(a)}，${this.presence(a)}，${this.model.labels[a.observation.status]}，${a.mission || "任务未提供"}`;
+        html = `<div class="at-node-header"><span class="at-avatar">${this.escape(({commander: "C", general: "G", scout: "S", worker: "W", verifier: "V"})[a.role] || "A")}</span><strong>${this.escape(this.name(a))}</strong><span class="at-presence ${a.observation.presence === "online" ? "at-online" : ""}">${this.presence(a)}</span></div><div class="at-node-sub"><span>${this.escape(this.role(a))}${n.context ? " · 上级上下文" : ""}</span>${this.tag(a)}</div><p class="at-node-mission" title="${this.escape(a.mission)}">${this.escape(goal)}</p>${c.grouping === "hierarchy" && hasChildren ? `<button class="at-fold" data-at-fold="${this.escape(a.id)}" aria-label="${c.collapsed.has(a.id) ? "展开" : "折叠"}${this.escape(this.name(a))}的下级" aria-expanded="${!c.collapsed.has(a.id)}">${c.collapsed.has(a.id) ? "+" : "−"}</button>${c.collapsed.has(a.id) ? `<span class="at-fold-count">${hidden} 个匹配的下级已折叠</span>` : ""}` : ""}`;
       }
       el.setAttribute("aria-label", label);
       el.setAttribute("aria-pressed", String(n.id === c.selected));
@@ -371,7 +383,7 @@ class AgentTopologyView {
     const query = this.el("search").value.trim().toLowerCase(), results = this.el("results");
     results.replaceChildren();
     if (!query) { this.hideSearch(); return; }
-    const found = this.rows.filter(a => [a.id, this.name(a), this.role(a), a.mission || ""].some(t => t.toLowerCase().includes(query))).sort(this.model.compare);
+    const found = this.rows.filter(a => [a.id, this.name(a), this.role(a), this.model.shortGoal(a), a.mission || ""].some(t => t.toLowerCase().includes(query))).sort(this.model.compare);
     for (const a of found.slice(0, 20)) {
       const b = button("", "at-search-result", () => { this.select(a.id, true); this.hideSearch(); this.el("search").focus(); });
       b.append(element("strong", "", this.name(a)), element("small", "", `${this.role(a)} · ${this.model.labels[a.observation.status]}`));

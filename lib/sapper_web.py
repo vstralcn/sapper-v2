@@ -34,8 +34,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sapper
 import sapper_context
 from kb import KnowledgeBase, KBError
-from sapper_workspace import Workspaces, WorkspaceError
+from sapper_workspace import Workspaces, WorkspaceError, ROLES
 from sapper_native import NativeSurface, NativeError
+from sapper_extensions import ExtensionError, clean_environment, api_environment
 import sapper_models
 
 REPO = Path(__file__).resolve().parent.parent
@@ -213,8 +214,9 @@ class Console:
             with contextlib.suppress(OSError, ValueError):
                 keys.append(json.loads(path.read_text()).get("token", ""))
         keys += [os.environ.get(k, "") for k in (
-            "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "SAPPER_CLAUDE_API_KEY", "OPENAI_API_KEY",
             "DEEPSEEK_API_KEY", "BENCHMARK_TOKEN")]
+        keys.extend(self.workspaces.extensions.credential_values())
         for key in keys:
             if key:
                 text = text.replace(key, "[已隐藏密钥]")
@@ -356,6 +358,44 @@ class Console:
         return [{k: v for k, v in p.items() if k != "api_key"} | {"protocol": sapper_models.protocol(p), "has_key": bool(p.get("api_key"))}
                 for p in self.config()["profiles"]]
 
+    def role_models(self):
+        cfg = self.config()
+        return {"assignments": cfg.get("role_profiles", {}),
+                "revision": cfg.get("role_profiles_revision", 0),
+                "roles": [{"id": role, "label": label} for role, label in ROLES.items()]}
+
+    def save_role_models(self, data):
+        assignments = data.get("assignments")
+        roles = ROLES
+        if not isinstance(assignments, dict) or any(role not in roles for role in assignments):
+            raise WebError("角色模型配置格式不正确")
+        if any(not isinstance(value, str) for value in assignments.values()):
+            raise WebError("请选择已保存的模型连接")
+        with self.config_lock():
+            cfg = self.config()
+            revision = cfg.get("role_profiles_revision", 0)
+            if type(data.get("expected_revision")) is not int or data["expected_revision"] != revision:
+                raise WebError("角色模型已被其他页面更新，请重新读取后再保存；当前选择仍保留", 409)
+            profiles = {p["id"]: p for p in cfg["profiles"]}
+            for value in assignments.values():
+                if value and value not in profiles:
+                    raise WebError("模型连接已不存在，请重新选择", 409)
+                if value and profiles[value].get("engine_prefix"):
+                    raise WebError("角色默认模型不能使用 CLI 包装器，请选择普通模型连接")
+            # Missing entries follow the original inheritance rule. Empty entries
+            # explicitly use the environment, even for children of another model.
+            cfg["role_profiles"] = assignments
+            cfg["role_profiles_revision"] = revision + 1
+            private_json(self.config_path, cfg)
+        self.audit("role_models.saved", revision=revision + 1, assignments=assignments)
+        return self.role_models()
+
+    def role_profile_id(self, role, data, fallback=""):
+        value = data["profile_id"] if "profile_id" in data else self.config().get("role_profiles", {}).get(role, fallback)
+        if not isinstance(value, str):
+            raise WebError("模型连接 ID 必须为文本")
+        return value
+
     def save_profile(self, data):
         name = require_text(data, "name", 100)
         model = require_text(data, "model", 200)
@@ -418,6 +458,10 @@ class Console:
     def delete_profile(self, pid):
         with self.config_lock():
             cfg = self.config()
+            used = [label for role, label in ROLES.items()
+                    if cfg.get("role_profiles", {}).get(role) == pid]
+            if used:
+                raise WebError("该连接用于角色默认模型：" + "、".join(used) + "；请先在角色默认模型中重新分配", 409)
             cfg["profiles"] = [p for p in cfg["profiles"] if p["id"] != pid]
             private_json(self.config_path, cfg)
         self.audit("profile.deleted", profile=pid)
@@ -578,6 +622,8 @@ class Console:
                 raise WebError("模型配置不存在")
         # Snapshot this service's launch environment, not an older tmux daemon's.
         env = dict(os.environ)
+        if (native or {}).get("isolated_extensions"):
+            clean_environment(env)
         env.update(PATH=str(self.state / "bin") + os.pathsep + os.environ.get("PATH", ""),
                    PYTHONUNBUFFERED="1", SAPPER_ROOT=str(self.root),
                    SAPPER_GLOBAL_CONTEXT_FILE=str(self.context_path), SAPPER_CONTEXT_PROMPT_REVISION="")
@@ -587,10 +633,17 @@ class Console:
         if profile and sapper_models.protocol(profile) != "anthropic":
             env["SAPPER_BIN"] = shlex.quote(self.claude_bin)
         sapper_models.apply_profile(env, profile, self.state)
+        if (native or {}).get("isolated_extensions") and not (env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or env.get("SAPPER_CLAUDE_API_KEY")):
+            raise WebError("独立会话仅支持 API Key：请在模型配置保存密钥，或为 Web 服务设置 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN；不使用 Claude 订阅登录", 409)
         argv = [sys.executable, str(SAPPER), "--store", str(Path(project["path"]) / ".sapper")]
         if native is not None:
             argv = native["argv"]
             env.update(native.get("env", {}))
+            missing = [name for name in native.get("mcp_env_refs", []) if not env.get(name)]
+            if missing:
+                raise WebError("MCP 所需环境变量未配置：" + ", ".join(missing), 409)
+            if native.get("isolated_extensions"):
+                api_environment(env)
         elif kind in ("auto", "dispatch"):
             argv += [kind]
             if kind == "auto":
@@ -768,6 +821,8 @@ class Console:
         if any(p.startswith(".env") or p.endswith(".env") for p in parts):
             raise WebError("环境凭据文件不通过普通文件接口提供", 403)
         resolved = self.inside(project_dir / relative, project_dir)
+        if resolved.is_relative_to((project_dir / ".sapper/sessions").resolve()):
+            raise WebError("会话历史与配置不通过普通工作区文件接口提供", 403)
         if resolved.is_relative_to(self.state):
             raise WebError("Web 私有运行与凭据目录不通过工作区文件接口提供", 403)
         return resolved
@@ -1040,8 +1095,8 @@ class Handler(BaseHTTPRequestHandler):
             path = parsed.path[len(prefix):]
             query = urllib.parse.parse_qs(parsed.query)
             q = lambda name, default="": query.get(name, [default])[0]
-            static_names = {"/", "/theme.js", "/app.js", "/style.css", "/workspace.js", "/workspace.css", "/overview.js", "/overview.css", "/native.js", "/native.css",
-                            "/agent-topology.js", "/agent-topology-model.js", "/agent-topology.css",
+            static_names = {"/", "/theme.js", "/app.js", "/style.css", "/workspace.js", "/extensions.js", "/workspace.css", "/overview.js", "/overview.css", "/native.js", "/native.css",
+                            "/agent-topology.js", "/agent-topology-model.js", "/agent-topology.css", "/models.js", "/models.css",
                             "/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js"}
             if path in static_names and method == "GET":
                 filename = "index.html" if path == "/" else path[1:]
@@ -1111,6 +1166,8 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) == 5:
                     wid, action = parts[3:]
                     if method == "GET":
+                        if action == "extensions":
+                            return self.reply(200, app.workspaces.extensions.view(wid))
                         if action == "inspect":
                             return self.reply(200, app.workspaces.inspect(wid))
                         if action == "agents":
@@ -1120,8 +1177,12 @@ class Handler(BaseHTTPRequestHandler):
                             return self.reply(200, app.workspaces.role_info(wid, q("role") or "worker", scope))
                     elif method == "POST":
                         data = self.body()
+                        if action == "extensions":
+                            return self.reply(200, app.workspaces.extensions.update(wid, data))
                         if action == "enable":
                             return self.reply(200, app.workspaces.enable(wid, data))
+                        if action == "settings":
+                            return self.reply(200, app.workspaces.save_settings(wid, data))
                         if action == "sessions":
                             return self.reply(201, app.workspaces.create_session(wid, data))
                         if action == "attach":
@@ -1158,6 +1219,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(200, app.profiles())
                 if method == "POST":
                     return self.reply(200, app.save_profile(self.body()))
+            if path == "/api/role-models":
+                if method == "GET":
+                    return self.reply(200, app.role_models())
+                if method == "POST":
+                    return self.reply(200, app.save_role_models(self.body()))
             if path in ("/api/profiles/models", "/api/profiles/test") and method == "POST":
                 return self.reply(200, app.profile_probe(self.body(), path.rsplit("/", 1)[1]))
             if path == "/api/profiles/bridges" and method == "GET":
@@ -1267,7 +1333,7 @@ class Handler(BaseHTTPRequestHandler):
                     if action in ("hint", "fact", "intent", "confirm", "doc", "claim", "release", "done", "complete", "brainstorm-pick"):
                         return self.reply(200, app.graph_action(pid, action, self.body()))
             raise WebError("接口不存在", 404)
-        except (WebError, WorkspaceError, NativeError) as exc:
+        except (WebError, WorkspaceError, NativeError, ExtensionError) as exc:
             self.reply(exc.status, {"error": str(exc)})
         except (sapper.FGError, KBError, ValueError, TypeError, KeyError) as exc:
             self.reply(400, {"error": app.redact(str(exc))})

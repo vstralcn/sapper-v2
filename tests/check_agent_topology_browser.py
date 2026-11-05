@@ -56,6 +56,8 @@ def main():
                       "mission": "Independent task " + str(i % 4), "execution_mode": "tui" if i in (1, 2) else "print",
                       "profile_name": "fixture", "cwd": first["path"], "desired_state": "running",
                       "claude_session_id": None}
+            if i == 1:
+                record["task_label"] = "统筹解题"
             if i == 9:
                 record["name"] = '<img src=x onerror="window.topologyInjected=true">'
                 record["mission"] = "<script>window.topologyInjected=true</script>"
@@ -111,6 +113,42 @@ def main():
                 at = lambda name: page.locator(f'[data-at="{name}"]')
                 aid = lambda i: f"{i:016x}"
                 check("assets served behind URL prefix and real API returns 24 agents", ev("agentTopology.rows.length === 24"))
+                node_goal = page.locator(f'[data-agent-id="{aid(1)}"] .at-node-mission')
+                check("node shows short goal and retains full mission", node_goal.inner_text() == "统筹解题" and node_goal.get_attribute("title") == records[1]["mission"])
+                check("terminal picker shows the same goal", page.locator('#native-pane option[value="%1"]').inner_text() == "Agent 01 · 统筹解题 · 000000")
+                tools = page.locator("#project-tools summary")
+                check("workspace actions have one header entry", tools.is_visible() and page.locator("#native-button").is_hidden() and page.locator("#advanced-run").is_hidden() and page.locator("#start-run").is_visible())
+                tools.focus()
+                page.keyboard.press("Enter")
+                check("workspace menu groups native tools and workspace management", page.locator("#project-tools [role=group]").count() == 2 and page.locator("#enable-workspace").is_visible())
+                submission = page.locator("#auto-submit-flags")
+                check("proactive flag submission defaults off", not submission.is_checked())
+                submission.check()
+                page.wait_for_function("!document.querySelector('#auto-submit-flags').disabled")
+                check("workspace flag switch persists to the real API", app.store(first["id"]).load_project().get("auto_submit_flags") is True)
+                page.evaluate("pid => openProject(pid, 'agents')", second["id"])
+                page.wait_for_function("!document.querySelector('#auto-submit-flags').checked")
+                check("flag authorization stays in the selected workspace", not app.workspaces.auto_submit_flags(second["id"]))
+                page.evaluate("pid => openProject(pid, 'agents')", first["id"])
+                page.wait_for_function("document.querySelector('#auto-submit-flags').checked")
+                if not page.locator("#project-tools").evaluate("e => e.open"):
+                    tools.click()
+                submission.uncheck()
+                page.wait_for_function("!document.querySelector('#auto-submit-flags').disabled")
+                check("flag switch can revoke proactive submission", app.store(first["id"]).load_project().get("auto_submit_flags") is False)
+                check("switching policy never submits recorded flags itself", not (app.store(first["id"]).root / ".flag-submit.lock").exists())
+                page.keyboard.press("Escape")
+                check("Escape closes tools and restores focus", ev("!document.querySelector('#project-tools').open && document.activeElement.matches('#project-tools summary')"))
+                for action, dialog in (("start-run", "agent-dialog"), ("workspace-native", "native-dialog"), ("advanced-run", "run-dialog"), ("stop-workspace", "confirm-dialog")):
+                    if action != "start-run":
+                        tools.click()
+                    page.locator("#" + action).click()
+                    page.wait_for_selector("#" + dialog + "[open]")
+                    check(action + " opens its original dialog", not ev("document.querySelector('#project-tools').open"))
+                    if action == "stop-workspace":
+                        page.locator("#confirm-cancel").click()
+                    else:
+                        page.keyboard.press("Escape")
                 check("unknown executions are not displayed as running", ev("AgentTopologyModel.counts(agentTopology.rows).running === 1"))
                 check("online idle remains online", ev("agentTopology.rows.find(a=>a.id.endsWith('5')).observation.presence === 'online'"))
                 check("offline and uncertain presence are distinct", ev("AgentTopologyModel.counts(agentTopology.rows).offline === 2 && AgentTopologyModel.counts(agentTopology.rows).presenceUnknown === 1"))
@@ -124,6 +162,21 @@ def main():
                 at("expand").click()
                 check("all 24 actual records can be shown", ev("agentTopology.graph.nodes.length === 24"))
                 check("task and agent text cannot inject HTML", ev("!window.topologyInjected") and page.locator(".at-node img,.at-node script").count() == 0)
+                def compact_pair():
+                    return ev("""(() => {
+                        const v = agentTopology, box = v.el('canvas').getBoundingClientRect();
+                        return v.graph.nodes.length === 2 && v.bounds().h < 220 &&
+                            v.graph.edges.length === 1 &&
+                            v.graph.nodes.every(n => {
+                                const r = v.elements.get(n.id).getBoundingClientRect();
+                                return r.left >= box.left && r.right <= box.right &&
+                                    r.top >= box.top && r.bottom <= box.bottom;
+                            });
+                    })()""")
+
+                at("status").select_option("waiting")
+                check("status filtering compacts parent and child and fits both on canvas", compact_pair())
+                page.locator('[data-at-scope="all"]').click()
                 at("search").fill(aid(6)); at("results").locator("button").first.click()
                 check("search reveals offline records", ev("agentTopology.current.selected.endsWith('6') && agentTopology.elements.has(agentTopology.current.selected)"))
                 at("search").fill(aid(1)); at("search").press("Enter")
@@ -196,7 +249,25 @@ def main():
                 at("layout").click()
                 check("60 live API records expand", ev("agentTopology.graph.nodes.length===60"))
                 check("60-agent automatic layout has no overlapping cards", ev("agentTopology.graph.nodes.every((a,i)=>agentTopology.graph.nodes.slice(i+1).every(b=>{const p=agentTopology.position(a.id),q=agentTopology.position(b.id);return Math.abs(p.x-q.x)>=218||Math.abs(p.y-q.y)>=109}))"))
+                page.locator('[data-at-fold="0000000000000001"]').click()
+                check("folding the root recenters the remaining node", ev("agentTopology.graph.nodes.length===1 && agentTopology.current.zoom>=1"))
+                page.locator('[data-at-fold="0000000000000001"]').click()
+                check("unfolding restores and fits all descendants", ev("agentTopology.graph.nodes.length===60 && agentTopology.current.zoom<1"))
+                page.locator('[data-at-scope="online"]').click()
+                for i in range(3, 61):
+                    path = app.run_path(records[i]["run_id"]) / "run.json"
+                    info = json.loads(path.read_text())
+                    private_json(path, {**info, "status": "exited", "exit_code": 0})
+                page.wait_for_function("AgentTopologyModel.counts(agentTopology.rows).offline===58")
+                check("polling compacts the graph when agents become hidden", compact_pair())
+                page.locator('[data-at-scope="all"]').click()
+                page.locator('[data-at-scope="active"]').click()
+                check("hiding inactive history compacts the graph and preserves parent context", compact_pair() and ev("agentTopology.graph.nodes.find(n=>n.id==='0000000000000001').context"))
+                page.locator('[data-at-scope="all"]').click()
                 at("grouping").select_option("role")
+                at("status").select_option("waiting")
+                check("group filtering compacts and fits the remaining group", ev("agentTopology.graph.nodes.length===1 && agentTopology.bounds().h<220 && agentTopology.current.zoom>=1"))
+                page.locator('[data-at-scope="all"]').click()
                 for width in (2560, 5120):
                     page.set_viewport_size({"width": width, "height": 1100})
                     check(f"{width}px main content fills the available width", ev("Math.abs(document.querySelector('.main').getBoundingClientRect().right-innerWidth)<=1 && Math.abs(document.querySelector('.topbar').getBoundingClientRect().right-innerWidth)<=1 && Math.abs(document.querySelector('#agent-topology').getBoundingClientRect().right-(innerWidth-36))<=1"))
@@ -211,6 +282,10 @@ def main():
                 check("desktop layout does not overflow", ev("document.documentElement.scrollWidth<=innerWidth"))
                 page.set_viewport_size({"width": 390, "height": 844})
                 check("narrow fallback does not overflow", ev("document.documentElement.scrollWidth<=innerWidth"))
+                tools.click()
+                check("narrow workspace menu fits the viewport", ev("document.querySelector('.project-tools-panel').getBoundingClientRect().left >= 0 && document.querySelector('.project-tools-panel').getBoundingClientRect().right <= innerWidth"))
+                page.locator("#project-goal").click()
+                check("clicking outside dismisses workspace menu", not ev("document.querySelector('#project-tools').open"))
                 check("global theme switch remains visible on narrow screens", theme("light").is_visible() and theme("dark").is_visible())
                 theme("light").click()
                 check("light topology follows the global theme without overflow", ev("getComputedStyle(document.querySelector('.at-metrics')).backgroundColor==='rgb(255, 255, 255)' && document.documentElement.scrollWidth<=innerWidth"))
@@ -225,12 +300,14 @@ def main():
                 for tab in ("memory", "console", "files"):
                     page.locator(f'[data-tab="{tab}"]').click()
                     check(f"{tab} view retains the global dark theme", ev("document.documentElement.dataset.theme==='dark' && getComputedStyle(document.body).backgroundColor==='rgb(21, 36, 49)'"))
+                tools.click()
                 with page.expect_event("framenavigated", predicate=lambda frame: frame.url.endswith("/graph-view")):
                     page.locator("#graph-button").click()
                 page.wait_for_function("document.querySelector('#graph-frame').contentDocument?.readyState==='complete' && document.querySelector('#graph-frame').contentDocument?.getElementById('sapper-page-theme')")
                 check("embedded native graph shares the global palette", ev("getComputedStyle(document.querySelector('#graph-frame').contentDocument.body).backgroundColor==='rgb(21, 36, 49)'"))
                 page.keyboard.press("Escape")
                 theme("light").click()
+                tools.click()
                 with page.expect_event("framenavigated", predicate=lambda frame: frame.url.endswith("/graph-view")):
                     page.locator("#graph-button").click()
                 page.wait_for_function("document.querySelector('#graph-frame').contentDocument?.readyState==='complete' && document.querySelector('#graph-frame').contentDocument?.getElementById('sapper-page-theme')")
@@ -241,6 +318,7 @@ def main():
                 check("manual choice takes precedence over system preference", ev("document.documentElement.dataset.theme==='dark'"))
                 page.reload()
                 page.wait_for_selector("#overview:visible")
+                check("overview retains access to native tools", page.locator("#native-button").is_visible())
                 check("theme persists across reload and on the overview", ev("document.documentElement.dataset.theme==='dark' && localStorage.getItem('sapper-theme')==='dark' && getComputedStyle(document.querySelector('.overview-context')).backgroundColor==='rgb(32, 53, 67)'"))
                 other = page.context.new_page()
                 other.on("pageerror", lambda error: errors.append(str(error)))

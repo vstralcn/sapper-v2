@@ -182,7 +182,10 @@ Multi-stage deep-dive chains (an industry report puts their success rate at
 Basic Web controls, using the original CLI, tmux sessions, and fact graph:
 
 ```bash
-python3 lib/sapper.py web                 # http://127.0.0.1:8766/
+./sapperctl start                         # http://127.0.0.1:8766/
+./sapperctl status                        # Web, managed tmux sessions and model bridges
+# ./sapperctl restart   (Web only)      ./sapperctl stop   (all Sapper-managed services)
+# ./sapperctl claude-status            ./sapperctl stop-claude (Claude daemon and detached sessions)
 # Read the login token in another terminal: cat .sapper-web/token
 ```
 

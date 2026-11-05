@@ -12,6 +12,7 @@ let roleInfoRequest = 0;
 let directoryRequest = 0;
 let selectedDirectory = "";
 let agentTopology;
+const flagSettingsRequests = new Set();
 const roleNames = {worker:"执行者",commander:"指挥官",general:"将军",scout:"侦察兵",verifier:"验证者",custom:"自定义职责"};
 const baseRefreshTask = refreshTask;
 const baseSetTab = setTab;
@@ -31,6 +32,10 @@ refreshTask = async function () {
     state.agents = roles.agents;
     state.services = roles.services;
     state.inspection = inspection;
+    if (!flagSettingsRequests.has(pid)) {
+      $("auto-submit-flags").checked = inspection.auto_submit_flags;
+      $("auto-submit-flags").disabled = !inspection.graph;
+    }
     const ready = inspection.graph && inspection.instructions && Object.values(inspection.hooks).every(Boolean);
     $("project-status").textContent = state.graph.project.status === "completed" ? "目标已完成" : ready ? "工作区已接入" : "待启用 sapper";
     $("enable-workspace").textContent = ready ? "检查／更新接入" : "启用 sapper";
@@ -154,12 +159,13 @@ function openAgent(role="worker",parent="") {
   $("agent-role").value=role;
   $("agent-location").value=role==="worker"&&!parent?"root":"agent";
   $("agent-mission").value=state.graph?.project.goal||state.project.goal;
-  $("agent-profile").replaceChildren(...$("run-profile").cloneNode(true).children);
+  refreshAgentModelOptions(false);
   $("agent-parent").replaceChildren(element("option","","无／独立主会话"));
   $("agent-parent").firstChild.value="";
-  for(const a of state.agents.filter(a=>!a.id.startsWith('legacy-'))){const opt=element("option","",`${a.name||a.role_label} · ${a.id.slice(0,6)}`);opt.value=a.id;$("agent-parent").append(opt);}
+  for(const a of state.agents.filter(a=>!a.id.startsWith('legacy-'))){const opt=element("option","",agentOptionLabel(a));opt.value=a.id;$("agent-parent").append(opt);}
   $("agent-parent").value=parent;
   $("agent-basis").required=Boolean(parent);
+  updateAgentModelHint();
   $("agent-scope-options").replaceChildren(...state.projects.map(p=>{
     const label=element("label","inline-check","");
     const input=document.createElement("input");input.type="checkbox";input.name="workspace_scope";input.value=p.id;
@@ -169,11 +175,13 @@ function openAgent(role="worker",parent="") {
   }));
   updateRoleFields();
   $("agent-dialog").showModal();
+  guarded(loadAgentExtensions);
 }
 function updateRoleFields(){
   const commander=$("agent-role").value==="commander";
   $("agent-scope").hidden=!commander;
   $("agent-watchdog").closest("label").hidden=!commander;
+  refreshAgentModelOptions();
   guarded(loadRoleInfo);
 }
 async function loadRoleInfo(){
@@ -234,6 +242,11 @@ function renderAgentCard(a) {
   appendRunActivity(node,a);
   const details=element("details","agent-details");
   details.append(element("summary","","会话与目录"),element("p","","Claude ID: "+(a.native_operation?"原 CLI 多步骤流程，无单一会话 ID":a.claude_session_id||"未知，未推断")),element("p","","cwd: "+a.cwd));
+  if(a.extensions){
+    details.append(element("p","",`MCP: ${a.extensions.mcp.map(r=>r.name).join("、")||"无"}`),
+      element("p","",`Skills: ${a.extensions.skills.map(r=>r.name).join("、")||"无"}`),
+      element("p","","会话存储: "+a.session_storage));
+  }
   if(a.shared_context){const c=a.shared_context;details.append(element("p","",`全局配置 v${c.latest_revision}；启动注入：${c.launch_revision?"v"+c.launch_revision:"无"}；最近 hook 检查：${c.hook_revision?"v"+c.hook_revision:"暂无回执"}${c.hook_checked_at?"（"+time(c.hook_checked_at)+"）":""}`));}
   details.append(element("p","",a.role_prompt_version?`基础职责：${a.role_prompt_version} · ${a.role_prompt_sha256?.slice(0,12)||"未记录摘要"}`:"基础职责：旧会话未记录版本"));
   if(a.workspace_scope?.length>1)details.append(element("p","","工作区范围: "+a.workspace_scope.map(id=>state.projects.find(p=>p.id===id)?.name||id).join("、")));
@@ -319,12 +332,19 @@ async function flushTerminalInput(){
   const data=inputBuffer,pane=state.nativePane;inputBuffer="";
   if(data&&pane){inputQueue=inputQueue.then(()=>guarded(()=>api(`/panes/${encodeURIComponent(pane)}/input`,{method:"POST",body:{data}})));await inputQueue;}
 }
+function agentOptionLabel(a){
+  return `${a.name||a.role_label} · ${AgentTopologyModel.shortGoal(a)} · ${a.id.slice(0,6)}`;
+}
 function renderNativePanes(){
   const rolePanes=new Set(state.agents.map(a=>a.pane_id));
   const all=state.panes.filter(p=>p.project_id===state.project.id||rolePanes.has(p.id)||p.role==="commander");
-  const sig=JSON.stringify(all.map(p=>[p.id,p.session,p.name]));if(state.nativePaneSignature===sig)return;
+  const options=all.map(p=>{
+    const a=state.agents.find(a=>a.pane_id===p.id), service=state.services.find(s=>s.pane_id===p.id);
+    return [p.id,a?agentOptionLabel(a):service?"Watchdog · 脚本服务":`已有会话 · ${p.name}`];
+  });
+  const sig=JSON.stringify(options);if(state.nativePaneSignature===sig)return;
   state.nativePaneSignature=sig;
-  $("native-pane").replaceChildren(...all.map(p=>{const a=state.agents.find(a=>a.pane_id===p.id),service=state.services.find(s=>s.pane_id===p.id);const opt=element("option","",a?`${a.name||a.role_label} · ${a.id.slice(0,6)}`:service?"Watchdog · 脚本服务":`已有会话 · ${p.name}`);opt.value=p.id;return opt;}));
+  $("native-pane").replaceChildren(...options.map(([id,label])=>{const opt=element("option","",label);opt.value=id;return opt;}));
   const chosen=all.some(p=>p.id===state.nativePane)?state.nativePane:all[0]?.id||"";
   if(!all.length){const opt=element("option","","暂无活动角色终端");opt.value="";$("native-pane").append(opt);}
   $("native-pane").value=chosen;
@@ -368,7 +388,25 @@ function disconnectNative(){
 
 $("bind-workspace").onclick=()=>guarded(openBind);
 $("bind-dialog").addEventListener("close",()=>{++directoryRequest;});
-$("start-run").textContent="打开 Claude Code";
+const projectTools=$("project-tools");
+function closeProjectTools(restoreFocus=false){
+  if(!projectTools.open)return;
+  projectTools.open=false;
+  if(restoreFocus)projectTools.querySelector("summary").focus();
+}
+document.addEventListener("click",event=>{
+  if(!projectTools.contains(event.target))closeProjectTools();
+});
+projectTools.addEventListener("keydown",event=>{
+  if(event.key==="Escape" && projectTools.open){event.preventDefault();closeProjectTools(true);}
+});
+// Close before the action opens its dialog so dismissing it returns to the disclosure.
+projectTools.addEventListener("click",event=>{
+  if(event.target.closest("button"))closeProjectTools(true);
+},true);
+projectTools.addEventListener("focusout",event=>{
+  if(event.relatedTarget && !projectTools.contains(event.relatedTarget))closeProjectTools();
+});
 $("start-run").onclick=()=>openAgent();
 $("new-agent").onclick=()=>openAgent();
 $("advanced-run").onclick=()=>openRun();
@@ -376,6 +414,20 @@ $("agent-parent").onchange=()=>{$("agent-basis").required=Boolean($("agent-paren
 $("agent-role").onchange=()=>{$("agent-location").value=$("agent-role").value==="worker"?"root":"agent";updateRoleFields();};
 $("enable-workspace").onclick=()=>guarded(async()=>{
   await workspaceApi("enable",{method:"POST",body:{}});await refreshProjects();toast("项目级 hooks 与说明已接入，用户内容已保留");
+});
+$("auto-submit-flags").onchange=()=>guarded(async()=>{
+  const input=$("auto-submit-flags"), pid=state.project.id, enabled=input.checked;
+  const hadFocus=document.activeElement===input;
+  flagSettingsRequests.add(pid);
+  $("auto-submit-flags").disabled=true;
+  try {
+    await api(`/workspaces/${pid}/settings`,{method:"POST",body:{auto_submit_flags:enabled}});
+    if(state.project?.id===pid)toast(enabled?"已开启 AI 主动提交 flag；运行中角色下一轮读取新设置":"已关闭 AI 主动提交 flag");
+  } finally {
+    flagSettingsRequests.delete(pid);
+    await refreshTask();
+    if(state.project?.id===pid && hadFocus && projectTools.open && document.activeElement===document.body)input.focus();
+  }
 });
 $("stop-workspace").onclick=()=>guarded(async()=>{
   if(!await confirmAction("停止本工作区登记的角色和 watchdog？其他工作区不受影响，原图与会话历史保留。"))return;
@@ -401,10 +453,12 @@ submit("bind-form",async form=>{
 });
 submit("agent-form",async form=>{
   const data=Object.fromEntries(form);data.minutes=Number(data.minutes);
+  if(data.profile_id==="__role_default__")delete data.profile_id;
   const basis=String(data.basis||"").trim();delete data.basis;
   if(basis)data[/^i[0-9]+$/.test(basis)?"intent_id":"from"]=basis;
   data.workspace_scope=[state.project.id,...(data.role==="commander"?form.getAll("workspace_scope").filter(id=>id!==state.project.id):[])];
   data.skip_permissions=form.has("skip_permissions");data.watchdog=form.has("watchdog");data.request_id=crypto.randomUUID();
+  if(!$("agent-extensions-default").checked)data.extensions=readExtensionSelection("agent-extension-options");
   const run=await workspaceApi("sessions",{method:"POST",body:data});$("agent-dialog").close();setTab("workspace");await refreshTask();
   const a=state.agents.find(a=>a.run_id===run.id);if(a?.pane_id)selectNative(a.pane_id);
   toast("已启动原 Claude Code，并记录独立会话 ID");

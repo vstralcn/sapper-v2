@@ -23,6 +23,7 @@
 
 | 文档 | 内容 |
 | --- | --- |
+| [Agent MCP、Skills 与会话存储](./16-agent-resources.md) | Web 资源选择、会话隔离、API Key 启动与精确恢复 |
 | [角色与协作拓扑](./15-agent-topology.md) | 实时拓扑、状态依据、分组交互、布局稳定性与验证 |
 | [产品需求与交互](./01-product-requirements.md) | 网页管理范围、操作语义、保留能力与验收 |
 | [技术架构与迁移](./02-architecture.md) | 原功能与网页操作的映射、模型配置、终端、日志及状态所有权 |

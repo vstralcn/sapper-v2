@@ -30,6 +30,29 @@ class HookProcessTests(unittest.TestCase):
                 self.assertIn("hook integration goal", payload["additionalContext"])
                 self.assertNotIn("contextForClaude", payload)
 
+    def test_submission_policy_updates_in_both_hooks_and_shared_agent_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = sapper.Store(root / ".sapper")
+            store.init("test", "submission fixture")
+            agent = root / "agent"
+            agent.mkdir()
+            (agent / ".sapper").symlink_to(store.root, target_is_directory=True)
+            for enabled in (False, True, False):
+                with store.locked():
+                    project = store.load_project()
+                    project["auto_submit_flags"] = enabled
+                    store.save_project(project)
+                for cwd in (root, agent):
+                    for event in ("sessionstart", "userpromptsubmit"):
+                        result = subprocess.run([sys.executable, str(HOOK), event], cwd=root,
+                                                input=json.dumps({"cwd": str(cwd)}),
+                                                capture_output=True, text=True, timeout=5)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+                        self.assertIn("ON: the user authorizes proactive" if enabled else "OFF: record flags", context)
+                        self.assertLess(context.index("[Sapper workspace flag submission policy]"), context.index("UNTRUSTED DATA"))
+
     def test_no_graph_is_silent_and_does_not_inherit_parent_graph(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

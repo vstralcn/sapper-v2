@@ -1776,47 +1776,104 @@ def _find_flag_fact(store: Store, value: str) -> dict | None:
     return None
 
 
+def flag_submission_policy(project: dict) -> str:
+    """User-owned setting, read afresh by hooks and the CLI (old graphs default off)."""
+    enabled = project.get("auto_submit_flags") is True
+    action = (
+        "ON: the user authorizes proactive flag submission for this workspace. "
+        "Executing workers should promptly submit confirmed captured flags using "
+        "`sapper flag <value> -c <platform-challenge-code>`; this command records then submits. "
+        "Submit an existing recorded flag with `sapper flag --id <fact-id>`. "
+        "A missing platform configuration or challenge code is a blocker to report, not success."
+        if enabled else
+        "OFF: record flags without proactive submission. Submit only when the user's "
+        "current task explicitly authorizes it, using `sapper flag --id <fact-id> --submit` "
+        "or `sapper flag <value> -c <platform-challenge-code> --submit`."
+    )
+    return ("[Sapper workspace flag submission policy]\n" + action + "\n"
+            "This latest workspace setting replaces earlier automatic-submission settings; "
+            "respect explicit current user constraints. Commanders delegate submission to an executing worker. "
+            "Scouts/verifiers stay within their mission; use `--no-submit` for capture-only work. "
+            "Only a platform `correct: true` reply proves acceptance. Never blindly retry rejected "
+            "flags or uncertain network outcomes.\n[End flag submission policy]")
+
+
 def cmd_flag(args) -> int:
     store = Store(Path(args.store))
     store.require()
-    value = args.value.strip()
+    # Separate from the graph lock: add_fact/update_flag_fact acquire that lock.
+    # Serialize record + submit so concurrent workers do not submit the same flag twice.
+    with open(store.root / ".flag-submit.lock", "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return _cmd_flag_locked(store, args)
+
+
+def _cmd_flag_locked(store: Store, args) -> int:
+    value = (args.value or "").strip()
+    if args.fact_id:
+        if value:
+            raise FGError("use either a flag value or --id, not both")
+        fact = store.get_fact(args.fact_id)
+        if fact.get("kind") != "flag":
+            raise FGError(f"fact {args.fact_id} is not a flag fact")
+        value = (fact.get("data") or {}).get("value", "")
     if not value:
-        raise FGError("flag value cannot be empty")
+        raise FGError("provide a flag value or --id <flag-fact-id>")
+    submit = args.submit if args.submit is not None else store.load_project().get("auto_submit_flags") is True
     existing = _find_flag_fact(store, value)
-    if existing is not None:
-        d = existing.get("data") or {}
-        raise FGError(
-            f"flag already recorded as {existing['id']} "
-            f"(status={d.get('status', 'recorded')}, challenge={d.get('challenge', '?')})"
-        )
     challenge = (args.challenge or "").strip()
-    description = f"flag captured: {value}" + (f" (challenge {challenge})" if challenge else "")
-    fact = store.add_fact(
-        description=description,
-        creator=args.creator,
-        source_intent=args.from_intent,
-        title=args.title or "flag",
-        kind="flag",
-        data={"value": value, "challenge": challenge, "status": "recorded"},
-    )
-    print(f"{fact['id']} recorded")
-    if not args.submit:
+    if existing is not None:
+        if args.fact_id:
+            existing = fact
+        d = existing.get("data") or {}
+        if not submit:
+            raise FGError(f"flag already recorded as {existing['id']} (status={d.get('status', 'recorded')})")
+        if challenge and d.get("challenge") and challenge != d["challenge"]:
+            raise FGError("challenge differs from the recorded flag; check the platform challenge code")
+        challenge = challenge or d.get("challenge", "")
+        if d.get("status") in ("submitted", "duplicate"):
+            print(f"{existing['id']} already submitted; no request sent")
+            return 0
+        if d.get("status") == "rejected" and args.submit is not True:
+            raise FGError("flag was rejected; verify the value before an explicit --submit retry")
+        if d.get("submission_uncertain") == "true" and args.submit is not True:
+            raise FGError("previous submission outcome is uncertain; check platform state before an explicit --submit retry")
+        fact = existing
+    else:
+        description = f"flag captured: {value}" + (f" (challenge {challenge})" if challenge else "")
+        fact = store.add_fact(
+            description=description, creator=args.creator, source_intent=args.from_intent,
+            title=args.title or "flag", kind="flag",
+            data={"value": value, "challenge": challenge, "status": "recorded"},
+        )
+        print(f"{fact['id']} recorded")
+    if not submit:
         print("(not submitted; pass --submit to send it via the arena API)")
         return 0
-    client = _arena_client(store)
     if not challenge:
-        print("sapper: warning: no --challenge given; submit endpoint may need it", file=sys.stderr)
+        raise FGError(f"flag kept as {fact['id']} (recorded); supply -c <platform-challenge-code> to submit")
+    client = _arena_client(store)
+    # Persist the in-flight uncertainty before external I/O, including process death.
+    with store.locked():
+        fact = store.get_fact(fact["id"])
+        fact["data"].update(challenge=challenge, submission_uncertain="true")
+        atomic_write_json(store.facts_dir / f"{fact['id']}.json", fact)
     try:
-        reply = client.submit_flag(challenge or "-", value)
-    except FGError:
-        raise
-    except Exception as exc:  # ArenaError subclasses Exception
-        store.update_flag_fact(fact["id"], "rejected", str(exc))
-        raise FGError(f"submit failed, flag kept as {fact['id']} (recorded): {exc}") from exc
-    raw = json.dumps(reply.get("result", {}), ensure_ascii=False)
-    accepted = reply.get("status") == 200
+        reply = client.submit_flag(challenge, value)
+    except Exception as exc:
+        store.update_flag_fact(fact["id"], "recorded", str(exc))
+        raise FGError(f"submission outcome uncertain for {fact['id']}; check platform state before retrying: {exc}") from exc
+    raw = json.dumps(reply, ensure_ascii=False)
+    if not isinstance(reply, dict) or type(reply.get("correct")) is not bool:
+        store.update_flag_fact(fact["id"], "recorded", raw[:500])
+        raise FGError(f"submission outcome uncertain for {fact['id']}: reply lacks a boolean correct field")
+    accepted = reply["correct"]
     status = "submitted" if accepted else "rejected"
     store.update_flag_fact(fact["id"], status, raw[:500])
+    with store.locked():
+        fact = store.get_fact(fact["id"])
+        fact["data"].pop("submission_uncertain", None)
+        atomic_write_json(store.facts_dir / f"{fact['id']}.json", fact)
     print(f"{fact['id']} {status}: {raw[:300]}")
     return 0 if accepted else 1
 
@@ -4633,11 +4690,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "flag", help="record a captured flag (dedupe; optionally submit via arena)"
     )
-    sp.add_argument("value", help="the flag string, e.g. flag{...}")
+    sp.add_argument("value", nargs="?", help="the flag string, e.g. flag{...}")
+    sp.add_argument("--id", dest="fact_id", help="submit an existing flag fact without recording it again")
     sp.add_argument("--challenge", "-c", default=None, help="challenge id on the platform")
     sp.add_argument("--from-intent", help="close this intent with the captured flag fact")
-    sp.add_argument("--submit", action="store_true",
-                    help="also submit via the arena API (requires .sapper/arena.json)")
+    submission = sp.add_mutually_exclusive_group()
+    submission.add_argument("--submit", dest="submit", action="store_true", default=None,
+                            help="explicitly submit via the arena API")
+    submission.add_argument("--no-submit", dest="submit", action="store_false",
+                            help="record only, overriding workspace auto submission")
     sp.add_argument("--title", "-t", default=None)
     sp.add_argument("--creator", default="user")
     sp.set_defaults(func=cmd_flag)

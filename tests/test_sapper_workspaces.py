@@ -27,10 +27,10 @@ import json,os,sys,subprocess,signal,time
 from pathlib import Path
 args=sys.argv[1:]
 if '--help' in args:
-    print('--session-id --resume --add-dir --append-system-prompt --init-only')
+    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt --init-only')
     raise SystemExit(0)
 if '--version' in args:
-    print('fixture-claude')
+    print('2.1.318 (fixture)')
     raise SystemExit(0)
 flag='--resume' if '--resume' in args else '--session-id'
 sid=args[args.index(flag)+1]
@@ -89,7 +89,10 @@ from datetime import datetime,timezone
 from pathlib import Path
 args=sys.argv[1:]
 if '--help' in args:
-    print('--session-id --resume --add-dir --append-system-prompt')
+    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt')
+    raise SystemExit(0)
+if '--version' in args:
+    print('2.1.318 (fixture)')
     raise SystemExit(0)
 sid=args[args.index('--resume' if '--resume' in args else '--session-id')+1]
 path=Path(os.environ['CLAUDE_CONFIG_DIR'])/'projects'/'fixture'/(sid+'.jsonl')
@@ -130,7 +133,7 @@ class WorkspaceBindingTests(unittest.TestCase):
         manager = self.app.workspaces
         pid = manager.bind({"path": str(self.question)})["id"]
         manager.enable(pid, {})
-        manager._capabilities = dict(available=True, session_id=True, resume=True, append_system=True)
+        manager._capabilities = dict(available=True, session_id=True, resume=True, append_system=True, mcp_config=True, strict_mcp_config=True, plugin_dir=True, setting_sources=True, settings=True, skill_isolation=True)
         store = self.app.store(pid)
         basis = store.add_fact("fixture archive supplied", "user")["id"]
         with mock.patch.object(manager, "agent", return_value={"workspace_id": pid, "desired_state": "running"}):
@@ -145,9 +148,10 @@ class WorkspaceBindingTests(unittest.TestCase):
         intent, = store.list_intents()
         self.assertEqual((intent["status"], intent["worker"], intent["to"]), ("open", None, None))
         with mock.patch.object(self.app, "start", return_value={"id": "test-run"}) as start:
-            manager.create_session(pid, {"intent_id": intent["id"], "mission": "check the header first"})
+            manager.create_session(pid, {"intent_id": intent["id"], "mission": "check the header first", "task_label": "检查文件头"})
             native = start.call_args.kwargs["native"]
             self.assertEqual(native["env"]["SAPPER_INTENT_ID"], intent["id"])
+            self.assertEqual(manager.agent(native["agent_id"])["task_label"], "检查文件头")
             self.assertEqual(native["argv"][-1], "inspect archive\n派发补充：check the header first")
             with self.assertRaisesRegex(sapper.FGError, "claimed by"):
                 manager.create_session(pid, {"intent_id": intent["id"]})
@@ -305,6 +309,7 @@ class NativeWorkspaceTests(unittest.TestCase):
         (self.question / "challenge.txt").write_text("read this original question")
         self.socket = "sapper-workspace-test-" + uuid.uuid4().hex[:10]
         self.env = dict(os.environ)
+        os.environ["ANTHROPIC_API_KEY"] = "workspace-fixture-only"
         os.environ["SAPPER_TEST_REPO"] = str(Path(sapper.__file__).resolve().parents[1])
         self.app = Console(self.base / "runs", self.base / "state", self.socket, claude_bin=str(self.bin))
         self.project = self.app.workspaces.bind({"path": str(self.question), "goal": "read fixture"})

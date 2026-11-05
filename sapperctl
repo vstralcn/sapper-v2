@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Manage this checkout's local Sapper Web instance."""
+import argparse
+import contextlib
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+if os.name != "posix" or sys.version_info < (3, 10):
+    sys.exit("需要 Python 3.10+ 和 POSIX 环境；Windows 请在 WSL2 内运行。")
+
+import fcntl
+import socket
+
+REPO = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO / "lib"))
+import sapper_models
+from sapper_web import Console, FINISHED, WebError, private_json, read_json
+
+
+def default_config():
+    return {"root": str(REPO / "runs"), "port": 8766, "socket": "default"}
+
+
+def web_args(config, state):
+    return [str(REPO / "lib/sapper_web.py"), "--state", str(state),
+            "--root", config["root"], "--port", str(config["port"]),
+            "--tmux-socket", config["socket"]]
+
+
+def cwd_of(pid):
+    proc = Path(f"/proc/{pid}/cwd")
+    if sys.platform.startswith("linux"):
+        return proc.resolve(strict=True)
+    if not shutil.which("lsof"):
+        raise RuntimeError("接管相对路径启动的旧服务需要 lsof。")
+    result = subprocess.run(["lsof", "-nP", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                            capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        if line.startswith("n"):
+            return Path(line[1:]).resolve()
+    raise RuntimeError(f"无法核实 PID {pid} 的工作目录。")
+
+
+def web_pids(state, config):
+    # Match complete invocations, including the repository/state. Never signal
+    # a process based on its name, port, or a persisted PID alone.
+    commands = {" ".join(web_args(config, state)): False}
+    if state == REPO / ".sapper-web" and config == default_config():
+        for entry in ("lib/sapper.py web", "lib/sapper_web.py"):
+            commands[entry] = True
+            commands[str(REPO / entry)] = False
+    listing = subprocess.check_output(["ps", "-axww", "-o", "uid=,pid=,command="], text=True, errors="replace")
+    found = []
+    for row in listing.splitlines():
+        fields = row.strip().split(None, 2)
+        if len(fields) != 3 or fields[0] != str(os.getuid()):
+            continue
+        for command, relative in commands.items():
+            executable, sep, tail = fields[2].rpartition(" " + command)
+            if not sep or tail or not re.fullmatch(r"python(?:[0-9.]+)?", Path(executable).name, re.I):
+                continue
+            if "/" in executable and not Path(executable).is_file():
+                continue
+            pid = int(fields[1])
+            try:
+                if not relative or cwd_of(pid) == REPO:
+                    found.append(pid)
+            except FileNotFoundError:
+                pass  # exited while being inspected
+            break
+    return found
+
+
+def port_available(port):
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError as exc:
+            raise RuntimeError(f"端口 {port} 不可用，未确认服务归属：{exc}") from exc
+
+
+def stop_web(state, config):
+    pids = web_pids(state, config)
+    if len(pids) > 1:
+        raise RuntimeError("发现多个匹配的 Web 服务，请先核对启动参数。")
+    if pids:
+        try:
+            os.kill(pids[0], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        for _ in range(60):
+            if pids[0] not in web_pids(state, config):
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("Web 尚未退出。")
+    port_available(config["port"])
+    print("Web 已停止。")
+
+
+def start(state, config):
+    found = web_pids(state, config)
+    if found:
+        if len(found) != 1:
+            raise RuntimeError("发现多个匹配的 Web 服务。")
+        print(f"Web 已在运行（PID {found[0]}）。")
+        return
+    port_available(config["port"])
+    path = state / "web-server.log"
+    actions = [
+        (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+        (os.POSIX_SPAWN_OPEN, 1, str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600),
+        (os.POSIX_SPAWN_DUP2, 1, 2),
+    ]
+    child = os.posix_spawn(sys.executable, [sys.executable, *web_args(config, state)],
+                           os.environ.copy(), file_actions=actions, setsid=True)
+    # Confirm both the matching invocation and a local listener before returning.
+    for _ in range(100):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        if child in web_pids(state, config):
+            try:
+                with socket.create_connection(("127.0.0.1", config["port"]), timeout=0.2):
+                    print(f"Web 已启动（PID {child}）：http://127.0.0.1:{config['port']}/")
+                    return
+            except OSError:
+                pass
+        time.sleep(0.1)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(child, signal.SIGTERM)
+    raise RuntimeError(f"Web 未就绪，请检查 {path}")
+
+
+def live_runs(state, config):
+    records = [read_json(p) for p in (state / "runs").glob("*/run.json")]
+    if not records:
+        return []
+    args = ["tmux", "-L", config["socket"], "list-sessions", "-F", "#{session_name}"]
+    result = subprocess.run(args, capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}, timeout=10)
+    if result.returncode and not any(s in result.stderr for s in ("no server running", "No such file or directory", "no sessions")):
+        raise RuntimeError(f"无法核实 tmux 会话：{result.stderr.strip()}")
+    sessions = set(result.stdout.splitlines())
+    return [r for r in records if r["session"] == "sapper-web-" + r["id"] and r["session"] in sessions]
+
+
+def stop_managed(state, config):
+    if (state / "runs").exists() or (state / "agents").exists():
+        app = Console(Path(config["root"]), state, config["socket"])
+        with app.workspaces.lifecycle():
+            runs = live_runs(state, config)
+            for path in (state / "agents").glob("*.json"):
+                agent = read_json(path)
+                if agent.get("run_id") and agent.get("desired_state") == "running" and not agent.get("deleted_at"):
+                    app.workspaces.mark_stopped(agent["id"])
+            for run in sorted(runs, key=lambda r: r.get("role") != "watchdog"):
+                if run["status"] not in FINISHED:
+                    app.stop(run["id"])
+                else:
+                    # A finished runner can leave a dead/remain-on-exit pane.
+                    app.tmux("kill-session", "-t", "=" + run["session"])
+            if live_runs(state, config):
+                raise RuntimeError("仍有受管 tmux 会话，模型桥保留；可重新执行 stop。")
+    for bridge in sapper_models.bridge_operation(state):
+        sapper_models.bridge_operation(state, bridge["id"])
+    for ready in (state / "model-bridges").glob("*/ready.json"):
+        # An unavailable bridge must not be reported as stopped if its recorded PID lives.
+        pid = read_json(ready, {}).get("pid")
+        if isinstance(pid, int) and pid > 0:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+        raise RuntimeError("仍有未确认退出的模型桥，请检查 status。")
+    print("受管任务及模型桥已关闭。")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sapper 本地服务管理（macOS / Linux / WSL2）")
+    parser.add_argument("action", choices=["start", "stop", "status", "restart", "stop-web", "claude-status", "stop-claude"],
+                        help="stop 关闭整套受管服务；restart 和 stop-web 只操作网页")
+    parser.add_argument("--state", type=Path, default=REPO / ".sapper-web", help="实例状态目录")
+    parser.add_argument("--port", type=int, help="首次 start 的本地端口，默认 8766")
+    parser.add_argument("--root", type=Path, help="首次 start 的任务根目录")
+    parser.add_argument("--tmux-socket", help="首次 start 的 tmux -L 名称，默认 default")
+    args = parser.parse_args()
+    state = args.state.expanduser().resolve()
+    os.umask(0o077)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (state / "sapperctl.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        settings = state / "sapperctl.json"
+        config = read_json(settings, default_config())
+        requested = dict(config)
+        if args.port is not None:
+            if not 1 <= args.port <= 65535:
+                parser.error("--port 需要 1–65535")
+            requested["port"] = args.port
+        if args.root:
+            requested["root"] = str(args.root.expanduser().resolve())
+        if args.tmux_socket:
+            requested["socket"] = args.tmux_socket
+        if requested != config and (settings.exists() or args.action != "start" or
+                                    web_pids(state, config) or any((state / "runs").glob("*/run.json"))):
+            parser.error("已有实例使用原配置。新配置请用 start --state 选择独立目录。")
+        if args.action in ("claude-status", "stop-claude"):
+            executable = shutil.which("claude")
+            if not executable:
+                raise RuntimeError("当前环境找不到 Claude Code CLI。")
+            argv = [executable, "daemon", "status"] if args.action == "claude-status" else [executable, "daemon", "stop", "--any"]
+            result = subprocess.run(argv, check=False, timeout=30)
+            if result.returncode:
+                raise RuntimeError(f"Claude daemon 命令退出码 {result.returncode}。")
+            return
+        if args.action == "status":
+            pids = web_pids(state, config)
+            print("Web：" + (", ".join(map(str, pids)) if pids else "未发现匹配进程"))
+            print(f"目录：{state}\n地址：http://127.0.0.1:{config['port']}/")
+            print(f"受管 tmux 会话：{len(live_runs(state, config))}（socket {config['socket']}）")
+            print(f"在线模型桥：{len(sapper_models.bridge_operation(state))}")
+            return
+        if args.action in ("restart", "stop", "stop-web"):
+            stop_web(state, config)
+        if args.action == "stop":
+            stop_managed(state, config)
+        if args.action in ("start", "restart"):
+            fresh = not settings.exists()
+            if fresh:
+                # Record the launch arguments before spawning, so an interrupted
+                # controller can rediscover a server with a non-default port.
+                private_json(settings, requested)
+            try:
+                start(state, requested)
+            except Exception:
+                if fresh and not web_pids(state, requested):
+                    settings.unlink(missing_ok=True)
+                raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, WebError, subprocess.SubprocessError) as error:
+        sys.exit(f"sapperctl：{error}")

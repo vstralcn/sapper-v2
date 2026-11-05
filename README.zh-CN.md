@@ -121,7 +121,10 @@ nvwabase status                          # 看板与可干前沿
 基础网页控制台（保留原 CLI、tmux 与事实图）：
 
 ```bash
-python3 lib/sapper.py web                 # http://127.0.0.1:8766/
+./sapperctl start                         # http://127.0.0.1:8766/
+./sapperctl status                        # Web、受管 tmux 会话、模型桥
+# ./sapperctl restart   只重启网页；./sapperctl stop   关闭 Sapper 受管服务
+# ./sapperctl claude-status 查看 Claude daemon；./sapperctl stop-claude 关闭 daemon 与后台会话
 # 在另一个终端查看登录口令：cat .sapper-web/token
 ```
 

@@ -220,7 +220,7 @@ class CommanderMonitor:
             root = Path(self.app.project(wid)["path"]) / ".sapper"
             # Directory metadata catches new HELP/REPORT facts; existing-node edits
             # are caught by the periodic 60s fallback. No graph dumps every 3s.
-            for name in ("facts", "hints"):
+            for name in ("facts", "hints", "project.json"):
                 path = root / name
                 items.append((wid, name, path.stat().st_mtime_ns if path.exists() else None))
         return hashlib.sha256(json.dumps(sorted(items, key=repr), sort_keys=True).encode()).hexdigest()

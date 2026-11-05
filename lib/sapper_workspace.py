@@ -21,6 +21,7 @@ import uuid
 import sapper
 import sapper_context
 import sapper_roles
+from sapper_extensions import AgentExtensions, ExtensionError, REQUIRED_FLAGS
 from sapper_commander import CommanderMonitor, WatchdogLog
 
 REPO = Path(__file__).resolve().parent.parent
@@ -61,6 +62,7 @@ class Workspaces:
         self._capabilities = None
         self._in_lifecycle = False
         self.commander = CommanderMonitor(self)
+        self.extensions = AgentExtensions(self)
 
     @contextlib.contextmanager
     def lifecycle(self):
@@ -170,11 +172,29 @@ class Workspaces:
                      for event in ("SessionStart", "UserPromptSubmit")}
         bridge = root / ".claude/sapper-workspace.md"
         return {"workspace": project, "graph": (root / ".sapper/project.json").is_file(),
+                "auto_submit_flags": self.auto_submit_flags(pid),
                 "hooks": installed, "instructions": bridge.exists(),
                 "claude_md": (root / "CLAUDE.md").exists(), "agents_md": (root / "AGENTS.md").exists(),
                 "claude": self.capabilities(), "path": str(root),
                 "role_catalog": sapper_roles.catalog(),
                 "role_prompt_version": sapper_roles.PROMPT_VERSION}
+
+    def auto_submit_flags(self, pid):
+        store = self.app.store(pid)
+        return store.exists() and store.load_project().get("auto_submit_flags") is True
+
+    @serialized
+    def save_settings(self, pid, data):
+        if set(data) != {"auto_submit_flags"} or type(data["auto_submit_flags"]) is not bool:
+            raise WorkspaceError("auto_submit_flags 必须为布尔值")
+        store = self.app.store(pid)
+        store.require()
+        with store.locked():
+            project = store.load_project()
+            project["auto_submit_flags"] = data["auto_submit_flags"]
+            store.save_project(project)
+        self.app.audit("workspace.settings", workspace=pid, auto_submit_flags=data["auto_submit_flags"])
+        return {"auto_submit_flags": data["auto_submit_flags"]}
 
     @serialized
     def enable(self, pid, data):
@@ -232,7 +252,15 @@ class Workspaces:
             self._capabilities = {"available": proc.returncode == 0, "binary": self.app.claude_bin,
                                   **{name: flag in output for name, flag in (
                                       ("session_id", "--session-id"), ("resume", "--resume"),
-                                      ("add_dir", "--add-dir"), ("append_system", "--append-system-prompt"))}}
+                                      ("add_dir", "--add-dir"), ("append_system", "--append-system-prompt"),
+                                      ("mcp_config", "--mcp-config"), ("strict_mcp_config", "--strict-mcp-config"),
+                                      ("plugin_dir", "--plugin-dir"), ("setting_sources", "--setting-sources"),
+                                      ("settings", "--settings"))}}
+            version = subprocess.run([self.app.claude_bin, "--version"], capture_output=True, text=True, timeout=5)
+            match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version.stdout)
+            self._capabilities["version"] = match.group(0) if match else "unknown"
+            # The full settings/skills isolation contract is tested at this floor.
+            self._capabilities["skill_isolation"] = bool(match and tuple(map(int, match.groups())) >= (2, 1, 318))
         except (OSError, subprocess.TimeoutExpired):
             self._capabilities = {"available": False, "binary": self.app.claude_bin}
         return self._capabilities
@@ -324,6 +352,7 @@ class Workspaces:
                   "role": role, "role_source": "user-attached", "legacy": True,
                   "name": text(data, "name", pane["name"], 100), "parent_agent_id": None,
                   "cwd": pane["path"], "claude_session_id": sid, "external_session": pane["session"],
+                  "task_label": text(data, "task_label", limit=18),
                   "external_pane": pane["id"], "execution_mode": "tui", "mission": text(data, "mission", "已有会话，用户显式登记"),
                   "created_at": sapper.now_iso(), "run_ids": [], "profile_id": "", "profile_name": "原会话配置",
                   "desired_state": "running", "minutes": 10}
@@ -333,11 +362,14 @@ class Workspaces:
     def role_prompt(self, role, project, scope=None):
         scope = scope or [project["id"]]
         projects = [self.app.project(wid) for wid in scope]
-        return sapper_roles.render(
+        prompt = sapper_roles.render(
             role, root=Path(project["path"]),
             worker_script=REPO / "docker/commander/worker.sh",
             workspace_id=project["id"], workspace_name=project["name"],
             workspace_scope=[{"id": p["id"], "name": p["name"]} for p in projects])
+        policies = [f"Workspace {p['id']} ({p['name']}):\n" + sapper.flag_submission_policy(
+            {"auto_submit_flags": self.auto_submit_flags(p["id"])}) for p in projects]
+        return prompt + "\n\n" + "\n\n".join(policies)
 
     def role_info(self, pid, role, scope=None):
         if role not in ROLES:
@@ -372,7 +404,7 @@ class Workspaces:
         for agent in agents:
             row = {k: agent.get(k) for k in (
                 "id", "workspace_id", "workspace_scope", "parent_agent_id", "role",
-                "role_label", "name", "status", "pane_id", "execution_mode", "intent_id",
+                "role_label", "name", "task_label", "status", "pane_id", "execution_mode", "intent_id",
                 "created_at", "minutes", "desired_state", "timeout_seconds", "deadline_epoch", "activity", "stop_reason")}
             row["mission"] = (agent.get("mission") or "")[:500]
             compact_agents.append(row)
@@ -418,6 +450,7 @@ class Workspaces:
                             "id", "title", "description", "status", "worker",
                             "creator", "created_at", "requires_confirmation", "confirmed_at", "from")})
                 graph_data = {"status": graph["project"]["status"], "goal": graph["project"]["goal"],
+                              "auto_submit_flags": graph["project"].get("auto_submit_flags") is True,
                               "facts_total": sum(f.get("id") != "goal" for f in facts),
                               "kinds": kinds, "flags": flags, "open_intents": open_intents[:20],
                               "help": help_notes[-10:], "reports": reports[-10:],
@@ -454,6 +487,9 @@ class Workspaces:
             raise WorkspaceError("当前 Claude CLI 缺少明确会话 ID／恢复能力，请选择支持这些参数的原 CLI；不会自动升级", 409)
         if not cap.get("append_system"):
             raise WorkspaceError("该 Claude CLI 不支持 --append-system-prompt，无法可靠加载角色基础职责；请使用支持该参数的原 CLI", 409)
+        isolated = not existing or bool(existing.get("extension_mode") or existing.get("session_storage"))
+        if isolated and (not cap.get("skill_isolation") or any(not cap.get(k) for k in REQUIRED_FLAGS)):
+            raise WorkspaceError("会话资源隔离需要 Claude CLI 2.1.318+ 及 --mcp-config、--strict-mcp-config、--plugin-dir、--setting-sources、--settings；不会静默降级或自动升级", 409)
         role = (existing or {}).get("role") or data.get("role", "worker")
         if role not in ROLES:
             raise WorkspaceError("角色不正确")
@@ -477,7 +513,10 @@ class Workspaces:
                     raise WorkspaceError("原 worker 并发上限已达到", 409)
         aid = existing["id"] if existing else uuid.uuid4().hex[:16]
         sid = existing["claude_session_id"] if existing else str(uuid.uuid4())
-        profile_id = (existing or {}).get("profile_id") or data.get("profile_id") or ""
+        # A resume retains its original route, including an empty environment
+        # profile. Role defaults only select routes for newly created sessions.
+        profile_id = existing.get("profile_id", "") if existing else self.app.role_profile_id(
+            role, data, parent_record.get("profile_id", "") if parent else "")
         profile = next((p for p in self.app.config()["profiles"] if p["id"] == profile_id), None)
         if profile_id and profile is None:
             raise WorkspaceError("角色模型配置已不存在，请先选择配置", 409)
@@ -531,12 +570,15 @@ class Workspaces:
                               "role": role, "role_source": "original-launch-parameters",
                               "parent_agent_id": parent, "claude_session_id": sid,
                               "execution_mode": mode, "cwd": str(cwd), "mission": mission,
+                              "task_label": text(data, "task_label", limit=18),
                               "profile_id": profile_id, "profile_name": profile["name"] if profile else "继承原环境",
                               "created_at": sapper.now_iso(), "run_ids": [],
                               "name": text(data, "name", ROLES[role], 100), "profile_snapshot": snapshot,
                               "skip_permissions": bool(data.get("skip_permissions")),
                               "minutes": minutes}
         record.setdefault("claude_config_dir", str(Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")))
+        if isolated:
+            record["extension_mode"] = "isolated-v1"
         record["desired_state"] = "running"
         record["role_prompt_version"] = sapper_roles.PROMPT_VERSION
         record["role_prompt_sources"] = list(sapper_roles.ROLE_SPECS[role].sources)
@@ -552,6 +594,7 @@ class Workspaces:
         elif iid and not (existing and intent["to"] is not None):
             active_intent = store.claim_intent(iid, aid)
         try:
+            extension_argv, extension_env, instructions = self.extensions.prepare(record, data, resume=bool(existing)) if isolated else ([], {}, "")
             if active_intent:
                 iid = record["intent_id"] = active_intent["id"]
                 role_prompt += (f"\nAssigned graph intent: {iid}; source facts: {', '.join(active_intent['from'])}. "
@@ -560,13 +603,14 @@ class Workspaces:
                 role_prompt += f"\nPrevious graph intent {iid} already concluded to {intent['to']}."
             record["role_prompt_sha256"] = hashlib.sha256(role_prompt.encode()).hexdigest()
             argv = [self.app.claude_bin, "--resume" if existing else "--session-id", sid]
+            argv += extension_argv
             if profile:
                 argv += ["--model", profile["model"]]
             if data.get("skip_permissions") or (existing or {}).get("skip_permissions"):
                 argv += ["--dangerously-skip-permissions"]
             if cwd != root and cap.get("add_dir"):
                 argv += ["--add-dir", str(root)]
-            argv += ["--append-system-prompt", "\n\n".join(p for p in (role_prompt, shared) if p)]
+            argv += ["--append-system-prompt", "\n\n".join(p for p in (role_prompt, shared, instructions) if p)]
             if mode == "print":
                 argv += ["-p", "--output-format", "stream-json", "--verbose"]
             if not existing or mode == "print" or role == "commander":
@@ -579,8 +623,9 @@ class Workspaces:
                 cwd.mkdir(parents=True, exist_ok=False)
                 (cwd / ".sapper").symlink_to(root / ".sapper", target_is_directory=True)
                 # Hooks are opt-in at exactly this cwd; do not rely on ancestor discovery.
-                settings = cwd / ".claude/settings.json"
-                sapper._load_settings_patch().add(settings, str(REPO / "lib/sapper-hook.py"))
+                if not isolated:
+                    settings = cwd / ".claude/settings.json"
+                    sapper._load_settings_patch().add(settings, str(REPO / "lib/sapper-hook.py"))
                 # Relative import avoids whitespace parsing in absolute paths.
                 (cwd / "CLAUDE.md").write_text("@../../CLAUDE.md\n")
             self.save_agent(record)
@@ -591,10 +636,15 @@ class Workspaces:
                    "SAPPER_WORKSPACE_ID": pid, "SAPPER_WORKSPACE_PATH": str(root), "SAPPER_AGENT_ID": aid,
                    "SAPPER_PARENT_AGENT_ID": parent or "", "SAPPER_WORKSPACE_ALLOWED_ROOTS": json.dumps([str(r) for r in self.app.workspace_roots]),
                    "SAPPER_CLAUDE_BIN": self.app.claude_bin, "SAPPER_TMUX_SOCKET": self.app.tmux_socket or ""}
+            env.update(extension_env)
+            if not isolated:
+                env["CLAUDE_CONFIG_DIR"] = record["claude_config_dir"]
             env[sapper_context.PROMPT_ENV] = str(record["context_revision"]) if record["context_revision"] else ""
             run = self.app.start(pid, {**data, "kind": "claude-native", "profile_id": profile_id}, native={
                 "argv": argv, "cwd": str(cwd), "env": env, "agent_id": aid, "claude_session_id": sid,
                 "role": role, "execution_mode": mode, "intent_id": iid or None,
+                "isolated_extensions": isolated, "skip_hook_install": isolated,
+                "mcp_env_refs": record.get("mcp_env_refs", []),
                 "output_format": "stream-json" if mode == "print" else None,
                 "timeout_seconds": int(record["minutes"]) * 60 if mode == "print" else None})
         except Exception as exc:
@@ -758,6 +808,7 @@ def worker(argv):
     parser.add_argument("target", nargs="?")
     parser.add_argument("body", nargs="?")
     parser.add_argument("--mission", default="")
+    parser.add_argument("--task-label", default="")
     assignment = parser.add_mutually_exclusive_group()
     assignment.add_argument("--from", dest="from_ids", default="", help="依据的 fact ID，以逗号分隔")
     assignment.add_argument("--intent", default="", help="领取已有 intent ID")
@@ -809,16 +860,20 @@ def worker(argv):
             raise WorkspaceError("派发目标不在当前指挥官的明确工作区范围内")
         if not (args.from_ids or args.intent):
             raise WorkspaceError("spawn 需要 --from fNNN 或 --intent iNNN。首次派单请先记录题面等已知事实。")
-        profile = args.profile
+        role = "general" if args.general else args.role or "worker"
+        selection = {"profile_id": args.profile} if args.profile is not None else {}
         if args.model:
-            parent_profile = next((p for p in app.config()["profiles"] if p["id"] == (manager.agent(parent).get("profile_id") if parent else None)), {})
-            chosen = app.save_profile({**parent_profile, "id": "", "name": "worker " + args.model, "model": args.model})
-            profile = chosen["id"]
+            base_id = app.role_profile_id(role, selection, manager.agent(parent).get("profile_id", "") if parent else "")
+            base_profile = next((p for p in app.config()["profiles"] if p["id"] == base_id), {})
+            if base_id and not base_profile:
+                raise WorkspaceError("角色模型配置已不存在，请先选择配置", 409)
+            chosen = app.save_profile({**base_profile, "id": "", "name": "worker " + args.model, "model": args.model})
+            selection = {"profile_id": chosen["id"]}
         run = manager.create_session(candidates[0]["id"], {
-            "role": "general" if args.general else args.role or "worker", "parent_agent_id": parent,
+            "role": role, "parent_agent_id": parent,
             "execution_mode": "print" if args.p else "tui", "minutes": args.minutes if args.minutes is not None else 10,
-            "mission": args.mission, "from": args.from_ids, "intent_id": args.intent, "name": args.name or "",
-            "profile_id": profile or (manager.agent(parent).get("profile_id") if parent else ""),
+            "task_label": args.task_label, "mission": args.mission, "from": args.from_ids, "intent_id": args.intent, "name": args.name or "",
+            **selection,
             "skip_permissions": manager.agent(parent).get("skip_permissions", False) if parent else False})
         print(json.dumps(run, ensure_ascii=False))
         return 0

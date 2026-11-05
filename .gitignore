@@ -35,4 +35,5 @@ COMMANDER-HANDOVER.md
 # Local Web console state (credentials, task workspaces and captured output)
 .sapper-web/
 .sapper-agents/
+.sapper/sessions/
 /runs/

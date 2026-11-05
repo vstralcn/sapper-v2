@@ -127,13 +127,15 @@ test("60-agent layout is complete and has no overlapping cards", () => {
   }
 });
 
-test("new nodes preserve manual positions and avoid hidden historical coordinates", () => {
-  const rows = normalize([agent("1"), agent("2", {parent_agent_id: "1"})]);
-  const graph = M.graph(rows, options()), positions = new Map([["1", {x: 40, y: 55}], ["hidden", {x: 334, y: 55}]]);
+test("new nodes ignore hidden historical coordinates and avoid visible cards", () => {
+  const rows = normalize([agent("1"), agent("2", {parent_agent_id: "1"}), agent("3", {parent_agent_id: "1"})]);
+  const graph = M.graph(rows, options()), positions = new Map([["1", {x: 40, y: 55}], ["3", {x: 334, y: 55}]]);
+  for (let i = 1; i <= 60; i++) positions.set("hidden-" + i, {x: 334, y: 55 + i * (M.height + M.gapY)});
   const before = structuredClone(positions.get("1"));
   M.placeMissing(graph, positions);
   assert.deepEqual(positions.get("1"), before);
-  assert.ok(positions.get("2").y >= positions.get("hidden").y + M.height);
+  assert.deepEqual(positions.get("3"), {x: 334, y: 55});
+  assert.deepEqual(positions.get("2"), {x: 334, y: 55 + M.height + M.gapY});
 });
 
 test("group IDs remain stable when filters remove a preceding group", () => {
@@ -156,4 +158,12 @@ test("task groups use exact missions and normalized IDs are unique", () => {
   const graph = M.grouped(rows, options({grouping: "task", collapsedGroups: new Set(["同一任务", "任务 3"])}));
   assert.equal(rows.length, 3);
   assert.equal(graph.nodes.find(n => n.key === "同一任务").members.length, 2);
+});
+
+test("compact goals prefer assignment labels and shorten older missions", () => {
+  assert.equal(M.shortGoal({task_label:"验证登录绕过", mission:"详细步骤"}), "验证登录绕过");
+  assert.equal(M.shortGoal({mission:"Scout only（侦察）：题目 Crypto #2，先确认格式"}), "Crypto #2");
+  assert.equal(M.shortGoal({mission:"Pwn #11「Sign In」 (challenge_id=11)"}), "Pwn #11「Sign In」");
+  assert.equal(Array.from(M.shortGoal({mission:"查".repeat(28)})).length, 18);
+  assert.equal(M.shortGoal({}), "目标未记录");
 });

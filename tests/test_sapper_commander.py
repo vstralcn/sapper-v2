@@ -278,6 +278,14 @@ class CommanderTests(unittest.TestCase):
         self.tick(1003)
         self.send.assert_called_once()
 
+    def test_submission_policy_change_wakes_idle_commander_before_fallback(self):
+        self.idle()
+        with self.monitor.locked(self.agent["id"]) as data:
+            data["event_signature"] = self.monitor.event_signature(self.agent, self.rows())
+        self.manager.save_settings(self.project["id"], {"auto_submit_flags": True})
+        self.tick(1003)
+        self.send.assert_called_once()
+
     def test_unknown_missing_partial_and_sidechain_data_do_not_trigger_wakes(self):
         self.tick()
         self.send.assert_not_called()

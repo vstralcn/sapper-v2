@@ -11,6 +11,17 @@
   const terminal = new Set(["exited", "failed", "stopped", "interrupted", "timed_out"]);
   const width = 218, height = 109, gapX = 76, gapY = 24;
 
+  function shortGoal(agent) {
+    if (agent.task_label?.trim()) return agent.task_label.trim();
+    const mission = (agent.mission || "").trim();
+    if (!mission || mission === "已有终端，未推断其职责或父子关系" || mission === "已有会话，用户显式登记") return "目标未记录";
+    const subject = mission.replace(/^scout only\s*(?:[（(]侦察[）)])?\s*[:：]\s*/i, "")
+      .replace(/^题目\s*[:：]?\s*(?=\S)/, "");
+    const clause = subject.split(/[\n。；;，,（(]/, 1)[0].trim() || subject || mission;
+    const chars = Array.from(clause);
+    return chars.length > 18 ? chars.slice(0, 17).join("") + "…" : clause;
+  }
+
   function timestamp(value) {
     if (typeof value === "number") return Number.isFinite(value) ? value * 1000 : 0;
     const parsed = Date.parse(value);
@@ -183,16 +194,17 @@
   }
 
   function placeMissing(graph, positions) {
+    const visible = new Set(graph.nodes.map(n => n.id));
     for (const n of graph.nodes) {
       if (positions.has(n.id)) continue;
       const p = positions.get(graph.parent.get(n.id));
       const candidate = {x: p ? p.x + width + gapX : 40, y: p ? p.y : 55};
       while ([...positions].some(([id, q]) =>
-        id !== n.id && Math.abs(q.x - candidate.x) < width + 20 && Math.abs(q.y - candidate.y) < height + gapY
+        visible.has(id) && id !== n.id && Math.abs(q.x - candidate.x) < width + 20 && Math.abs(q.y - candidate.y) < height + gapY
       )) candidate.y += height + gapY;
       positions.set(n.id, candidate);
     }
   }
 
-  return {labels, width, height, gapX, gapY, timestamp, observe, normalize, compare, counts, matches, parents, graph, descendants, groupKey, grouped, layout, placeMissing};
+  return {shortGoal, labels, width, height, gapX, gapY, timestamp, observe, normalize, compare, counts, matches, parents, graph, descendants, groupKey, grouped, layout, placeMissing};
 });
