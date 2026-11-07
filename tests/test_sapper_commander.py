@@ -348,6 +348,7 @@ class CommanderTests(unittest.TestCase):
             self.tick(1400, [])
         self.assertEqual(resume.call_count, 2)
         self.assertIn("[Sapper wake:", resume.call_args.args[1]["continuation"])
+        self.assertEqual(resume.call_args.args[1]["request_id"], self.monitor.view(self.agent["id"])["wake"]["id"])
         self.assertEqual(self.monitor.view(self.agent["id"])["verification"], "process_started")
 
     def test_actual_worker_board_writes_receipt_and_child_cannot_ack_parent(self):

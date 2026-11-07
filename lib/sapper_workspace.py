@@ -21,6 +21,7 @@ import uuid
 import sapper
 import sapper_context
 import sapper_roles
+from sapper_permission_audit import permission_audit
 from sapper_extensions import AgentExtensions, ExtensionError, REQUIRED_FLAGS
 from sapper_commander import CommanderMonitor, WatchdogLog
 from sapper_chat import ChatJournal, NativeConversation
@@ -370,6 +371,7 @@ class Workspaces:
     @serialized
     def dispatch(self, pid, data):
         """Web dispatch requests go through the primary; it chooses child strategy."""
+        data = {**data, "request_id": data.get("request_id") or uuid.uuid4().hex}
         project = self.app.project(pid)
         role = data.get("role", "commander")
         if role not in ROLES:
@@ -406,7 +408,7 @@ class Workspaces:
                 self.stop_agent(main["id"])
                 main = self.agent(main["id"])
             if not main.get("pane_id") or main.get("desired_state") != "running":
-                resume_data = {"execution_mode": mode}
+                resume_data = {"execution_mode": mode, "request_id": data["request_id"]}
                 if "skip_permissions" in data:
                     resume_data["skip_permissions"] = data["skip_permissions"]
                 run = self.resume(main["id"], resume_data)
@@ -471,6 +473,7 @@ class Workspaces:
             if pane and a.get("external_pane") and pane["id"] != a["external_pane"]:
                 pane = None
             results.append({**a, "status": run.get("status", "unknown"), "exit_code": run.get("exit_code"),
+                            "process_skip_permissions": run.get("effective_skip_permissions", a.get("skip_permissions")),
                             "activity": run.get("activity", {}), "deadline_epoch": run.get("deadline_epoch"),
                             "stop_reason": run.get("stop_reason"),
                             "timeout_seconds": run.get("timeout_seconds"), "supervisor_version": run.get("supervisor_version"),
@@ -643,7 +646,8 @@ class Workspaces:
                 "observation_note": "进程存活、终端输出和图进展分别报告；本看板不把安静状态自动判为卡死。"}
 
     @serialized
-    def create_session(self, pid, data, existing=None):
+    def create_session(self, pid, data, existing=None, *, inherited_permission_source=None):
+        data = {**data, "request_id": data.get("request_id") or uuid.uuid4().hex}
         previous_prompt = (existing or {}).get("role_prompt_sha256")
         project = self.app.project(pid)
         root = Path(project["path"])
@@ -674,6 +678,8 @@ class Workspaces:
         skip_permissions = data.get("skip_permissions", (existing or {}).get("skip_permissions", False))
         if type(skip_permissions) is not bool:
             raise WorkspaceError("skip_permissions 必须为布尔值")
+        permissions = permission_audit(data, existing, skip_permissions,
+                                       inherited_source=inherited_permission_source)
         if mode == "chat" and not all(cap.get(k) for k in ("stream_input", "replay_user")):
             raise WorkspaceError("当前 Claude CLI 缺少网页对话所需的结构化输入与消息回执能力", 409)
         parent = (existing or {}).get("parent_agent_id") or data.get("parent_agent_id") or None
@@ -844,6 +850,7 @@ class Workspaces:
             run = self.app.start(pid, {**data, "kind": "claude-native", "profile_id": profile_id}, native={
                 "argv": argv, "cwd": str(cwd), "env": env, "agent_id": aid, "claude_session_id": sid,
                 "role": role, "execution_mode": mode, "intent_id": iid or None,
+                "permission_audit": permissions,
                 "companion_required": role == "commander",
                 "isolated_extensions": isolated, "skip_hook_install": isolated,
                 "mcp_env_refs": record.get("mcp_env_refs", []),
@@ -870,7 +877,11 @@ class Workspaces:
             except Exception:
                 self.stop_agent(aid)
                 raise
-        self.app.audit("agent.resumed" if existing else "agent.started", agent=aid, role=role, workspace=pid)
+        self.app.audit("agent.resumed" if existing else "agent.started", agent=aid, role=role,
+                       workspace=pid, run=run["id"], **permissions)
+        if not existing and role != "commander":
+            self.app.audit("agent.dispatched", agent=aid, role=role, workspace=pid,
+                           parent_agent=parent, intent=iid or None, run=run["id"], **permissions)
         return run
 
     @serialized
@@ -1066,6 +1077,7 @@ def worker(argv):
     parser.add_argument("--close", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--reason", default="")
+    parser.add_argument("--request-id", default=None)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--p", "-p", action="store_true")
     modes.add_argument("--tui", action="store_true")
@@ -1126,7 +1138,9 @@ def worker(argv):
             "execution_mode": "print" if args.p else "tui", "minutes": args.minutes if args.minutes is not None else 10,
             "task_label": args.task_label, "mission": args.mission, "from": args.from_ids, "intent_id": args.intent, "name": args.name or "",
             **selection,
-            "skip_permissions": manager.agent(parent).get("skip_permissions", False) if parent else False})
+            "request_id": args.request_id or uuid.uuid4().hex,
+            "skip_permissions": manager.agent(parent).get("skip_permissions", False) if parent else False},
+            inherited_permission_source="parent_agent" if parent and "skip_permissions" in manager.agent(parent) else "default")
         print(json.dumps(run, ensure_ascii=False))
         return 0
     if args.action == "hint":
@@ -1155,6 +1169,7 @@ def worker(argv):
         print(json.dumps(manager.extend(a["id"], {"minutes": args.minutes}), ensure_ascii=False))
     elif args.action == "resume":
         data = {"minutes": args.minutes} if args.minutes is not None else {}
+        data["request_id"] = args.request_id or uuid.uuid4().hex
         if args.mission:
             data["continuation"] = args.mission
         print(json.dumps(manager.resume(a["id"], data), ensure_ascii=False))
@@ -1223,8 +1238,9 @@ def watch():
                 continue
             retries[a["id"]] = retries.get(a["id"], 0) + 1
             try:
-                app.workspaces.resume(a["id"], {})
-                app.audit("watchdog.resumed", agent=a["id"], workspace=wid)
+                request_id = uuid.uuid4().hex
+                app.workspaces.resume(a["id"], {"request_id": request_id})
+                app.audit("watchdog.resumed", agent=a["id"], workspace=wid, request_id=request_id)
             except (sapper.FGError, OSError) as exc:
                 print(f"[watchdog] {a['id']}: {exc}", flush=True)
         if not commanders:

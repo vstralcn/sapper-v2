@@ -398,6 +398,11 @@ function updateRunOptions() {
   $("dispatch-options").hidden = kind !== "dispatch";
   $("custom-options").hidden = kind !== "custom";
   $("agent-options").hidden = !["auto", "dispatch"].includes(kind);
+  const form=$("run-form").elements;
+  const worker=kind==="auto"||kind==="dispatch"&&/^i\d+$/.test(form.target.value.trim());
+  const warning=AgentTopologyModel.permissionWarning(form.skip_permissions.checked,worker&&!form.dry_run.checked);
+  $("run-permission-warning").textContent=warning;
+  $("run-permission-warning").hidden=!warning;
 }
 async function startRun(data) {
   data.request_id = crypto.randomUUID();
@@ -506,6 +511,8 @@ $("new-project").onclick = $("empty-create").onclick = () => $("create-dialog").
 $("refresh-projects").onclick = () => guarded(refreshProjects);
 $("open-shell").onclick = () => openRun("shell");
 $("run-kind").onchange = updateRunOptions;
+$("run-form").addEventListener("input",updateRunOptions);
+$("run-form").addEventListener("change",updateRunOptions);
 $("add-fact").onclick = () => openRecord("fact");
 $("add-intent").onclick = () => openRecord("intent");
 $("worker-manage").onclick = () => $("worker-dialog").showModal();

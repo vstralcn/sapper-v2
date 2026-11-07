@@ -34,6 +34,13 @@ class RolePromptTests(unittest.TestCase):
         self.assertIn("inspect it with `peek`", prompt)
         self.assertIn("`kill` the completed child", prompt)
 
+    def test_permission_block_is_execution_block_and_never_self_authorizes(self):
+        prompt = self.render("commander")
+        self.assertIn("execution blocker, not a dispatch failure", prompt)
+        self.assertIn("keep scheduling independent work", prompt)
+        self.assertIn("Never enable skip-permissions yourself", prompt)
+        self.assertIn("genuinely requires a user reply or authorization", prompt)
+
     def test_commander_briefing_distinguishes_goal_from_personal_execution(self):
         prompt = self.render("commander")
         self.assertIn("组织将军或 worker 完成", prompt)

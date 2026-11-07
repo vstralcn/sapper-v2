@@ -55,6 +55,7 @@ def main():
                       "created_at": created, "updated_at": created, "run_id": rid,
                       "mission": "Independent task " + str(i % 4), "execution_mode": "tui" if i in (1, 2) else "print",
                       "profile_name": "fixture", "cwd": first["path"], "desired_state": "running",
+                      "skip_permissions": i % 2 == 0,
                       "claude_session_id": None}
             if i == 1:
                 record["task_label"] = "统筹解题"
@@ -113,6 +114,8 @@ def main():
                 at = lambda name: page.locator(f'[data-at="{name}"]')
                 aid = lambda i: f"{i:016x}"
                 check("assets served behind URL prefix and real API returns 24 agents", ev("agentTopology.rows.length === 24"))
+                check("header counts only live processes by recorded permission", page.locator("#workspace-permissions").inner_text() == "10 个角色跳过审批 / 11 个需审批")
+                check("role card shows process permission", at("detail").locator(".agent-process-permissions").inner_text() in ("进程权限：需审批", "进程权限：跳过审批"))
                 node_goal = page.locator(f'[data-agent-id="{aid(1)}"] .at-node-mission')
                 check("node shows short goal and retains full mission", node_goal.inner_text() == "统筹解题" and node_goal.get_attribute("title") == records[1]["mission"])
                 check("terminal picker shows the same goal", page.locator('#native-pane option[value="%1"]').inner_text() == "Agent 01 · 统筹解题 · 000000 · 运行中")
@@ -149,6 +152,19 @@ def main():
                         page.locator("#confirm-cancel").click()
                     else:
                         page.keyboard.press("Escape")
+                page.evaluate("openRun('auto')")
+                warning=page.locator("#run-permission-warning")
+                check("unattended worker warns about repeated permission denials", warning.is_visible() and "被拒绝并反复重试" in warning.inner_text())
+                page.locator('#run-form input[name="skip_permissions"]').check()
+                check("permission warning tracks checkbox without changing submission", warning.is_hidden())
+                page.keyboard.press("Escape")
+                page.evaluate("openNative('auto')")
+                page.wait_for_selector("#native-field-skip_permissions")
+                check("native form explains unattended denial", page.locator("#native-permission-warning").is_visible())
+                page.locator("#native-field-skip_permissions").check()
+                check("native warning tracks permission", page.locator("#native-permission-warning").is_hidden())
+                check("all three forms explain permission consequences", page.locator('label').filter(has_text="允许角色执行命令、修改文件等操作时跳过逐次审批").count() == 3)
+                page.keyboard.press("Escape")
                 check("unknown executions are not displayed as running", ev("AgentTopologyModel.counts(agentTopology.rows).running === 1"))
                 check("online idle remains online", ev("agentTopology.rows.find(a=>a.id.endsWith('5')).observation.presence === 'online'"))
                 check("offline and uncertain presence are distinct", ev("AgentTopologyModel.counts(agentTopology.rows).offline === 2 && AgentTopologyModel.counts(agentTopology.rows).presenceUnknown === 1"))

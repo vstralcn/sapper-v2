@@ -64,6 +64,17 @@ function renderNativeFields(){
     label.append(element("small","field-help",f.help));fields.append(label);nativeControls.set(f.name,{field:f,input});
   }
   nativePreset={};
+  updateNativePermissionWarning();
+}
+function updateNativePermissionWarning(){
+  const op=$("native-operation").value;
+  const skip=nativeControls.get("skip_permissions")?.input.checked;
+  const dry=nativeControls.get("dry_run")?.input.checked;
+  const target=nativeControls.get("target")?.input.value.trim()||"";
+  const worker=op==="auto"||op==="dispatch"&&/^i\d+$/.test(target);
+  const warning=AgentTopologyModel.permissionWarning(skip,worker&&!dry);
+  $("native-permission-warning").textContent=warning;
+  $("native-permission-warning").hidden=!warning;
 }
 function nativeRequest(){
   const values={};
@@ -109,6 +120,8 @@ async function loadNativeConfig(){
 $("native-operation").onchange=()=>{const op=$("native-operation").value;nativePreset=op==="kb"?{action:"list"}:op==="dispatch"?{target:"reason"}:["command","sweep"].includes(op)?{root:nativeCatalog.roots[0]}:{};updateNativeProjects($("native-project").value);renderNativeFields();};
 $("native-project").onchange=()=>{invalidateNative();$("native-dialog").querySelector(".native-config").hidden=$("native-project").value==="global";$("native-config-save").disabled=true;$("native-config-content").disabled=true;};
 $("native-profile").onchange=invalidateNative;
+$("native-fields").addEventListener("input",updateNativePermissionWarning);
+$("native-fields").addEventListener("change",updateNativePermissionWarning);
 $("native-preview-button").onclick=()=>guarded(previewNative);
 $("native-button").onclick=$("workspace-native").onclick=()=>guarded(()=>openNative());
 $("native-config-load").onclick=()=>guarded(loadNativeConfig);

@@ -335,13 +335,13 @@ class CommanderMonitor:
                         ChatJournal(self.app.state, aid).enqueue(self.prompt(token), internal=True)
                     else:
                         self.app.send(row["pane_id"], {"text": self.prompt(token)})
-                    self.app.audit("commander.wake_sent", agent=aid, wake=token)
+                    self.app.audit("commander.wake_sent", agent=aid, wake=token, request_id=token)
                     return
             # Crash recovery is separate from healthy-process wakeup.
-            resumed = self.manager.resume(aid, {"continuation": self.prompt(token)})
+            resumed = self.manager.resume(aid, {"continuation": self.prompt(token), "request_id": token})
             with self.locked(aid) as data:
                 data["wake"]["run_id"] = resumed["id"]
                 if data["wake"].get("status") == "launching":
                     data["wake"]["status"] = "sent"
                     data["verification"] = "process_started"
-            self.app.audit("commander.recovery_requested", agent=aid, run=resumed["id"], wake=token)
+            self.app.audit("commander.recovery_requested", agent=aid, run=resumed["id"], wake=token, request_id=token)

@@ -28,6 +28,32 @@
     return Number.isFinite(parsed) ? parsed : 0;
   }
 
+  function permissionValue(agent) {
+    const value = Object.hasOwn(agent, "process_skip_permissions") ? agent.process_skip_permissions : agent.skip_permissions;
+    return typeof value === "boolean" ? value : null;
+  }
+
+  function permissionLabel(agent) {
+    const value = permissionValue(agent);
+    return value === null ? "权限未记录" : value ? "跳过审批" : "需审批";
+  }
+
+  function permissionSummary(agents, panes = []) {
+    let skip = 0, approval = 0, unknown = 0;
+    for (const agent of agents) {
+      if (observe(agent, panes).presence !== "online") continue;
+      const value = permissionValue(agent);
+      if (value === true) skip++;
+      else if (value === false) approval++;
+      else unknown++;
+    }
+    return `${skip} 个角色跳过审批 / ${approval} 个需审批` + (unknown ? ` / ${unknown} 个权限未记录` : "");
+  }
+
+  function permissionWarning(skip, noninteractive) {
+    return noninteractive && !skip ? "遇到需要审批的操作会被拒绝并反复重试" : "";
+  }
+
   function observe(agent, panes = []) {
     const pane = panes.find(p => p.id === agent.pane_id);
     // A terminal run is evidence that the agent exited, even if its tmux shell remains.
@@ -207,5 +233,5 @@
     }
   }
 
-  return {shortGoal, labels, width, height, gapX, gapY, timestamp, observe, normalize, compare, counts, matches, parents, graph, descendants, groupKey, grouped, layout, placeMissing};
+  return {shortGoal, labels, width, height, gapX, gapY, timestamp, observe, normalize, compare, counts, matches, parents, graph, descendants, groupKey, grouped, layout, placeMissing, permissionValue, permissionLabel, permissionSummary, permissionWarning};
 });

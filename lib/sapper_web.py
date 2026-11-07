@@ -36,6 +36,7 @@ import sapper_context
 from kb import KnowledgeBase, KBError
 from sapper_workspace import Workspaces, WorkspaceError, ROLES
 from sapper_native import NativeSurface, NativeError
+from sapper_permission_audit import FIELDS as PERMISSION_AUDIT_FIELDS
 from sapper_extensions import ExtensionError, clean_environment, api_environment
 import sapper_models
 
@@ -751,6 +752,8 @@ class Console:
                     "profile_name": profile["name"] if profile else "继承原环境"}
             if native:
                 info.update({k: native[k] for k in ("agent_id", "claude_session_id", "intent_id", "role", "timeout_seconds", "native_operation", "execution_mode", "output_format", "companion_required") if k in native})
+                info.update({k: native["permission_audit"][k] for k in PERMISSION_AUDIT_FIELDS
+                             if k in native.get("permission_audit", {})})
             info["supervisor_version"] = 1
             private_json(run_dir / "run.json", info)
             private_json(run_dir / "launch.json", {"argv": argv, "env": env,

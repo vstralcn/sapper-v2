@@ -38,6 +38,7 @@ refreshTask = async function () {
     state.services = roles.services;
     state.inspection = inspection;
     state.mainAgent = roles.primary_agent;
+    $("workspace-permissions").textContent=AgentTopologyModel.permissionSummary(state.agents,state.panes);
     if($("agent-dialog").open)refreshDispatchState();
     if (!flagSettingsRequests.has(pid)) {
       $("auto-submit-flags").checked = inspection.auto_submit_flags;
@@ -263,6 +264,9 @@ function renderAgentCard(a) {
   const title=element("div","agent-title");
   title.append(element("span","",a.name||a.role_label),element("span","badge",formatAgentStatus(a)));
   node.append(title,element("p","agent-sub",`${a.role_label} · ${a.execution_mode==="chat"?"网页对话":a.execution_mode==="cli"?"原 CLI 流程":a.execution_mode==="print"?"限时单次":"原生交互"} · ${a.profile_name}`));
+  const permission=element("p","agent-context agent-process-permissions",`进程权限：${AgentTopologyModel.permissionLabel(a)}`);
+  permission.title="根据该角色本次或最近一次运行的启动记录显示";
+  node.append(permission);
   if(a.resume_model)node.append(element("p","agent-context",`恢复使用：${a.resume_model.original_label}。当前角色默认：${a.resume_model.current_label}，用于新建会话。`));
   if(a.parent_agent_id)node.append(element("p","agent-parent","派发自 "+a.parent_agent_id.slice(0,8)));
   if(a.intent_id)node.append(element("p","agent-parent","派单意图 "+a.intent_id));

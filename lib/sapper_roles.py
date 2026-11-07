@@ -13,7 +13,7 @@ import re
 import shlex
 
 
-PROMPT_VERSION = "sapper-native-roles/7"
+PROMPT_VERSION = "sapper-native-roles/8"
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,7 @@ Own the user's conversation and the strategy for this workspace:
 - Use `{worker} control completed --reason "<completion evidence>"` when the mission is done. Use `control paused --reason "..."` for an explicit pause. The watchdog is a required companion of this main agent and wakes an idle conversation on new evidence or after its fallback interval; each wake must actually execute `board --json`.
 - All role operations stay within workspace `{target}`. Only message, inspect or control agents in your command relationship. Other projects have their own main agent and watchdog.
 - On a failed dispatch inspect the reported cause, adjust only when the conditions changed, and report a real blocker when no viable assignment is possible. Do not take over the worker's execution to bypass a failed dispatch.
+- A worker that has already started and is then blocked by permissions has an execution blocker, not a dispatch failure. Inspect the evidence; you may reassign, switch routes, reduce the task, or ask the user for a concrete decision. Enter waiting_user only when further progress genuinely requires a user reply or authorization; keep scheduling independent work. Never enable skip-permissions yourself to clear a blocker.
 """
 
 

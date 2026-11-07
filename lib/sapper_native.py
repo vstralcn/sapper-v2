@@ -32,7 +32,7 @@ FIELD_LABELS = {"description": "描述", "title": "标题", "from_": "依据事�
     "target": "目标／内容", "action": "操作", "root": "任务／知识库根目录", "file": "编队配置文件", "model": "模型 ID",
     "minutes": "分钟预算", "deadline": "截止时间（ISO 8601）", "timeout": "单步超时（秒）", "templates": "提示词模板目录",
     "max_steps": "最大推理轮数", "max_explore": "最大探索数", "verify": "启用验证", "dry_run": "仅渲染提示词",
-    "claim": "先领取意图", "intent": "待验证意图 ID", "max_options": "头脑风暴方案数", "skip_permissions": "使用原权限跳过选项",
+    "claim": "先领取意图", "intent": "待验证意图 ID", "max_options": "头脑风暴方案数", "skip_permissions": "允许角色执行命令、修改文件等操作时跳过逐次审批",
     "value": "Flag 内容", "challenge": "本地题目标识", "goal": "任务目标", "origin": "任务来源", "note": "说明",
     "add": "授权对象名称", "remove": "撤销授权对象", "sender": "发送者标签", "channel": "通信日志路径",
     "peer": "已授权对象名称", "message": "消息", "lines": "终端行数", "discover": "仅发现，不授权", "json": "JSON 输出",
