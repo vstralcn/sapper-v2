@@ -267,6 +267,7 @@ function renderAgentCard(a) {
   const permission=element("p","agent-context agent-process-permissions",`进程权限：${AgentTopologyModel.permissionLabel(a)}`);
   permission.title="根据该角色本次或最近一次运行的启动记录显示";
   node.append(permission);
+  if(a.stop_phase==="waiting_confirmation")node.append(element("p","agent-context","等待确认停止；确认进程退出前保留意图认领"));
   if(a.resume_model)node.append(element("p","agent-context",`恢复使用：${a.resume_model.original_label}。当前角色默认：${a.resume_model.current_label}，用于新建会话。`));
   if(a.parent_agent_id)node.append(element("p","agent-parent","派发自 "+a.parent_agent_id.slice(0,8)));
   if(a.intent_id)node.append(element("p","agent-parent","派单意图 "+a.intent_id));
@@ -322,7 +323,7 @@ function renderAgentCard(a) {
     })));
     actions.append(button("停止","text-button danger",()=>guarded(async()=>{
       if(!await confirmAction("停止该角色的原会话及其进程？watchdog 不会将这次明确停止当作异常重启。"))return;
-      await api(`/agents/${a.id}/stop`,{method:"POST",body:{}});await refreshTask();
+      const result=await api(`/agents/${a.id}/stop`,{method:"POST",body:{}});if(result.message)toast(result.message);await refreshTask();
     })));
   } else if(a.can_resume)actions.append(button("恢复此会话","text-button",()=>guarded(async()=>{
     await api(`/agents/${a.id}/resume`,{method:"POST",body:a.role==="commander"?{execution_mode:"tui"}:{}});await refreshTask();setTab("workspace");const resumed=state.agents.find(row=>row.id===a.id);if(resumed?.pane_id)selectNative(resumed.pane_id);toast("已按原生会话恢复");
@@ -332,10 +333,10 @@ function renderAgentCard(a) {
   }));
   if(a.native_operation)actions.append(button("原流程参数","text-button",()=>guarded(async()=>{await openNative(a.native_request.operation,a.native_request.values||{});$("native-profile").value=a.profile_id||"";})));
   if(!a.id.startsWith("legacy-"))actions.append(button("删除角色","text-button danger",()=>guarded(async()=>{
-    const effect=a.external_session&&!a.run_id?"将移除角色登记，已有外部终端继续运行。":"将停止该角色当前任务并从角色列表移除，watchdog 不会恢复它。";
+    const effect=a.external_session&&!a.run_id?"移除登记；若仍持有意图，将先请求中断并等待确认停止。":"将停止该角色当前任务并从角色列表移除，watchdog 不会恢复它。";
     const scope=a.workspace_scope?.length>1?"此角色关联多个工作区，删除会在所有关联工作区生效。":"";
     if(!await confirmAction(`删除“${a.name||a.role_label}”？${effect}${scope}已有子角色继续运行，文件、日志和共享图记录保留。`))return;
-    await api(`/agents/${a.id}`,{method:"DELETE"});state.nativePaneSignature=null;await refreshTask();toast("角色已删除");
+    const result=await api(`/agents/${a.id}`,{method:"DELETE"});state.nativePaneSignature=null;await refreshTask();toast(result.message||"角色已删除");
   })));
   node.append(details,actions);return node;
 }

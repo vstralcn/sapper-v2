@@ -22,6 +22,7 @@ import sapper
 import sapper_context
 import sapper_roles
 from sapper_permission_audit import permission_audit
+from sapper_processes import RunProcesses
 from sapper_extensions import AgentExtensions, ExtensionError, REQUIRED_FLAGS
 from sapper_commander import CommanderMonitor, WatchdogLog
 from sapper_chat import ChatJournal, NativeConversation
@@ -778,6 +779,8 @@ class Workspaces:
         if isolated:
             record["extension_mode"] = "isolated-v1"
         record["desired_state"] = "running"
+        record.pop("stop_phase", None)
+        record.pop("stop_confirmed_at", None)
         record["role_prompt_version"] = sapper_roles.PROMPT_VERSION
         record["role_prompt_sources"] = list(sapper_roles.ROLE_SPECS[role].sources)
         record["context_revision"] = context["revision"] if shared and cap.get("append_system") else 0
@@ -890,6 +893,12 @@ class Workspaces:
             a = self.agent(aid)
             if not a.get("claude_session_id"):
                 raise WorkspaceError("原生会话 ID 未知，不能猜测恢复；请使用原会话入口", 409)
+            if a.get("stop_phase") == "waiting_confirmation":
+                self.assert_stopped_owner(a["workspace_id"], aid)
+            if a.get("intent_id"):
+                intent = self.app.store(a["workspace_id"]).get_intent(a["intent_id"])
+                if intent["to"] is None and intent.get("worker") not in (None, aid):
+                    raise WorkspaceError(f"意图 {intent['id']} 已转派给 {intent['worker']}，不能继续旧分配；请新建任务", 409)
             if a["role"] == "commander" and a.get("execution_mode") != "chat" and data.get("execution_mode") == "chat":
                 ChatJournal(self.app.state, aid).import_history(self.conversations.messages(a))
             try:
@@ -917,19 +926,166 @@ class Workspaces:
         a.update(desired_state="stopped", stopped_at=sapper.now_iso())
         self.save_agent(a)
 
+    def held_intents(self, a):
+        store = self.app.store(a["workspace_id"])
+        return [i for i in store.list_intents() if i["to"] is None and i.get("worker") == a["id"]] if store.exists() else []
+
+    def external_pane(self, a):
+        return next((p for p in self.app.panes() if p["session"] == a.get("external_session")
+                     and (not a.get("external_pane") or p["id"] == a["external_pane"]) and not p.get("dead")), None)
+
+    def stop_pending(self, a):
+        a = self.agent(a["id"], include_deleted=True)
+        a.update(stop_phase="waiting_confirmation", desired_state="stopped")
+        self.save_agent(a)
+        return {"status": "stop_pending", "message": "等待确认停止", "released_intents": []}
+
+    def release_stopped_intents(self, a):
+        store = self.app.store(a["workspace_id"])
+        released = []
+        if store.exists():
+            with store.locked():
+                for intent in store.list_intents():
+                    if intent["to"] is None and intent.get("worker") == a["id"]:
+                        intent.update(worker=None, status="open")
+                        store.save_intent(intent)
+                        released.append(intent["id"])
+        a = self.agent(a["id"], include_deleted=True)
+        a.update(stop_phase="confirmed", stop_confirmed_at=sapper.now_iso())
+        self.save_agent(a)
+        if released:
+            self.app.audit("agent.intents_released", agent=a["id"], workspace=a["workspace_id"], intents=released)
+        return released
+
+    def assert_stopped_owner(self, pid, owner):
+        if not owner or not re.fullmatch(r"[a-f0-9]{16}", owner):
+            return  # An unregistered graph worker label has no managed process.
+        a = read(self.agent_path(owner))
+        if a is None:
+            return
+        if a["workspace_id"] != pid:
+            raise WorkspaceError("意图持有者不属于这个工作区", 403)
+        if a.get("desired_state") != "stopped":
+            raise WorkspaceError(f"角色 {owner} 尚未停止，请先 stop 后确认退出", 409)
+        if a.get("external_session") and self.external_pane(a):
+            raise WorkspaceError("等待确认停止；外部终端仍存活，不能释放或转派", 409)
+        if a.get("run_id"):
+            run = self.app.run_info(a["run_id"])
+            try:
+                live = RunProcesses(run).remaining()
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                raise WorkspaceError("无法确认原进程退出，保留意图认领", 409) from exc
+            if run["status"] not in TERMINAL_STATES or live:
+                raise WorkspaceError("等待确认停止；受管进程尚未退出，不能释放或转派", 409)
+            if any(p["session"] == run["session"] and not p.get("dead") for p in self.app.panes()):
+                raise WorkspaceError("等待确认停止；原运行终端仍存活", 409)
+
+    def check_intent_owner(self, intent, expected_owner):
+        if intent["to"] is not None:
+            raise WorkspaceError(f"意图 {intent['id']} 已完成，不能释放或转派", 409)
+        if intent.get("worker") != expected_owner:
+            raise WorkspaceError(f"意图 {intent['id']} 持有者已变化：预期 {expected_owner}，实际 {intent.get('worker')}", 409)
+
+    def assert_assignment_control(self, pid, actor, targets):
+        if not re.fullmatch(r"[a-f0-9]{16}", actor):
+            return  # Authenticated Web/user CLI, rather than an agent identity.
+        caller = self.agent(actor)
+        if caller["workspace_id"] != pid or caller["role"] not in ("commander", "general"):
+            raise WorkspaceError("释放和转派由本工作区指挥官／将军处理", 403)
+        for target in targets:
+            if not target or not re.fullmatch(r"[a-f0-9]{16}", target) or not self.agent_path(target).exists():
+                continue
+            record = self.agent(target, include_deleted=True)
+            if record["workspace_id"] != pid:
+                raise WorkspaceError("不能操作其他工作区角色", 403)
+            ancestor, seen = target, set()
+            while ancestor and ancestor not in seen and ancestor != actor:
+                seen.add(ancestor)
+                ancestor = self.agent(ancestor, include_deleted=True).get("parent_agent_id")
+            if ancestor != actor:
+                raise WorkspaceError("目标角色不在当前角色的指挥关系中", 403)
+
+    @serialized
+    def release_intent(self, pid, iid, *, expected_owner, reason, actor="web-user"):
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+            raise WorkspaceError("释放意图需要 --reason（最多 1000 字符）")
+        self.assert_assignment_control(pid, actor, (expected_owner,))
+        self.assert_stopped_owner(pid, expected_owner)
+        store = self.app.store(pid)
+        with store.locked():
+            intent = store.get_intent(iid)
+            self.check_intent_owner(intent, expected_owner)
+            intent.update(worker=None, status="open")
+            store.save_intent(intent)
+        self.app.audit("intent.released", workspace=pid, intent=iid, previous_worker=expected_owner,
+                       actor=actor, reason=reason)
+        return intent
+
+    @serialized
+    def reassign_intent(self, pid, iid, target_id, *, expected_owner, reason, actor="web-user"):
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+            raise WorkspaceError("转派意图需要 --reason（最多 1000 字符）")
+        self.assert_assignment_control(pid, actor, (expected_owner, target_id))
+        self.assert_stopped_owner(pid, expected_owner)
+        target = self.agent(target_id)
+        if target["workspace_id"] != pid:
+            raise WorkspaceError("接收角色不属于这个工作区", 403)
+        # A running process still has its previous mission and SAPPER_INTENT_ID.
+        # Bind the new assignment while offline, then explicitly resume it.
+        self.assert_stopped_owner(pid, target_id)
+        store = self.app.store(pid)
+        with store.locked():
+            intent = store.get_intent(iid)
+            self.check_intent_owner(intent, expected_owner)
+            if intent.get("requires_confirmation") and not intent.get("confirmed_at"):
+                raise WorkspaceError("意图尚待确认，不能转派", 409)
+            if any(i["to"] is None and i.get("worker") == target_id and i["id"] != iid
+                   for i in store.list_intents()):
+                raise WorkspaceError("接收角色仍持有其他未完成意图", 409)
+            updated = {**target, "intent_id": iid, "mission": intent["description"], "updated_at": sapper.now_iso()}
+            self.save_agent(updated)
+            try:
+                transferred = {**intent, "worker": target_id, "status": "claimed"}
+                store.save_intent(transferred)
+            except Exception:
+                self.save_agent(target)
+                raise
+        self.app.audit("intent.reassigned", workspace=pid, intent=iid, previous_worker=expected_owner,
+                       worker=target_id, actor=actor, reason=reason)
+        return transferred
+
     @serialized
     def stop_agent(self, aid):
-        a = self.agent(aid)
+        a = self.agent(aid, include_deleted=True)
         self.mark_stopped(aid)
         if a.get("external_session") and not a.get("run_id"):
-            row = next((r for r in self.agents(a["workspace_id"]) if r["id"] == aid), {})
-            if row.get("pane_id"):
-                return self.app.send(row["pane_id"], {"key": "C-c"}) | {"message": "已发送原中断键；旧 watchdog 仍按原规则运行"}
-            return {"status": "not_running"}
-        result = self.app._stop(a["run_id"]) if a.get("run_id") else {"status": "not_running"}
+            pane = self.external_pane(a)
+            if pane:
+                if a.get("stop_phase") != "waiting_confirmation":
+                    self.app.send(pane["id"], {"key": "C-c"})
+                return self.stop_pending(a)
+            return {"status": "not_running", "released_intents": self.release_stopped_intents(a)}
+        observed = True
+        try:
+            tracker = RunProcesses(self.app.run_info(a["run_id"])) if a.get("run_id") else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            tracker, observed = None, False
+        result = self.app._stop_run(a["run_id"], processes=tracker) if a.get("run_id") else {"status": "not_running"}
         if a["role"] == "commander":
             self.stop_watchdog(a["workspace_id"])
-        return result
+        try:
+            if not observed or tracker and not tracker.finish():
+                return self.stop_pending(a)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return self.stop_pending(a)
+        if a.get("run_id"):
+            # A finished wrapper may have left its tmux shell alive. It belongs
+            # to this run, not to a replacement or an external terminal.
+            session = self.app.run_info(a["run_id"])["session"]
+            self.app.tmux("kill-session", "-t", session)
+            if not self.app.tmux("has-session", "-t", session).returncode:
+                return self.stop_pending(a)
+        return {**result, "released_intents": self.release_stopped_intents(a)}
 
     @serialized
     def delete_agent(self, aid):
@@ -938,13 +1094,13 @@ class Workspaces:
             return {"deleted_agent": aid}
         # Reuse managed process-group shutdown; external terminals are only
         # unregistered because their lifecycle is not owned by this service.
-        if a.get("run_id"):
-            self.stop_agent(aid)
+        if a.get("run_id") or self.held_intents(a):
+            stopped = self.stop_agent(aid)
+            if stopped.get("status") == "stop_pending":
+                return stopped
         else:
             self.mark_stopped(aid)
         a = self.agent(aid)
-        if a.get("intent_id"):
-            self.app.store(a["workspace_id"]).release_intent(a["intent_id"], aid, if_owned=True)
         a.update(deleted_at=sapper.now_iso(), desired_state="stopped")
         self.save_agent(a)
         # Surviving children become independent roles and remain resumable.
@@ -1058,7 +1214,7 @@ def console_from_environment():
 
 def worker(argv):
     parser = argparse.ArgumentParser(description="原 worker CLI 的显式本地工作区接入")
-    parser.add_argument("action", choices=["spawn", "kill", "msg", "peek", "list", "board", "hint", "extend", "resume", "control", "inbox"])
+    parser.add_argument("action", choices=["spawn", "kill", "msg", "peek", "list", "board", "hint", "extend", "resume", "control", "inbox", "release", "reassign"])
     parser.add_argument("target", nargs="?")
     parser.add_argument("body", nargs="?")
     parser.add_argument("--mission", default="")
@@ -1078,6 +1234,8 @@ def worker(argv):
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--reason", default="")
     parser.add_argument("--request-id", default=None)
+    parser.add_argument("--to", dest="target_agent")
+    parser.add_argument("--expected-owner", default=None, help="预期持有者；none 表示开放意图")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--p", "-p", action="store_true")
     modes.add_argument("--tui", action="store_true")
@@ -1148,6 +1306,19 @@ def worker(argv):
         if len(targets) != 1:
             raise WorkspaceError("hint 目标不在工作区范围内")
         app.store(targets[0]["id"]).add_hint(args.body or "", parent or "commander")
+        return 0
+    if args.action in ("release", "reassign"):
+        intent = app.store(wid).get_intent(args.target)
+        expected = intent.get("worker") if args.expected_owner is None else None if args.expected_owner == "none" else args.expected_owner
+        if args.action == "release":
+            result = manager.release_intent(wid, args.target, expected_owner=expected,
+                                            reason=args.reason, actor=parent or "cli-user")
+        else:
+            if not args.target_agent:
+                raise WorkspaceError("reassign 需要 --to <agent-id>")
+            result = manager.reassign_intent(wid, args.target, args.target_agent, expected_owner=expected,
+                                             reason=args.reason, actor=parent or "cli-user")
+        print(json.dumps(result, ensure_ascii=False))
         return 0
     a = manager.agent(args.target) if args.target else None
     if a and a["workspace_id"] not in scope:

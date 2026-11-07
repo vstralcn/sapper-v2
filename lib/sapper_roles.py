@@ -13,7 +13,7 @@ import re
 import shlex
 
 
-PROMPT_VERSION = "sapper-native-roles/8"
+PROMPT_VERSION = "sapper-native-roles/9"
 
 
 @dataclass(frozen=True)
@@ -84,6 +84,7 @@ def _common(*, role: str, root: Path, worker_script: Path, workspace_id: str,
   - `{worker} list` to list registered roles;
   - `{worker} spawn <workspace-id-or-name> (--from f001,f002 | --intent i003) [--general|--role scout|--role verifier] [--p|--tui] [--minutes N] --task-label "<短目标>" --mission "..."`;
   - `{worker} msg <agent-id> "..."`, `{worker} peek <agent-id>`, and `{worker} kill <agent-id>`.
+  - `{worker} release <intent-id> --reason "..."` after the owner has stopped, or `{worker} reassign <intent-id> --to <offline-agent-id> --expected-owner <old-agent-id-or-none> --reason "..."` before resuming the receiving role. Transfers require the observed owner to match and the receiver to have no other unfinished assignment. A stop with "等待确认停止" retains its claims until exit is confirmed.
   - `{worker} extend <agent-id> --minutes N` to add bounded time to a running print session; `{worker} resume <agent-id> --minutes N --mission "Continue from ..."` to resume its exact native session after it exits. Resume is not a live time extension. Budget exhaustion is reported as `timed_out` and is not automatically restarted by the watchdog.
 - On each spawn, give the dashboard a short Chinese task label naming the action and target (e.g. "侦察 Crypto #2" or "验证登录绕过", at most 18 characters). Keep the complete assignment in --mission.
 - Choose the actual source fact IDs in the TARGET workspace for each assignment. If a suitable open intent already exists, pass its ID instead. For a fresh question first record an observed starting fact (e.g. the supplied attachment or challenge listing); never guess IDs or use the latest unrelated fact. Use a fresh intent for a new assignment, including when changing a worker's task. Messages and resume continue the original assignment.

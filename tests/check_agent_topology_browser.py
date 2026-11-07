@@ -62,6 +62,8 @@ def main():
             if i == 9:
                 record["name"] = '<img src=x onerror="window.topologyInjected=true">'
                 record["mission"] = "<script>window.topologyInjected=true</script>"
+            if i == 8:
+                record["stop_phase"] = "waiting_confirmation"
             records[i] = record
             app.workspaces.save_agent(record)
             info = {"id": rid, "project_id": first["id"], "session": session, "status": "exited" if i == 6 else "running",
@@ -116,6 +118,7 @@ def main():
                 check("assets served behind URL prefix and real API returns 24 agents", ev("agentTopology.rows.length === 24"))
                 check("header counts only live processes by recorded permission", page.locator("#workspace-permissions").inner_text() == "10 个角色跳过审批 / 11 个需审批")
                 check("role card shows process permission", at("detail").locator(".agent-process-permissions").inner_text() in ("进程权限：需审批", "进程权限：跳过审批"))
+                check("pending external stop preserves a visible confirmation state", ev("id=>renderAgentCard(state.agents.find(a=>a.id===id)).textContent.includes('等待确认停止；确认进程退出前保留意图认领')", aid(8)))
                 node_goal = page.locator(f'[data-agent-id="{aid(1)}"] .at-node-mission')
                 check("node shows short goal and retains full mission", node_goal.inner_text() == "统筹解题" and node_goal.get_attribute("title") == records[1]["mission"])
                 check("terminal picker shows the same goal", page.locator('#native-pane option[value="%1"]').inner_text() == "Agent 01 · 统筹解题 · 000000 · 运行中")

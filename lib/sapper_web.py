@@ -339,7 +339,8 @@ class Console:
         elif action == "claim":
             result = store.claim_intent(require_text(data, "id", 64), require_text(data, "worker", 100))
         elif action == "release":
-            result = store.release_intent(require_text(data, "id", 64), require_text(data, "worker", 100))
+            result = self.workspaces.release_intent(pid, require_text(data, "id", 64),
+                expected_owner=require_text(data, "worker", 100), reason=require_text(data, "reason", 1000, "用户释放意图"))
         elif action == "done":
             fact, intent = store.conclude_with_new_fact(require_text(data, "id", 64), require_text(data, "description"),
                 require_text(data, "worker", 100), title=data.get("title"), doc=data.get("doc"), kind=data.get("kind"), data=data.get("data"))
@@ -782,8 +783,6 @@ class Console:
     def stop(self, rid):
         with self.workspaces.lifecycle():
             info = self.run_info(rid)
-            if info.get("role") == "commander" and info.get("agent_id"):
-                return self.workspaces.stop_agent(info["agent_id"])
             if info.get("role") == "watchdog":
                 for a in self.workspaces.agents(info["project_id"]):
                     if a.get("role") == "commander" and not a.get("legacy"):
@@ -791,11 +790,29 @@ class Console:
             return self._stop(rid)
 
     def _stop(self, rid):
+        with self.workspaces.lifecycle():
+            info = self.run_info(rid)
+            if info.get("agent_id"):
+                agent = self.workspaces.agent(info["agent_id"], include_deleted=True)
+                if agent.get("run_id") == rid:
+                    return self.workspaces.stop_agent(agent["id"])
+            return self._stop_run(rid)
+
+    def _stop_run(self, rid, *, processes=None):
+        """Low-level shutdown; workspace callers must confirm exit before release."""
         info = self.run_info(rid)
         if info.get("agent_id"):
-            self.workspaces.mark_stopped(info["agent_id"])
+            agent = self.workspaces.agent(info["agent_id"], include_deleted=True)
+            if agent.get("run_id") == rid:
+                self.workspaces.mark_stopped(info["agent_id"])
         if info["status"] in FINISHED:
             return info
+        if processes is None:
+            from sapper_processes import RunProcesses
+            try:
+                processes = RunProcesses(info)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                processes = None
         run_dir = self.run_path(rid)
         with run_lock(run_dir):
             (run_dir / "stop_requested").touch()
@@ -813,20 +830,17 @@ class Console:
                     self.audit("run.stopped", run=rid)
                     return current
                 time.sleep(0.1)
-            # A broken wrapper still must not orphan its detached print group.
-            child_group = self.run_info(rid).get("child_process_group")
-            if child_group and child_group != os.getpgrp():
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(child_group, signal.SIGKILL)
-        group = info.get("process_group")
-        wrapper = info.get("wrapper_pid")
-        if group and group == wrapper and group != os.getpgrp():
-            # A managed tmux pane is a separate process group. Include its tools.
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(group, signal.SIGTERM)
-            time.sleep(0.2)
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(group, signal.SIGKILL)
+        if processes is not None:
+            # Never signal raw persisted PGIDs: they may now name another run.
+            # The observer includes both original groups and detached tools.
+            try:
+                processes.signal(signal.SIGTERM)
+                time.sleep(0.2)
+                processes.signal(signal.SIGKILL)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                # Still close the run's own tmux session. The workspace owner
+                # will retain claims unless its observer can confirm exit.
+                pass
         # Only the session this service created is affected. No global tmux kill.
         self.tmux("kill-session", "-t", info["session"])
         info = self.run_info(rid)
@@ -998,6 +1012,12 @@ def run_child(directory):
                     wrapper_pid=os.getpid(), process_group=os.getpgrp())
         if managed_print:
             info["child_process_group"] = child.pid
+        from sapper_processes import process_table
+        try:
+            births = process_table()
+            info["process_births"] = {str(pid): births[pid]["birth"] for pid in (os.getpid(), child.pid) if pid in births}
+        except (OSError, subprocess.SubprocessError):
+            info["process_observation"] = "unavailable"
         with run_lock(directory):
             private_json(directory / "run.json", info)
         note("[sapper-web] 原命令已启动，输出从此处开始采集。")

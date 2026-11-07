@@ -754,6 +754,9 @@ def _check_conclusion_permission(
             f"intent {intent['id']} requires confirmation; run `sapper confirm {intent['id']}` first"
         )
     owner = intent.get("worker")
+    managed_worker = os.environ.get("SAPPER_AGENT_ID") if os.environ.get("SAPPER_MODE") == "workspace" else None
+    if managed_worker and owner != managed_worker:
+        raise FGError(f"intent {intent['id']} no longer assigned to {managed_worker}; dropping stale workspace result")
     if owner and owner != worker:
         raise FGError(f"intent {intent['id']} claimed by {owner}")
 
@@ -2931,6 +2934,16 @@ def cmd_claim(args) -> int:
 
 
 def cmd_release(args) -> int:
+    if os.environ.get("SAPPER_MODE") == "workspace":
+        from sapper_workspace import console_from_environment
+        app = console_from_environment()
+        iid = args.id
+        previous = app.store(os.environ["SAPPER_WORKSPACE_ID"]).get_intent(iid).get("worker")
+        expected = args.worker if args.worker is not None else previous
+        intent = app.workspaces.release_intent(os.environ["SAPPER_WORKSPACE_ID"], iid,
+            expected_owner=expected, reason=args.reason or "用户通过原生入口释放意图", actor=os.environ.get("SAPPER_AGENT_ID") or "cli-user")
+        print(f"released {intent['id']}")
+        return 0
     store = Store(Path(args.store))
     store.require()
     worker = args.worker or f"agent-{os.getpid()}"
@@ -4592,6 +4605,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("release", help="release a claimed intent")
     sp.add_argument("id")
     sp.add_argument("--worker", default=None)
+    sp.add_argument("--reason", default="")
     sp.set_defaults(func=cmd_release)
 
     sp = sub.add_parser("done", help="conclude an intent with a produced fact")

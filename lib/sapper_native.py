@@ -212,6 +212,8 @@ class NativeSurface:
             raise NativeError("此操作会撤销接入、覆盖数据或停止编队，请先确认预览中的目标", 409)
         env = {"SAPPER_TMUX_SOCKET": self.app.tmux_socket or "", "SAPPER_WEB_STATE": str(self.app.state),
                "SAPPER_WORKSPACE_ID": pid, "SAPPER_NATIVE_OPERATION": prepared["operation"]}
+        if prepared["operation"] == "release":
+            env.update(SAPPER_MODE="workspace", SAPPER_WORKSPACE_ALLOWED_ROOTS=json.dumps([str(p) for p in self.app.workspace_roots]))
         if data.get("request_id"):
             existing = next((r for r in self.app.runs(pid) if r.get("request_id") == data["request_id"]), None)
             if existing:
