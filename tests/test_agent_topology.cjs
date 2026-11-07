@@ -21,6 +21,8 @@ test("running process does not prove task execution; quiet online agents stay on
 test("confirmed idle commander remains online", () => {
   const a = agent("1", {commander_monitor: {phase: "idle", last_event_at: current}});
   assert.deepEqual([M.observe(a, [{id: "%1", dead: false}]).presence, M.observe(a, [{id: "%1", dead: false}]).status], ["online", "idle"]);
+  a.activity = {phase: "unknown", last_event_at: current};
+  assert.equal(M.observe(a, [{id: "%1", dead: false}]).status, "idle");
 });
 
 test("missing pane is unconfirmed, never an invented offline event", () => {
@@ -46,6 +48,17 @@ test("fresh observed responding and pending tools map to execution", () => {
 test("restored run cannot inherit a previous monitor phase", () => {
   const a = agent("1", {updated_at: "2026-11-03T04:00:00Z", commander_monitor: {phase: "responding", last_event_at: current}});
   assert.equal(M.observe(a, [{id: "%1", dead: false}]).status, "unknown");
+});
+
+test("worker transcripts and structured activity use the same phase evidence", () => {
+  for (const source of ["execution_observation", "activity"]) {
+    for (const [phase, status] of [["tool_running", "running"], ["responding", "running"], ["waiting_user", "waiting"], ["idle", "idle"]]) {
+      const a = agent("1", {[source]: {phase, last_event_at: current}});
+      assert.equal(M.observe(a, [{id: "%1", dead: false}]).status, status);
+      a.updated_at = "2026-11-03T04:00:00Z";
+      assert.equal(M.observe(a, [{id: "%1", dead: false}]).status, "unknown");
+    }
+  }
 });
 
 test("explicit waiting and stopping have attributable evidence", () => {

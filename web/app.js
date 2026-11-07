@@ -117,15 +117,16 @@ async function refreshTask() {
   if (state.view === "overview") return refreshOverview();
   const pid = state.project?.id;
   if (!pid) return;
+  const navigation = state.navigation;
   const [graph, panes, runs] = await Promise.all([taskApi("graph"), api("/panes"), api(`/runs?project=${pid}`)]);
-  if (pid !== state.project?.id) return;
+  if (pid !== state.project?.id || navigation !== state.navigation) return;
   state.graph = graph;
   const project = state.projects.find(p => p.id === pid);
   if (project) {
     const count = graph.facts.filter(f => f.id !== "goal").length;
     if (project.facts !== count) {project.facts = count; renderProjects();}
   }
-  state.panes = panes.filter(p => p.project_id === pid || p.role === "commander");
+  state.panes = panes.filter(p => p.project_id === pid);
   state.runs = runs;
   $("breadcrumb").textContent = state.project.name;
   $("project-name").textContent = state.project.name;
@@ -316,7 +317,9 @@ async function refreshLog() {
   if ($("follow-log").checked) $("log-output").scrollTop = $("log-output").scrollHeight;
 }
 async function loadFiles() {
-  const result = await taskApi("files?path=" + encodeURIComponent(state.folder));
+  const pid = state.project?.id, folder = state.folder, navigation = state.navigation;
+  const result = await taskApi("files?path=" + encodeURIComponent(folder));
+  if (pid !== state.project?.id || folder !== state.folder || navigation !== state.navigation) return;
   $("files-path").textContent = state.folder === "." ? "" : "/ " + state.folder;
   $("files-up").hidden = state.folder === ".";
   const list = $("files-list");
@@ -453,13 +456,9 @@ submit("create-form", async data => {
   $("create-dialog").close();
   $("create-form").reset();
   await refreshProjects();
-  toast("任务已通过原 Store 初始化");
-});
-submit("hint-form", async () => {
-  await taskApi("hint", {method: "POST", body: {content: $("hint-content").value}});
-  $("hint-content").value = "";
-  await refreshTask();
-  toast("已保存至原 hint；尚不代表 agent 已读取");
+  setTab("workspace");
+  openAgent("commander");
+  toast("工作区已创建，请确认初步配置");
 });
 submit("record-form", async data => {
   const payload = Object.fromEntries(data);
@@ -505,7 +504,6 @@ submit("knowledge-form", loadKnowledge);
 
 $("new-project").onclick = $("empty-create").onclick = () => $("create-dialog").showModal();
 $("refresh-projects").onclick = () => guarded(refreshProjects);
-$("start-run").onclick = () => openRun();
 $("open-shell").onclick = () => openRun("shell");
 $("run-kind").onchange = updateRunOptions;
 $("add-fact").onclick = () => openRecord("fact");

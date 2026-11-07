@@ -6,6 +6,38 @@ let workspaceResourcesDirty = false, workspaceModelsDirty = false;
 
 function resetExtensionForm(id) { $(id).reset(); $(id).elements.id.value = ""; }
 
+function readMcpConfig(importAll = false) {
+  const input = $("extensions-mcp-form").elements.config;
+  const source = input.value.trim();
+  let config;
+  if (!source) throw new Error(importAll ? "请先在 Server JSON 中粘贴完整的 mcpServers JSON，再点击导入。" : "请先填写 Server JSON。");
+  try { config = JSON.parse(source); }
+  catch { throw new Error("JSON 格式不正确或内容不完整，请检查双引号、逗号和括号后重试。"); }
+  if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("MCP 配置必须是 JSON 对象。");
+  if (importAll) {
+    const servers = config.mcpServers;
+    if (!servers || typeof servers !== "object" || Array.isArray(servers) || !Object.keys(servers).length || Object.keys(servers).length > 100) {
+      throw new Error('批量导入需要包含 1–100 个服务器的 mcpServers 对象，例如 {"mcpServers":{"example":{"command":"your-server"}}}。');
+    }
+  } else if (Object.hasOwn(config, "mcpServers")) {
+    throw new Error('这是批量配置，请点击“从 JSON 导入”；“保存 server”只保存单个服务器配置。');
+  }
+  return config;
+}
+
+async function saveMcpConfig(importAll = false, form = null) {
+  $("extensions-mcp-error").textContent = "";
+  try {
+    const config = readMcpConfig(importAll);
+    await saveExtensionAction(importAll ? {action: "import_mcp", config} : {...Object.fromEntries(form), action: "save", kind: "mcp", config});
+  } catch (error) {
+    $("extensions-mcp-error").textContent = error.message;
+    $("extensions-mcp-form").elements.config.focus();
+    throw error;
+  }
+  resetExtensionForm("extensions-mcp-form"); $("extensions-mcp-editor").open = false;
+}
+
 function extensionOptions(target, library, selection, disabled = false) {
   const groups = [];
   for (const [key, field, title] of [["mcp", "mcp_ids", "MCP 服务器"], ["skills", "skill_ids", "Skills"]]) {
@@ -58,6 +90,7 @@ function resourceDetail(kind, resource) {
 function editExtension(kind, resource = null) {
   const prefix = kind === "mcp" ? "extensions-mcp" : "extensions-skill";
   resetExtensionForm(`${prefix}-form`);
+  if (kind === "mcp") $("extensions-mcp-error").textContent = "";
   const form = $(`${prefix}-form`);
   if (resource) {
     form.elements.id.value = resource.id; form.elements.name.value = resource.name;
@@ -220,9 +253,12 @@ for (const [kind, prefix] of [["mcp", "extensions-mcp"], ["skills", "extensions-
   $(`${prefix}-add`).onclick = $(`${prefix}-reset`).onclick = () => editExtension(kind);
 }
 $("extensions-mcp-import").onclick = () => guarded(async () => {
-  await saveExtensionAction({action: "import_mcp", config: JSON.parse($("extensions-mcp-form").elements.config.value)});
-  resetExtensionForm("extensions-mcp-form"); $("extensions-mcp-editor").open = false;
+  const button = $("extensions-mcp-import");
+  button.disabled = true;
+  try { await saveMcpConfig(true); }
+  finally { button.disabled = false; }
 });
+$("extensions-mcp-form").elements.config.addEventListener("input", () => { $("extensions-mcp-error").textContent = ""; });
 submit("extensions-defaults-form", async () => {
   const pid = extensionWorkspace;
   if (!pid || !extensionLibrary) throw new Error("请先选择工作区并等待读取完成");
@@ -243,8 +279,7 @@ submit("workspace-model-form", async form => {
   toast("工作区模型已保存，将用于新启动的角色");
 });
 submit("extensions-mcp-form", async form => {
-  await saveExtensionAction({...Object.fromEntries(form), action: "save", kind: "mcp", config: JSON.parse(form.get("config"))});
-  resetExtensionForm("extensions-mcp-form"); $("extensions-mcp-editor").open = false;
+  await saveMcpConfig(false, form);
 });
 submit("extensions-skill-form", async form => {
   await saveExtensionAction({...Object.fromEntries(form), action: "save", kind: "skills"});

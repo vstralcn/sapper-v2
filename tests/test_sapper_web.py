@@ -124,6 +124,53 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(first["text"] + second["text"], expected)
         self.assertEqual(second["offset"], len(expected.encode()))
 
+    def test_run_list_collects_credentials_once_and_refreshes_them_next_batch(self):
+        self.app.save_profile({"name": "test", "model": "fixture", "api_key": "fixture-profile-secret"})
+        private_json(self.app.state / "agents" / ("b" * 16 + ".json"),
+                     {"mcp_env_refs": ["SAPPER_TEST_MCP_SECRET"], "deleted_at": "historical"})
+        private_json(self.app.state / "model-bridges" / "fixture" / "ready.json",
+                     {"token": "fixture-bridge-secret"})
+        for i in range(4):
+            directory = self.app.run_path(f"{i:016x}")
+            private_json(directory / "run.json", {"id": f"{i:016x}", "project_id": self.pid,
+                         "status": "exited", "created_at": str(i), "command": "fixture-profile-secret"})
+            private_json(directory / "activity.json", {"latest_message":
+                         "fixture-profile-secret fixture-bridge-secret fixture-mcp-old fixture-mcp-new"})
+        extensions = self.app.workspaces.extensions
+        for secret in ("fixture-mcp-old", "fixture-mcp-new"):
+            with mock.patch.dict(os.environ, {"SAPPER_TEST_MCP_SECRET": secret}), \
+                    mock.patch.object(extensions, "credential_values", wraps=extensions.credential_values) as collect:
+                records = self.app.runs()
+            collect.assert_called_once()
+            self.assertEqual(len(records), 4)
+            result = json.dumps(records)
+            for hidden in ("fixture-profile-secret", "fixture-bridge-secret", secret):
+                self.assertNotIn(hidden, result)
+
+    def test_workspace_status_and_overview_share_run_queries(self):
+        aid, rid = "a" * 16, "b" * 16
+        private_json(self.app.run_path(rid) / "run.json", {"id": rid, "project_id": self.pid,
+                     "session": "fixture", "status": "exited", "created_at": "2026-01-01", "exit_code": 0})
+        self.app.workspaces.save_agent({"id": aid, "workspace_id": self.pid, "role": "worker",
+                                       "run_id": rid, "created_at": "2026-01-01"})
+        private_json(self.app.state / "services" / "fixture.json",
+                     {"id": "fixture", "workspace_id": self.pid, "run_id": rid})
+        with mock.patch.object(self.app, "runs", wraps=self.app.runs) as runs, \
+                mock.patch.object(self.app, "panes", return_value=[]) as panes:
+            status = self.app.workspace_status(self.pid)
+            self.assertEqual(status["agents"][0]["status"], "exited")
+            self.assertEqual(status["agents"][0]["exit_code"], 0)
+            self.assertEqual(status["services"][0]["status"], "exited")
+            runs.assert_called_once_with()
+            panes.assert_called_once_with()
+        with mock.patch.object(self.app, "runs", wraps=self.app.runs) as runs, \
+                mock.patch.object(self.app, "panes", return_value=[]), \
+                mock.patch.object(self.app.workspaces, "capabilities", return_value={"available": False}):
+            overview = self.app.overview()
+            self.assertEqual(overview["agents"][0]["id"], aid)
+            self.assertEqual(overview["recent_runs"][0]["id"], rid)
+            runs.assert_called_once_with()
+
 
 class HttpTests(unittest.TestCase):
     def setUp(self):

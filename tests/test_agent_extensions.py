@@ -33,6 +33,7 @@ class ExtensionTests(unittest.TestCase):
         self.app.panes = lambda: []
         self.launches = []
         self.start = mock.patch.object(self.app, "start", side_effect=self.capture).start()
+        mock.patch.object(self.manager, "start_watchdog", return_value={}).start()
         self.addCleanup(mock.patch.stopall)
 
     def capture(self, pid, data, native):

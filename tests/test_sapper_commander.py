@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import sapper
 from sapper_web import Console, private_json
 from sapper_commander import WatchdogLog
+from sapper_workspace import watch
 
 
 class WatchdogLogTests(unittest.TestCase):
@@ -82,6 +83,36 @@ class CommanderTests(unittest.TestCase):
 
     def rows(self):
         return [{**self.agent, "pane_id": "%123", "status": "running"}]
+
+    def test_watchdog_ignores_retired_commanders_and_their_exhausted_recoveries(self):
+        old = {**self.agent, "id":"c"*16, "desired_state":"stopped", "pane_id":None, "status":"stopped"}
+        self.manager.save_agent(old)
+        rows = [old, *self.rows()]
+        for control in ("paused", "waiting_user", "completed"):
+            with self.subTest(control=control):
+                with self.monitor.locked(old["id"]) as data:
+                    data.update(control=control, recoveries=2)
+                with mock.patch.dict(os.environ, {"SAPPER_WORKSPACE_ID":self.project["id"]}), \
+                        mock.patch("sapper_workspace.console_from_environment", return_value=self.app), \
+                        mock.patch.object(self.manager, "agents", return_value=rows), \
+                        mock.patch.object(self.manager, "mark_stopped") as stopped, \
+                        mock.patch.object(self.monitor, "tick") as tick, \
+                        mock.patch("sapper_workspace.time.sleep", side_effect=RuntimeError("one sweep")):
+                    with self.assertRaisesRegex(RuntimeError, "one sweep"):
+                        watch()
+                    tick.assert_called_once_with(self.agent["id"], rows)
+                    stopped.assert_not_called()
+
+    def test_watchdog_still_exits_when_current_main_is_offline_and_waiting(self):
+        rows = [{**self.agent, "pane_id":None, "status":"exited"}]
+        self.monitor.configure(self.agent["id"], "waiting_user", "需要用户决定")
+        with mock.patch.dict(os.environ, {"SAPPER_WORKSPACE_ID":self.project["id"]}), \
+                mock.patch("sapper_workspace.console_from_environment", return_value=self.app), \
+                mock.patch.object(self.manager, "agents", return_value=rows), \
+                mock.patch.object(self.monitor, "tick") as tick:
+            self.assertEqual(watch(), 0)
+        tick.assert_not_called()
+        self.assertEqual(self.manager.agent(self.agent["id"])["desired_state"], "stopped")
 
     def tick(self, at=1070, rows=None):
         self.monitor.tick(self.agent["id"], self.rows() if rows is None else rows, now=at)

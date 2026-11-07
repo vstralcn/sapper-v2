@@ -15,14 +15,14 @@ class RolePromptTests(unittest.TestCase):
             workspace_id="0123456789abcdef", workspace_name="fixture challenge",
             workspace_scope=[{"id": "0123456789abcdef", "name": "fixture challenge"}])
 
-    def test_commander_keeps_original_conditional_dispatch_ladder(self):
+    def test_commander_owns_dialogue_and_chooses_dispatch_from_evidence(self):
         prompt = self.render("commander")
-        self.assertIn("bounded 4-minute scout", prompt)
-        self.assertIn("0-10 minutes", prompt)
-        self.assertIn("10-20 minutes", prompt)
-        self.assertIn("20-30 minutes", prompt)
-        self.assertIn("--general", prompt)
-        self.assertIn("Do not spawn merely to satisfy this prompt", prompt)
+        self.assertIn("AskUserQuestion", prompt)
+        self.assertIn("A user question does not pause all workers", prompt)
+        self.assertIn("If the inputs are sufficient, dispatch work", prompt)
+        for fixed_strategy in ("bounded 4-minute scout", "0-10 minutes", "10-20 minutes", "at most two decisive"):
+            self.assertNotIn(fixed_strategy, prompt)
+        self.assertIn("configured resource limits", prompt)
         self.assertIn("board --json", prompt)
         self.assertIn("0123456789abcdef", prompt)
 
@@ -33,6 +33,14 @@ class RolePromptTests(unittest.TestCase):
         self.assertIn("--role verifier --p --minutes 5", prompt)
         self.assertIn("inspect it with `peek`", prompt)
         self.assertIn("`kill` the completed child", prompt)
+
+    def test_commander_briefing_distinguishes_goal_from_personal_execution(self):
+        prompt = self.render("commander")
+        self.assertIn("组织将军或 worker 完成", prompt)
+        self.assertIn("不得转为自己解题", prompt)
+        self.assertIn("不得亲自查询比赛平台", prompt)
+        for role in ("general", "worker", "scout", "verifier", "custom"):
+            self.assertNotIn("[Sapper 指挥官职责", self.render(role))
 
     def test_non_leaders_do_not_receive_spawn_authority(self):
         for role in ("worker", "scout", "verifier", "custom"):

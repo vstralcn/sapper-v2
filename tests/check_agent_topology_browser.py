@@ -115,9 +115,9 @@ def main():
                 check("assets served behind URL prefix and real API returns 24 agents", ev("agentTopology.rows.length === 24"))
                 node_goal = page.locator(f'[data-agent-id="{aid(1)}"] .at-node-mission')
                 check("node shows short goal and retains full mission", node_goal.inner_text() == "统筹解题" and node_goal.get_attribute("title") == records[1]["mission"])
-                check("terminal picker shows the same goal", page.locator('#native-pane option[value="%1"]').inner_text() == "Agent 01 · 统筹解题 · 000000")
+                check("terminal picker shows the same goal", page.locator('#native-pane option[value="%1"]').inner_text() == "Agent 01 · 统筹解题 · 000000 · 运行中")
                 tools = page.locator("#project-tools summary")
-                check("workspace actions have one header entry", tools.is_visible() and page.locator("#native-button").is_hidden() and page.locator("#advanced-run").is_hidden() and page.locator("#start-run").is_visible())
+                check("workspace actions have one header entry", tools.is_visible() and page.locator("#native-button").is_hidden() and page.locator("#advanced-run").is_hidden() and page.locator("#dispatch-role").is_visible())
                 tools.focus()
                 page.keyboard.press("Enter")
                 check("workspace menu groups native tools and workspace management", page.locator("#project-tools [role=group]").count() == 2 and page.locator("#enable-workspace").is_visible())
@@ -139,8 +139,8 @@ def main():
                 check("switching policy never submits recorded flags itself", not (app.store(first["id"]).root / ".flag-submit.lock").exists())
                 page.keyboard.press("Escape")
                 check("Escape closes tools and restores focus", ev("!document.querySelector('#project-tools').open && document.activeElement.matches('#project-tools summary')"))
-                for action, dialog in (("start-run", "agent-dialog"), ("workspace-native", "native-dialog"), ("advanced-run", "run-dialog"), ("stop-workspace", "confirm-dialog")):
-                    if action != "start-run":
+                for action, dialog in (("dispatch-role", "agent-dialog"), ("workspace-native", "native-dialog"), ("advanced-run", "run-dialog"), ("stop-workspace", "confirm-dialog")):
+                    if action != "dispatch-role":
                         tools.click()
                     page.locator("#" + action).click()
                     page.wait_for_selector("#" + dialog + "[open]")
@@ -152,7 +152,7 @@ def main():
                 check("unknown executions are not displayed as running", ev("AgentTopologyModel.counts(agentTopology.rows).running === 1"))
                 check("online idle remains online", ev("agentTopology.rows.find(a=>a.id.endsWith('5')).observation.presence === 'online'"))
                 check("offline and uncertain presence are distinct", ev("AgentTopologyModel.counts(agentTopology.rows).offline === 2 && AgentTopologyModel.counts(agentTopology.rows).presenceUnknown === 1"))
-                check("workspace sidebar is bounded", page.locator(".agent-preview-row").count() <= 4)
+                check("workspace sidebar includes every agent", page.locator(".agent-preview-row").count() == 24)
                 check("no simulator or mock dataset controls in production page", page.locator("#auto-demo,#dataset,#change-state").count() == 0)
                 check("existing stop and log controls are retained", at("detail").get_by_text("停止", exact=True).count() == 1 and at("detail").get_by_text("查看活动", exact=True).count() == 1)
                 at("detail").get_by_text("停止", exact=True).click()
@@ -225,12 +225,12 @@ def main():
                 check("legacy context text follows dark panel contrast", page.locator(".at-detail .agent-context").first.evaluate("e=>getComputedStyle(e).color==='rgb(154, 175, 189)'"))
                 check("header and controls share the dark palette", ev("getComputedStyle(document.querySelector('.topbar')).backgroundColor==='rgb(28, 48, 63)' && getComputedStyle(document.querySelector('[data-at=search]')).backgroundColor==='rgb(28, 48, 63)'"))
                 # Original dialogs are reused, not prototype-only buttons.
-                at("dispatch").click(); check("original dispatch form opens", page.locator("#agent-dialog").evaluate("e=>e.open"))
-                check("dialogs and form fields follow the global theme", ev("getComputedStyle(document.querySelector('#agent-dialog')).backgroundColor==='rgb(28, 48, 63)' && getComputedStyle(document.querySelector('#agent-dialog input:not([type=hidden])')).backgroundColor==='rgb(28, 48, 63)'"))
+                page.locator("#dispatch-role").click(); check("original dispatch form opens", page.locator("#agent-dialog").evaluate("e=>e.open"))
+                check("dialogs and form fields follow the global theme", ev("getComputedStyle(document.querySelector('#agent-dialog')).backgroundColor==='rgb(28, 48, 63)' && getComputedStyle(document.querySelector('#agent-dialog textarea')).backgroundColor==='rgb(28, 48, 63)'"))
                 page.keyboard.press("Escape")
                 page.evaluate("pid=>openProject(pid,'agents')", second["id"])
                 check("empty workspace cannot inherit previous agents", ev("agentTopology.rows.length === 0 && agentTopology.graph.nodes.length === 0"))
-                check("empty workspace offers dispatch", at("empty").get_by_text("＋ 派发角色", exact=True).count() == 1)
+                check("empty workspace offers dispatch", "派发角色" in at("empty").inner_text() and page.locator("#dispatch-role").is_visible())
                 page.evaluate("pid=>openProject(pid,'agents')", first["id"])
                 check("workspace-specific grouping and selection restore", ev("agentTopology.current.grouping === 'task' && agentTopology.current.selected==='0000000000000001'"))
                 page.route("**/api/workspaces/*/agents", lambda route: route.abort())

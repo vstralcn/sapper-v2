@@ -9,6 +9,7 @@ state.nativeControl = false;
 state.nativeStream = null;
 let terminal, terminalFit, inputBuffer = "", inputTimer, messageAgent, inputQueue = Promise.resolve();
 let roleInfoRequest = 0;
+let dispatchRequestId;
 let directoryRequest = 0;
 let selectedDirectory = "";
 let agentTopology;
@@ -18,20 +19,26 @@ const baseRefreshTask = refreshTask;
 const baseSetTab = setTab;
 
 function workspaceApi(action, options = {}) { return api(`/workspaces/${state.project.id}/${action}`, options); }
-function formatAgentStatus(a) { return ["stopping", "timed_out"].includes(a.status) ? names[a.status] : a.pane_id ? "进程存活" : names[a.status] || "状态未知"; }
+function formatAgentStatus(a,panes=state.panes) {
+  return AgentTopologyModel.labels[(a.observation||AgentTopologyModel.observe(a,panes)).status];
+}
 
 refreshTask = async function () {
+  if (state.view !== "project") return baseRefreshTask();
+  const pid = state.project?.id;
+  if (!pid) return;
+  const navigation = state.navigation;
   try {
-    if (state.view === "project" && state.project && agentTopology) agentTopology.switchWorkspace(state.project.id);
-    await baseRefreshTask();
-    if (state.view !== "project") return;
-    const pid = state.project?.id;
-    if (!pid) return;
-    const [roles, inspection] = await Promise.all([workspaceApi("agents"),workspaceApi("inspect")]);
-    if (pid !== state.project?.id) return;
+    if (agentTopology) agentTopology.switchWorkspace(pid);
+    const [, roles, inspection] = await Promise.all([
+      baseRefreshTask(), api(`/workspaces/${pid}/agents`), api(`/workspaces/${pid}/inspect`)
+    ]);
+    if (state.view !== "project" || pid !== state.project?.id || navigation !== state.navigation) return;
     state.agents = roles.agents;
     state.services = roles.services;
     state.inspection = inspection;
+    state.mainAgent = roles.primary_agent;
+    if($("agent-dialog").open)refreshDispatchState();
     if (!flagSettingsRequests.has(pid)) {
       $("auto-submit-flags").checked = inspection.auto_submit_flags;
       $("auto-submit-flags").disabled = !inspection.graph;
@@ -48,12 +55,13 @@ refreshTask = async function () {
       await workspaceFiles();
     }
   } catch (error) {
-    if (state.view === "project") agentTopology?.setConnection(false);
+    if (state.view === "project" && pid === state.project?.id && navigation === state.navigation) agentTopology?.setConnection(false);
     throw error;
   }
 };
 
 setTab = function (tab) {
+  if(tab==="chat")tab="workspace";
   $("tab-agents").hidden = tab !== "agents";
   if (tab !== "workspace") {
     $("tab-workspace").hidden = true;
@@ -72,7 +80,10 @@ setTab = function (tab) {
     n.setAttribute("aria-selected",String(n.dataset.tab===tab));
   });
   ensureTerminal();
-  if (state.project) guarded(workspaceFiles);
+  if (state.project) {
+    state.workspaceFilesPid = state.project.id;
+    guarded(workspaceFiles);
+  }
   if (terminalFit) requestAnimationFrame(() => terminalFit.fit());
 };
 
@@ -140,9 +151,9 @@ async function browseDirectory(path) {
   }
 }
 async function workspaceFiles() {
-  const pid=state.project.id, folder=state.workspaceFolder;
+  const pid=state.project.id, folder=state.workspaceFolder, navigation=state.navigation;
   const files=await taskApi("files?path="+encodeURIComponent(folder));
-  if (pid!==state.project?.id || folder!==state.workspaceFolder) return;
+  if (pid!==state.project?.id || folder!==state.workspaceFolder || navigation!==state.navigation) return;
   $("workspace-file-path").textContent=folder==="."?"工作区根目录":folder;
   $("workspace-file-list").replaceChildren(...(files.length?files.map(file=>button((file.directory?"▱ ":"▤ ")+file.name,"text-button workspace-file",()=>guarded(async()=>{
     if(file.directory){state.workspaceFolder=file.path;await workspaceFiles();return;}
@@ -154,33 +165,51 @@ async function workspaceFiles() {
   }))):[element("p","workspace-empty","目录中暂无可显示的文件。")])) ;
 }
 
-function openAgent(role="worker",parent="") {
+function openAgent(role,parent="") {
+  dispatchRequestId=crypto.randomUUID();
+  role = role || (state.mainAgent?.pane_id ? "worker" : "commander");
   $("agent-form").reset();
+  $("agent-form").elements.skip_permissions.checked=Boolean(state.mainAgent?.skip_permissions);
+  $("dispatch-error").textContent="";
   $("agent-role").value=role;
-  $("agent-location").value=role==="worker"&&!parent?"root":"agent";
+  $("agent-role").closest("label").hidden=!state.mainAgent?.pane_id;
+  $("agent-location").value="agent";
   $("agent-mission").value=state.graph?.project.goal||state.project.goal;
   refreshAgentModelOptions(false);
   $("agent-parent").replaceChildren(element("option","","无／独立主会话"));
   $("agent-parent").firstChild.value="";
   for(const a of state.agents.filter(a=>!a.id.startsWith('legacy-'))){const opt=element("option","",agentOptionLabel(a));opt.value=a.id;$("agent-parent").append(opt);}
   $("agent-parent").value=parent;
-  $("agent-basis").required=Boolean(parent);
   updateAgentModelHint();
-  $("agent-scope-options").replaceChildren(...state.projects.map(p=>{
-    const label=element("label","inline-check","");
-    const input=document.createElement("input");input.type="checkbox";input.name="workspace_scope";input.value=p.id;
-    input.checked=p.id===state.project.id;input.disabled=p.id===state.project.id||!p.enabled;
-    input.onchange=()=>guarded(loadRoleInfo);
-    label.append(input,document.createTextNode(p.name));return label;
-  }));
   updateRoleFields();
   $("agent-dialog").showModal();
   guarded(loadAgentExtensions);
 }
+function originalModelLabel(agent){
+  if(agent.resume_model)return agent.resume_model.original_label;
+  if(!agent.profile_id)return "继承原环境";
+  const profile=agent.profile_snapshot||state.profiles.find(p=>p.id===agent.profile_id);
+  return profile?`${profile.name} · ${profile.model}`:agent.profile_name||"原模型配置";
+}
+function dispatchCreatesSession(){
+  return !state.mainAgent||(!state.mainAgent.pane_id&&$("dispatch-session-mode").value==="new");
+}
+function refreshDispatchState(){
+  const main=state.mainAgent, offline=main&&!main.pane_id, fresh=dispatchCreatesSession();
+  $("dispatch-session-choice").hidden=!offline;
+  $("dispatch-settings").hidden=!fresh;
+  $("agent-permissions").hidden=Boolean(main?.pane_id);
+  $("dispatch-submit").textContent=fresh?(main?"新建主会话":"派发主 agent"):offline?"恢复原会话":"交给主 agent";
+  $("dispatch-help").textContent=fresh?"启动新的主 agent，在原生终端中澄清目标并安排执行。":offline?"恢复本工作区的原生会话，继续已有任务。":"派发请求会交给本工作区的主 agent，由它核对任务并安排执行。";
+  const selected=$("agent-profile").value;
+  const profile=state.profiles.find(p=>p.id===selected);
+  const defaultModel=Object.hasOwn(effectiveRoleAssignments(),"commander")?roleDefaultLabel("commander"):"继承原环境";
+  const current=selected==="__role_default__"?defaultModel:profile?modelConnectionLabel(profile):"继承原环境";
+  $("dispatch-model-summary").textContent=fresh?`新会话使用：${current}。${main?"旧会话、工作文件和共享图保留。":""}`:
+    offline?`恢复使用：${originalModelLabel(main)}。当前角色默认：${defaultModel}，用于新建会话；要使用此配置，请选择“按当前配置新建”。`:
+    `当前主 agent 使用：${originalModelLabel(main)}。`;
+}
 function updateRoleFields(){
-  const commander=$("agent-role").value==="commander";
-  $("agent-scope").hidden=!commander;
-  $("agent-watchdog").closest("label").hidden=!commander;
   refreshAgentModelOptions();
   guarded(loadRoleInfo);
 }
@@ -190,7 +219,7 @@ async function loadRoleInfo(){
   $("agent-role-summary").textContent=known?.summary||"正在读取角色基础职责…";
   $("agent-role-source").textContent=known?`${known.prompt_version} · ${known.sources.join("；")}`:"";
   $("agent-role-prompt").textContent="正在读取实际提示词…";
-  const selected=role==="commander"?[...document.querySelectorAll('#agent-scope-options input:checked')].map(input=>input.value):[state.project.id];
+  const selected=[state.project.id];
   const params=new URLSearchParams({role,scope:[...new Set(selected)].join(",")});
   const info=await workspaceApi("role-prompt?"+params);
   if(request!==roleInfoRequest||role!==$("agent-role").value)return;
@@ -206,25 +235,35 @@ function renderAgents() {
   state.agentSignature=signature;
   const list=$("agent-list");list.replaceChildren();
   const rows=AgentTopologyModel.normalize(state.agents,state.panes).sort(AgentTopologyModel.compare);
-  const active=rows.filter(a=>a.observation.status!=="offline");
-  for (const a of active.slice(0,4)) {
-    const row=button("","agent-preview-row at-status-"+a.observation.status,()=>{
-      setTab("agents");agentTopology.select(a.id,true);
-    });
-    row.append(element("i",""),element("span","",a.name||a.role_label),element("span","",AgentTopologyModel.labels[a.observation.status]));
+  $("workspace-agent-count").textContent=String(rows.length);
+  for (const a of rows) {
+    const row=button("","agent-preview-row at-status-"+a.observation.status,()=>guarded(()=>openAgentOutput(a)));
+    row.dataset.roleAgent=a.id;
+    row.setAttribute("aria-pressed",String(Boolean(a.pane_id)&&a.pane_id===state.nativePane));
+    row.title=a.observation.evidence;
+    const info=element("span","agent-preview-info");
+    info.append(element("strong","",a.name||a.role_label),element("span","agent-preview-task",AgentTopologyModel.shortGoal(a)));
+    row.append(element("i",""),info,element("span","agent-preview-status",AgentTopologyModel.labels[a.observation.status]));
     list.append(row);
   }
-  if(!active.length)list.append(element("p","workspace-empty",rows.length?"当前仅有离线历史，可在协作拓扑查看。":"还没有登记的角色。可打开原会话或派发新角色。"));
+  if(!rows.length)list.append(element("p","workspace-empty","还没有登记的角色。点击“派发角色”启动主 agent。"));
   list.append(button(`打开协作拓扑 · ${rows.length} 个 Agent`,"text-button agent-preview-link",()=>setTab("agents")));
   renderAgentServices($("service-list"));
   renderAgentServices(agentTopology.el("services"));
+}
+
+async function openAgentOutput(a){
+  if(a.execution_mode==="print"&&a.run_id){setTab("console");await openLog({id:a.run_id,profile_name:a.profile_name});}
+  else if(a.pane_id){setTab("workspace");selectNative(a.pane_id);}
+  else{setTab("agents");agentTopology.select(a.id,true);}
 }
 
 function renderAgentCard(a) {
   const node=element("article","agent-card"+(a.parent_agent_id?" child":""));
   const title=element("div","agent-title");
   title.append(element("span","",a.name||a.role_label),element("span","badge",formatAgentStatus(a)));
-  node.append(title,element("p","agent-sub",`${a.role_label} · ${a.execution_mode==="cli"?"原 CLI 流程":a.execution_mode==="print"?"限时单次":"原生交互"} · ${a.profile_name}`));
+  node.append(title,element("p","agent-sub",`${a.role_label} · ${a.execution_mode==="chat"?"网页对话":a.execution_mode==="cli"?"原 CLI 流程":a.execution_mode==="print"?"限时单次":"原生交互"} · ${a.profile_name}`));
+  if(a.resume_model)node.append(element("p","agent-context",`恢复使用：${a.resume_model.original_label}。当前角色默认：${a.resume_model.current_label}，用于新建会话。`));
   if(a.parent_agent_id)node.append(element("p","agent-parent","派发自 "+a.parent_agent_id.slice(0,8)));
   if(a.intent_id)node.append(element("p","agent-parent","派单意图 "+a.intent_id));
   if(a.shared_context){const c=a.shared_context;node.append(element("p","agent-context",contextStatus(c)));}
@@ -272,18 +311,22 @@ function renderAgentCard(a) {
       }));
       node.append(details,actions);return node;
     }
-    actions.append(button("打开终端","text-button",()=>{setTab("workspace");selectNative(a.pane_id);}),button("补充说明","text-button",()=>{
-      $("agent-message-help").textContent=a.native_operation||a.execution_mode==="print"?"通过共享 hint 保存补充说明，后续读图时可见，不代表当前模型已读取或采用。":"发送到选定角色的真实终端，不代表模型已读取或采用。";messageAgent=a.id;$("agent-message-title").textContent="给"+(a.name||a.role_label)+"补充说明";$("agent-message-text").value="";$("agent-message-dialog").showModal();
-    }));
+    actions.append(button("查看终端","text-button",()=>{setTab("workspace");selectNative(a.pane_id);}));
+    if(a.role==="commander"&&a.execution_mode==="chat")actions.append(button("使用交互终端","text-button",()=>guarded(async()=>{
+      await workspaceApi("dispatch",{method:"POST",body:{role:"commander",execution_mode:"tui"}});
+      await refreshTask();setTab("workspace");if(state.mainAgent?.pane_id)selectNative(state.mainAgent.pane_id);
+    })));
     actions.append(button("停止","text-button danger",()=>guarded(async()=>{
       if(!await confirmAction("停止该角色的原会话及其进程？watchdog 不会将这次明确停止当作异常重启。"))return;
       await api(`/agents/${a.id}/stop`,{method:"POST",body:{}});await refreshTask();
     })));
   } else if(a.can_resume)actions.append(button("恢复此会话","text-button",()=>guarded(async()=>{
-    await api(`/agents/${a.id}/resume`,{method:"POST",body:{}});await refreshTask();toast("已按原生 Claude ID 恢复");
+    await api(`/agents/${a.id}/resume`,{method:"POST",body:a.role==="commander"?{execution_mode:"tui"}:{}});await refreshTask();setTab("workspace");const resumed=state.agents.find(row=>row.id===a.id);if(resumed?.pane_id)selectNative(resumed.pane_id);toast("已按原生会话恢复");
   })));
+  if(a.can_resume&&a.id===state.mainAgent?.id)actions.append(button("按当前配置新建","text-button",()=>{
+    openAgent("commander");$("dispatch-session-mode").value="new";refreshDispatchState();
+  }));
   if(a.native_operation)actions.append(button("原流程参数","text-button",()=>guarded(async()=>{await openNative(a.native_request.operation,a.native_request.values||{});$("native-profile").value=a.profile_id||"";})));
-  if(!a.native_operation&&["commander","general"].includes(a.role)&&a.desired_state==="running")actions.append(button("派发子任务","text-button",()=>openAgent("worker",a.id)));
   if(!a.id.startsWith("legacy-"))actions.append(button("删除角色","text-button danger",()=>guarded(async()=>{
     const effect=a.external_session&&!a.run_id?"将移除角色登记，已有外部终端继续运行。":"将停止该角色当前任务并从角色列表移除，watchdog 不会恢复它。";
     const scope=a.workspace_scope?.length>1?"此角色关联多个工作区，删除会在所有关联工作区生效。":"";
@@ -318,7 +361,7 @@ function ensureTerminal(){
   if(terminal)return;
   terminal=new Terminal({cursorBlink:true,fontSize:12,fontFamily:'"SFMono-Regular",Consolas,monospace',scrollback:5000,disableStdin:true,theme:terminalTheme()});
   terminalFit=new FitAddon.FitAddon();terminal.loadAddon(terminalFit);terminal.open($("native-terminal"));
-  terminal.writeln("选择角色终端，或点击“打开 Claude Code”。\r\n会话会在题目目录中运行，关闭网页不会结束它。");
+  terminal.writeln("点击“派发角色”启动主 agent，或选择已有角色终端。\r\n点击“接管输入”后，可以直接在终端中补充信息、回答问题和纠偏。");
   terminal.onData(data=>{
     if(!state.nativeControl||!state.nativePane)return;
     // tmux already answers device queries; do not inject the browser emulator's replies twice.
@@ -337,15 +380,16 @@ function agentOptionLabel(a){
 }
 function renderNativePanes(){
   const rolePanes=new Set(state.agents.map(a=>a.pane_id));
-  const all=state.panes.filter(p=>p.project_id===state.project.id||rolePanes.has(p.id)||p.role==="commander");
+  const all=state.panes.filter(p=>!p.dead&&(p.project_id===state.project.id||rolePanes.has(p.id)));
   const options=all.map(p=>{
     const a=state.agents.find(a=>a.pane_id===p.id), service=state.services.find(s=>s.pane_id===p.id);
-    return [p.id,a?agentOptionLabel(a):service?"Watchdog · 脚本服务":`已有会话 · ${p.name}`];
+    return [p.id,a?`${agentOptionLabel(a)} · ${formatAgentStatus(a)}`:service?"Watchdog · 脚本服务":`已有会话 · ${p.name}`];
   });
   const sig=JSON.stringify(options);if(state.nativePaneSignature===sig)return;
   state.nativePaneSignature=sig;
   $("native-pane").replaceChildren(...options.map(([id,label])=>{const opt=element("option","",label);opt.value=id;return opt;}));
-  const chosen=all.some(p=>p.id===state.nativePane)?state.nativePane:all[0]?.id||"";
+  const chosen=all.some(p=>p.id===state.nativePane)?state.nativePane:
+    all.find(p=>p.id===state.mainAgent?.pane_id)?.id||all.find(p=>rolePanes.has(p.id))?.id||all[0]?.id||"";
   if(!all.length){const opt=element("option","","暂无活动角色终端");opt.value="";$("native-pane").append(opt);}
   $("native-pane").value=chosen;
   if(chosen!==state.nativePane)selectNative(chosen);
@@ -354,10 +398,11 @@ function selectNative(pane){
   if(state.nativePane===pane&&state.nativeStream)return;
   if(state.nativeStream)state.nativeStream.close();state.nativeStream=null;
   state.nativePane=pane;state.nativeControl=false;inputBuffer="";
+  document.querySelectorAll("#agent-list [data-role-agent]").forEach(row=>row.setAttribute("aria-pressed",String(state.agents.some(a=>a.id===row.dataset.roleAgent&&a.pane_id===pane))));
   $("native-pane").value=pane;
   $("terminal-control").textContent="接管输入";$("terminal-control").classList.remove("controlling");
   ensureTerminal();terminal.options.disableStdin=true;
-  if(!pane){$("native-mode").textContent="会话已结束，可查看运行日志或按 ID 恢复";return;}
+  if(!pane){$("native-mode").textContent="暂无活动终端，可派发角色或从角色列表恢复会话";return;}
   terminal.reset();$("native-mode").textContent="正在接入原终端…";
   const stream=new EventSource(`api/panes/${encodeURIComponent(pane)}/stream`);
   state.nativeStream=stream;
@@ -383,7 +428,7 @@ function disconnectNative(){
   if(state.nativeStream)state.nativeStream.close();
   state.nativeStream=null;state.nativePane="";state.nativeControl=false;inputBuffer="";
   state.nativePaneSignature=null;
-  if(terminal)terminal.options.disableStdin=true;
+  if(terminal){terminal.options.disableStdin=true;terminal.reset();}
 }
 
 $("bind-workspace").onclick=()=>guarded(openBind);
@@ -407,11 +452,10 @@ projectTools.addEventListener("click",event=>{
 projectTools.addEventListener("focusout",event=>{
   if(event.relatedTarget && !projectTools.contains(event.relatedTarget))closeProjectTools();
 });
-$("start-run").onclick=()=>openAgent();
-$("new-agent").onclick=()=>openAgent();
+$("dispatch-role").onclick=()=>openAgent();
 $("advanced-run").onclick=()=>openRun();
-$("agent-parent").onchange=()=>{$("agent-basis").required=Boolean($("agent-parent").value);};
-$("agent-role").onchange=()=>{$("agent-location").value=$("agent-role").value==="worker"?"root":"agent";updateRoleFields();};
+$("agent-role").onchange=updateRoleFields;
+$("dispatch-session-mode").onchange=()=>{$("dispatch-error").textContent="";refreshDispatchState();};
 $("enable-workspace").onclick=()=>guarded(async()=>{
   await workspaceApi("enable",{method:"POST",body:{}});await refreshProjects();toast("项目级 hooks 与说明已接入，用户内容已保留");
 });
@@ -439,7 +483,7 @@ $("terminal-control").onclick=()=>guarded(async()=>{
   if(!state.nativePane)throw new Error("请先选择活动终端");
   state.nativeControl=!state.nativeControl;terminal.options.disableStdin=!state.nativeControl;
   $("terminal-control").textContent=state.nativeControl?"只读查看":"接管输入";$("terminal-control").classList.toggle("controlling",state.nativeControl);
-  if(state.nativeControl){terminalFit.fit();await api(`/panes/${encodeURIComponent(state.nativePane)}/resize`,{method:"POST",body:{cols:terminal.cols,rows:terminal.rows}});terminal.focus();}
+  if(state.nativeControl){terminalFit.fit();terminal.focus();await api(`/panes/${encodeURIComponent(state.nativePane)}/resize`,{method:"POST",body:{cols:terminal.cols,rows:terminal.rows}});}
 });
 document.querySelectorAll("[data-tab]").forEach(node=>{node.onclick=()=>setTab(node.dataset.tab);});
 document.querySelectorAll(".dialog-close").forEach(node=>{node.onclick=()=>node.closest("dialog").close();});
@@ -449,19 +493,22 @@ submit("bind-form",async form=>{
   const p=await api("/workspaces/bind",{method:"POST",body:Object.fromEntries(form)});
   state.project=p;localStorage.setItem("sapper-project",p.id);state.workspaceFilesPid=null;
   state.view="project";
-  $("bind-dialog").close();await refreshProjects();setTab("workspace");toast("已绑定原题目目录，没有搬动文件");
+  $("bind-dialog").close();await refreshProjects();setTab("workspace");openAgent("commander");toast("已打开工作区，请确认初步配置");
 });
 submit("agent-form",async form=>{
   const data=Object.fromEntries(form);data.minutes=Number(data.minutes);
+  data.new_session=Boolean(state.mainAgent)&&dispatchCreatesSession();
+  if(data.new_session)data.role="commander";
   if(data.profile_id==="__role_default__")delete data.profile_id;
-  const basis=String(data.basis||"").trim();delete data.basis;
-  if(basis)data[/^i[0-9]+$/.test(basis)?"intent_id":"from"]=basis;
-  data.workspace_scope=[state.project.id,...(data.role==="commander"?form.getAll("workspace_scope").filter(id=>id!==state.project.id):[])];
-  data.skip_permissions=form.has("skip_permissions");data.watchdog=form.has("watchdog");data.request_id=crypto.randomUUID();
+  data.skip_permissions=form.has("skip_permissions");data.request_id=dispatchRequestId;
   if(!$("agent-extensions-default").checked)data.extensions=readExtensionSelection("agent-extension-options");
-  const run=await workspaceApi("sessions",{method:"POST",body:data});$("agent-dialog").close();setTab("workspace");await refreshTask();
-  const a=state.agents.find(a=>a.run_id===run.id);if(a?.pane_id)selectNative(a.pane_id);
-  toast("已启动原 Claude Code，并记录独立会话 ID");
+  data.execution_mode="tui";
+  $("dispatch-error").textContent="";
+  try{await workspaceApi("dispatch",{method:"POST",body:data});}
+  catch(error){$("dispatch-error").textContent=error.message;throw error;}
+  $("agent-dialog").close();setTab("workspace");await refreshTask();
+  if(state.mainAgent?.pane_id)selectNative(state.mainAgent.pane_id);
+  toast("已交给本工作区主 agent，可在终端查看和继续交流");
 });
 submit("agent-message-form",async()=>{
   const result=await api(`/agents/${messageAgent}/messages`,{method:"POST",body:{text:$("agent-message-text").value}});

@@ -3,6 +3,7 @@
 /tmp/sapper-ui-venv/bin/python tests/check_settings_browser.py --browser '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 """
 import argparse
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -61,6 +62,38 @@ def main():
                 check('opens globally from overview without selecting a workspace', page.evaluate('state.project === null'))
                 page.locator('[data-settings-tab=mcp]').click()
                 expect(page.locator('#settings-mcp-panel')).to_be_visible()
+                page.locator('#extensions-mcp-add').click()
+                config_input = page.locator('#extensions-mcp-form textarea')
+                import_button = page.locator('#extensions-mcp-import')
+                revision = ext.view()['revision']
+                for source, message in [
+                    ('', '请先在 Server JSON 中粘贴完整'),
+                    ('{"mcpServers":', 'JSON 格式不正确或内容不完整'),
+                    ('[]', 'MCP 配置必须是 JSON 对象'),
+                    ('{"command":"fixture"}', '批量导入需要包含'),
+                    ('{"mcpServers":{}}', '批量导入需要包含'),
+                    ('{"mcpServers":{"invalid":{}}}', 'command 必须是非空文本')]:
+                    config_input.fill(source)
+                    import_button.click()
+                    expect(page.locator('#extensions-mcp-error')).to_contain_text(message)
+                    check('invalid import does not write resource library: ' + (source or 'empty'), ext.view()['revision'] == revision)
+                    check('invalid import retains input: ' + (source or 'empty'), config_input.input_value() == source)
+                batch = {'mcpServers': {'import-one': {'command': 'fixture-one'}, 'import-two': {'type': 'http', 'url': 'https://example.test/mcp'}}}
+                config_input.fill(json.dumps(batch))
+                import_button.click()
+                expect(page.locator('#extensions-mcp-list .resource-row')).to_have_count(2)
+                check('batch import succeeds without a separate name', len(ext.view()['mcp']) == 2)
+                original_id = next(r['id'] for r in ext.view()['mcp'] if r['name'] == 'import-one')
+                page.locator('#extensions-mcp-add').click()
+                config_input.fill('{"mcpServers":{"import-one":{"command":"updated-fixture"}}}')
+                import_button.click()
+                expect(page.locator('#extensions-mcp-list')).to_contain_text('updated-fixture')
+                check('reimport updates matching server without duplication', len(ext.view()['mcp']) == 2 and next(r['id'] for r in ext.view()['mcp'] if r['name'] == 'import-one') == original_id)
+                for name in ['import-one', 'import-two']:
+                    row = page.locator('#extensions-mcp-list .resource-row').filter(has=page.locator('strong', has_text=name))
+                    row.get_by_role('button', name='移除', exact=True).click()
+                    page.locator('#confirm-accept').click()
+                    expect(row).to_have_count(0)
                 page.locator('#extensions-mcp-add').click()
                 page.locator('#extensions-mcp-form input[name=name]').fill('exa')
                 page.locator('#extensions-mcp-form textarea').fill('{"type":"http","url":"https://example.test/mcp"}')

@@ -63,6 +63,7 @@ function refreshAgentModelOptions(preserve = true) {
   updateAgentModelHint();
 }
 function updateAgentModelHint() {
+  if(typeof refreshDispatchState==="function")refreshDispatchState();
   const value = $("agent-profile").value;
   const role = $("agent-role").value;
   if (value !== "__role_default__") {

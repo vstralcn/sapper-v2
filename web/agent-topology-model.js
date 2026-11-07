@@ -34,10 +34,11 @@
     const presence = terminal.has(agent.status) || pane?.dead === true ? "offline"
       : pane?.dead === false ? "online" : "unknown";
     const monitor = agent.commander_monitor || {}, activity = agent.activity || {};
-    const last = Math.max(timestamp(activity.last_event_at), timestamp(monitor.last_event_at));
+    const observation = agent.execution_observation || (activity.phase && activity.phase !== "unknown" ? activity : monitor);
+    const last = Math.max(timestamp(activity.last_event_at), timestamp(observation.last_event_at));
     // A restored run must not inherit an old monitor phase before new events arrive.
-    const currentMonitor = timestamp(monitor.last_event_at) > 0 &&
-      timestamp(monitor.last_event_at) >= Math.max(timestamp(agent.updated_at), timestamp(agent.created_at));
+    const currentObservation = timestamp(observation.last_event_at) > 0 &&
+      timestamp(observation.last_event_at) >= Math.max(timestamp(agent.updated_at), timestamp(agent.created_at));
     let execution = "unknown", evidence = "只有运行／进程记录，尚无可确认的执行阶段";
     const failed = agent.status === "failed" || agent.status === "timed_out" ||
       (terminal.has(agent.status) && typeof agent.exit_code === "number" && agent.exit_code !== 0) ||
@@ -45,13 +46,13 @@
     if (failed) {
       execution = "error";
       evidence = agent.stop_reason || (agent.status === "timed_out" ? "运行预算耗尽" : "运行失败、非零退出码或明确的结果错误");
-    } else if (currentMonitor && ["responding", "tool_running"].includes(monitor.phase)) {
-      execution = "running";
-      evidence = monitor.phase === "tool_running" ? "原生会话记录：工具执行中" : "原生会话记录：模型处理中";
-    } else if ((currentMonitor && monitor.phase === "waiting_user") || monitor.control === "waiting_user") {
+    } else if ((currentObservation && observation.phase === "waiting_user") || monitor.control === "waiting_user") {
       execution = "waiting";
       evidence = monitor.reason || "原生会话或显式调度控制：等待用户输入";
-    } else if (currentMonitor && monitor.phase === "idle") {
+    } else if (currentObservation && ["responding", "tool_running"].includes(observation.phase)) {
+      execution = "running";
+      evidence = observation.phase === "tool_running" ? "原生会话记录：工具执行中" : "原生会话记录：模型处理中";
+    } else if (currentObservation && observation.phase === "idle") {
       execution = "idle";
       evidence = "原生会话记录：本轮已结束；在线性另行观测";
     } else if (activity.result_received === true) {

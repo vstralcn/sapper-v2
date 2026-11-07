@@ -190,15 +190,16 @@ class Console:
 
     def overview(self):
         projects = self.projects()
-        agents = [a for a in self.workspaces.agents() if not a["id"].startswith("legacy-")]
         runs = self.runs()
+        panes = self.panes()
+        agents = [a for a in self.workspaces.agents(run_records=runs, pane_records=panes) if not a["id"].startswith("legacy-")]
         context = self.global_context()
         for project in projects:
             project["active_agents"] = sum(bool(a.get("pane_id")) for a in agents
                                            if project["id"] in a.get("workspace_scope", [a["workspace_id"]]))
         recent = [{k: r.get(k) for k in ("id", "project_id", "kind", "native_operation", "role", "profile_name", "status", "exit_code", "created_at")}
                   for r in runs[:8]]
-        return {"projects": projects, "agents": agents, "recent_runs": recent,
+        return {"projects": projects, "agents": agents, "panes": panes, "recent_runs": recent,
                 "summary": {"workspaces": len(projects), "active_agents": sum(bool(a.get("pane_id")) for a in agents),
                             "open_intents": sum(p["open_intents"] for p in projects),
                             "facts": sum(p["facts"] for p in projects)},
@@ -207,8 +208,8 @@ class Console:
                                 "python": platform.python_version(), "tmux": shutil.which("tmux") is not None,
                                 "claude": self.workspaces.capabilities(), "workspace_roots": [str(p) for p in self.workspace_roots]}}
 
-    def redact(self, value):
-        text = str(value)
+    def redaction_keys(self):
+        """Collect fresh credentials once for a batch, never cache across requests."""
         keys = [p.get("api_key", "") for p in self.config()["profiles"]]
         for path in (self.state / "model-bridges").glob("*/ready.json"):
             with contextlib.suppress(OSError, ValueError):
@@ -217,6 +218,12 @@ class Console:
             "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "SAPPER_CLAUDE_API_KEY", "OPENAI_API_KEY",
             "DEEPSEEK_API_KEY", "BENCHMARK_TOKEN")]
         keys.extend(self.workspaces.extensions.credential_values())
+        return tuple(dict.fromkeys(key for key in keys if key))
+
+    def redact(self, value, *, keys=None):
+        text = str(value)
+        if keys is None:
+            keys = self.redaction_keys()
         for key in keys:
             if key:
                 text = text.replace(key, "[已隐藏密钥]")
@@ -566,7 +573,7 @@ class Console:
             raise WebError("运行 ID 不正确")
         return self.state / "runs" / rid
 
-    def run_info(self, rid):
+    def run_info(self, rid, *, redaction_keys=None):
         directory = self.run_path(rid)
         info = read_json(directory / "run.json")
         if not info:
@@ -574,7 +581,7 @@ class Console:
         control = read_json(directory / "control.json", {})
         if "timeout_seconds" in control:
             info["timeout_seconds"] = control["timeout_seconds"]
-        info["activity"] = json.loads(self.redact(json.dumps(read_json(directory / "activity.json", {}), ensure_ascii=False)))
+        info["activity"] = json.loads(self.redact(json.dumps(read_json(directory / "activity.json", {}), ensure_ascii=False), keys=redaction_keys))
         if info.get("timeout_seconds") is not None and info.get("started_epoch") is not None:
             info["deadline_epoch"] = info["started_epoch"] + info["timeout_seconds"]
         return info
@@ -598,6 +605,7 @@ class Console:
 
     def runs(self, pid=None):
         result = []
+        keys = self.redaction_keys()
         for path in (self.state / "runs").glob("*/run.json"):
             info = read_json(path)
             if pid and info.get("project_id") != pid:
@@ -611,9 +619,19 @@ class Console:
                         if current["status"] not in FINISHED:
                             current.update(status=current.get("stop_reason", "interrupted"), ended_at=sapper.now_iso())
                             private_json(path, current)
-            info = self.run_info(info["id"])
-            result.append(json.loads(self.redact(json.dumps(info, ensure_ascii=False))))
+            info = self.run_info(info["id"], redaction_keys=keys)
+            result.append(json.loads(self.redact(json.dumps(info, ensure_ascii=False), keys=keys)))
         return sorted(result, key=lambda r: r["created_at"], reverse=True)[:100]
+
+    def workspace_status(self, pid):
+        runs, panes = self.runs(), self.panes()
+        agents = self.workspaces.agents(pid, run_records=runs, pane_records=panes)
+        try:
+            primary, error = self.workspaces.main_agent(pid, agents=agents), None
+        except WorkspaceError as exc:
+            primary, error = None, str(exc)
+        return {"agents": agents, "primary_agent": primary, "primary_error": error,
+                "services": self.workspaces.services(pid, run_records=runs, pane_records=panes)}
 
     def start(self, pid, data, *, native=None):
         project = (native or {}).get("project_override") or self.project(pid)
@@ -645,7 +663,10 @@ class Console:
             env["SAPPER_BIN"] = shlex.quote(self.claude_bin)
         sapper_models.apply_profile(env, profile, self.state)
         if (native or {}).get("isolated_extensions") and not (env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or env.get("SAPPER_CLAUDE_API_KEY")):
-            raise WebError("独立会话仅支持 API Key：请在模型配置保存密钥，或为 Web 服务设置 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN；不使用 Claude 订阅登录", 409)
+            source = f"模型配置“{profile['name']} · {profile['model']}”" if profile else "“继承原环境”"
+            remedy = "请为此模型配置保存密钥，或为 Web 服务设置 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN。" if profile else (
+                "请为 Web 服务设置 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN；要使用已配置的工作区模型，请按当前配置新建会话。")
+            raise WebError(f"独立会话仅支持 API Key；本次实际采用{source}，未找到可用密钥。" + remedy, 409)
         argv = [sys.executable, str(SAPPER), "--store", str(Path(project["path"]) / ".sapper")]
         if native is not None:
             argv = native["argv"]
@@ -729,10 +750,12 @@ class Console:
                     "command": shlex.join(argv), "cwd": cwd,
                     "profile_name": profile["name"] if profile else "继承原环境"}
             if native:
-                info.update({k: native[k] for k in ("agent_id", "claude_session_id", "intent_id", "role", "timeout_seconds", "native_operation", "execution_mode", "output_format") if k in native})
+                info.update({k: native[k] for k in ("agent_id", "claude_session_id", "intent_id", "role", "timeout_seconds", "native_operation", "execution_mode", "output_format", "companion_required") if k in native})
             info["supervisor_version"] = 1
             private_json(run_dir / "run.json", info)
-            private_json(run_dir / "launch.json", {"argv": argv, "env": env})
+            private_json(run_dir / "launch.json", {"argv": argv, "env": env,
+                         "initial_prompt": (native or {}).get("initial_prompt"),
+                         "resume_chat": (native or {}).get("resume_chat", False)})
             wrapper = shlex.join([sys.executable, str(Path(__file__).resolve()), "_runner", str(run_dir)])
             try:
                 proc = self.tmux("new-session", "-d", "-s", session, "-c", cwd, wrapper)
@@ -755,6 +778,13 @@ class Console:
 
     def stop(self, rid):
         with self.workspaces.lifecycle():
+            info = self.run_info(rid)
+            if info.get("role") == "commander" and info.get("agent_id"):
+                return self.workspaces.stop_agent(info["agent_id"])
+            if info.get("role") == "watchdog":
+                for a in self.workspaces.agents(info["project_id"]):
+                    if a.get("role") == "commander" and not a.get("legacy"):
+                        self.workspaces.stop_agent(a["id"])
             return self._stop(rid)
 
     def _stop(self, rid):
@@ -766,7 +796,7 @@ class Console:
         run_dir = self.run_path(rid)
         with run_lock(run_dir):
             (run_dir / "stop_requested").touch()
-        if info.get("supervisor_version") == 1 and info.get("execution_mode") == "print":
+        if info.get("supervisor_version") == 1 and info.get("execution_mode") in ("print", "chat"):
             # Let the owner interrupt Claude and drain its final output first.
             end = time.monotonic() + INTERRUPT_GRACE + TERMINATE_GRACE + 4
             while time.monotonic() < end:
@@ -894,7 +924,15 @@ def run_child(directory):
     stop_signal = None
     reader = None
     output = None
-    managed_print = info.get("execution_mode") == "print"
+    chat_mode = info.get("execution_mode") == "chat"
+    managed_print = info.get("execution_mode") in ("print", "chat")
+    journal = None
+    initialized = threading.Event()
+    init_error = []
+    if chat_mode:
+        from sapper_chat import ChatJournal
+        journal = ChatJournal(env["SAPPER_WEB_STATE"], info["agent_id"])
+        journal.begin(info["id"], launch["initial_prompt"], resume=launch.get("resume_chat", False))
     if info.get("output_format") == "stream-json":
         from sapper_run import RunOutput
         output = RunOutput(directory, private_json)
@@ -921,6 +959,22 @@ def run_child(directory):
                 sys.stdout.buffer.write(line)
                 sys.stdout.buffer.flush()
                 output.observe(line)
+                if journal:
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    journal.receive(info["id"], info["claude_session_id"], event)
+                    if event.get("type") == "control_response" and event.get("response", {}).get("request_id") == "sapper-initialize":
+                        if event["response"].get("subtype") == "error":
+                            init_error.append(event["response"].get("error", "初始化失败"))
+                        initialized.set()
+                    elif event.get("type") == "control_request" and event.get("request", {}).get("subtype") != "can_use_tool":
+                        # Unknown requests must receive an explicit error, not hang.
+                        with journal.locked() as data:
+                            data.setdefault("responses", []).append({"type": "control_response", "response": {
+                                "subtype": "error", "request_id": event["request_id"],
+                                "error": "Unsupported control request"}})
         finally:
             child.stdout.close()
 
@@ -930,6 +984,8 @@ def run_child(directory):
     reason = None
     try:
         options = {"start_new_session": True, "stdin": subprocess.DEVNULL} if managed_print else {}
+        if chat_mode:
+            options["stdin"] = subprocess.PIPE
         if output:
             options.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         child = subprocess.Popen(launch["argv"], cwd=info["cwd"], env=env, **options)
@@ -945,17 +1001,63 @@ def run_child(directory):
         if output:
             reader = threading.Thread(target=relay, daemon=True)
             reader.start()
+        if journal:
+            child.stdin.write((json.dumps({"type": "control_request", "request_id": "sapper-initialize",
+                "request": {"subtype": "initialize", "hooks": None}}) + "\n").encode())
+            child.stdin.flush()
         phase_end = None
         stage = None
         warned_budget = None
+        companion_checked = 0
+        companion_missing = None
         while child.poll() is None:
             now = time.monotonic()
+            if info.get("companion_required") and now - companion_checked >= 1:
+                companion_checked = now
+                alive = False
+                for path in (Path(env["SAPPER_WEB_STATE"]) / "services").glob("*.json"):
+                    service = read_json(path, {})
+                    if service.get("workspace_id") != info["project_id"]:
+                        continue
+                    run = read_json(Path(env["SAPPER_WEB_STATE"]) / "runs" / service["run_id"] / "run.json", {})
+                    if run.get("status") == "starting" and now - started < 10:
+                        alive = True
+                    elif run.get("status") == "running" and run.get("wrapper_pid"):
+                        try:
+                            os.kill(run["wrapper_pid"], 0)
+                            alive = True
+                        except ProcessLookupError:
+                            pass
+                companion_missing = None if alive else companion_missing or now
+                if companion_missing and now - started > 10 and now - companion_missing >= 2:
+                    reason = "stopped"
+                    note("[sapper-web] watchdog 已退出，主 agent 同步停止。")
+                    agent_path = Path(env["SAPPER_WEB_STATE"]) / "agents" / f"{info['agent_id']}.json"
+                    agent = read_json(agent_path, {})
+                    if agent.get("run_id") == info["id"]:
+                        agent["desired_state"] = "stopped"
+                        private_json(agent_path, agent)
+            if journal and reason is None:
+                if init_error:
+                    raise OSError("Claude Code 聊天初始化失败：" + init_error[0])
+                if not initialized.is_set() and now - started > 60:
+                    raise OSError("Claude Code 聊天初始化超时")
+                if initialized.is_set():
+                    frames = journal.outgoing(info["id"])
+                    for frame in frames:
+                        if frame["type"] == "user":
+                            frame["session_id"] = info["claude_session_id"]
+                        child.stdin.write((json.dumps(frame, ensure_ascii=False) + "\n").encode())
+                    child.stdin.flush()
+                    journal.sent(info["id"], frames)
             with run_lock(directory):
                 control = read_json(directory / "control.json", {})
                 budget = control.get("timeout_seconds", info.get("timeout_seconds"))
                 if reason is None:
-                    if stop_signal or (directory / "stop_requested").exists():
+                    if (directory / "stop_requested").exists():
                         reason = "stopped"
+                    elif stop_signal:
+                        reason = "interrupted"
                     elif budget is not None and now - started >= budget:
                         reason = "timed_out"
                     if reason:
@@ -1003,9 +1105,12 @@ def run_child(directory):
             child_signal(signal.SIGKILL)
         if reader:
             reader.join(timeout=2)
+        if journal:
+            journal.end(info["id"])
         with run_lock(directory):
             # Explicit cancellation wins a race with an otherwise normal exit.
-            reason = reason or ("stopped" if stop_signal or (directory / "stop_requested").exists() else None)
+            reason = reason or ("stopped" if (directory / "stop_requested").exists() else
+                                "interrupted" if stop_signal else None)
             info.update(status=reason or "exited", ended_at=sapper.now_iso(), exit_code=rc)
             if reason:
                 info["stop_reason"] = reason
@@ -1019,6 +1124,8 @@ def run_child(directory):
 class WebServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # A page requests many scripts/styles concurrently, including after reload.
+    request_queue_size = 64
 
     def __init__(self, address, console, public_url="", prefix=""):
         self.console = console
@@ -1184,10 +1291,12 @@ class Handler(BaseHTTPRequestHandler):
                         if action == "inspect":
                             return self.reply(200, app.workspaces.inspect(wid))
                         if action == "agents":
-                            return self.reply(200, {"agents": app.workspaces.agents(wid), "services": app.workspaces.services(wid)})
+                            return self.reply(200, app.workspace_status(wid))
                         if action == "role-prompt":
                             scope = [item for item in q("scope").split(",") if item] or None
                             return self.reply(200, app.workspaces.role_info(wid, q("role") or "worker", scope))
+                        if action == "chat":
+                            return self.reply(200, app.workspaces.chat_view(wid, q("before") or None, q("agent_id") or None))
                     elif method == "POST":
                         data = self.body()
                         if action == "role-models":
@@ -1200,6 +1309,10 @@ class Handler(BaseHTTPRequestHandler):
                             return self.reply(200, app.workspaces.save_settings(wid, data))
                         if action == "sessions":
                             return self.reply(201, app.workspaces.create_session(wid, data))
+                        if action == "dispatch":
+                            return self.reply(201, app.workspaces.dispatch(wid, data))
+                        if action == "chat":
+                            return self.reply(201, app.workspaces.chat_message(wid, data))
                         if action == "attach":
                             return self.reply(200, app.workspaces.attach(wid, data))
                         if action == "watchdog":

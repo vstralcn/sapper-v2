@@ -21,13 +21,14 @@ import sapper_roles
 from sapper_web import Console, WebServer, WebError
 from sapper_workspace import WorkspaceError, START_MARK
 from sapper_terminal import TerminalBridge
+from sapper_chat import ChatJournal
 
 FIXTURE = r'''#!/usr/bin/env python3
 import json,os,sys,subprocess,signal,time
 from pathlib import Path
 args=sys.argv[1:]
 if '--help' in args:
-    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt --init-only')
+    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt --input-format --replay-user-messages --init-only')
     raise SystemExit(0)
 if '--version' in args:
     print('2.1.318 (fixture)')
@@ -89,7 +90,7 @@ from datetime import datetime,timezone
 from pathlib import Path
 args=sys.argv[1:]
 if '--help' in args:
-    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt')
+    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt --input-format --replay-user-messages')
     raise SystemExit(0)
 if '--version' in args:
     print('2.1.318 (fixture)')
@@ -239,10 +240,11 @@ class WorkspaceBindingTests(unittest.TestCase):
         other_dir = self.question.parent / "other-preview"
         other_dir.mkdir()
         other = self.app.workspaces.bind({"path": str(other_dir), "goal": "other"})
-        preview = self.app.workspaces.role_info(current["id"], "commander", [current["id"], other["id"]])
-        self.assertIn(f"other-preview={other['id']}", preview["prompt"])
-        with self.assertRaises(WorkspaceError):
-            self.app.workspaces.role_info(current["id"], "general", [current["id"], other["id"]])
+        for role in ("commander", "general", "worker"):
+            with self.assertRaisesRegex(WorkspaceError, "当前工作区"):
+                self.app.workspaces.role_info(current["id"], role, [current["id"], other["id"]])
+        preview = self.app.workspaces.role_info(current["id"], "commander")
+        self.assertNotIn(other['id'], preview["prompt"])
 
     def test_enable_preserves_user_content_and_is_idempotent(self):
         claude = self.question / "CLAUDE.md"
@@ -370,6 +372,26 @@ class NativeWorkspaceTests(unittest.TestCase):
         reloaded = Console(self.app.root, self.app.state, self.socket, workspace_roots=[self.question.parent], claude_bin=str(self.bin))
         self.assertEqual(len([a for a in reloaded.workspaces.agents(self.pid) if a.get("pane_id")]), 2)
 
+    def test_worker_status_reads_native_phases_without_scheduling_or_rewriting_history(self):
+        self.bin.write_text(COMMANDER_FIXTURE)
+        run = self.launch()
+        agent = self.app.workspaces.agent(run["agent_id"])
+        path = self.app.workspaces.commander.transcript(agent)
+        original = path.read_bytes()
+        self.assertEqual(self.app.workspaces.agents(self.pid)[0]["execution_observation"]["phase"], "idle")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(self.app.workspaces.commander.path(agent["id"]).exists())
+        event = {"type":"assistant", "sessionId":agent["claude_session_id"], "timestamp":sapper.now_iso(),
+                 "message":{"content":[{"type":"tool_use", "id":"ask", "name":"AskUserQuestion"}]}}
+        encoded = json.dumps(event) + "\n"
+        with path.open("a") as file:
+            file.write(encoded[:20])
+        self.assertEqual(self.app.workspaces.agents(self.pid)[0]["execution_observation"]["phase"], "unknown")
+        with path.open("a") as file:
+            file.write(encoded[20:])
+        self.assertEqual(self.app.workspaces.agents(self.pid)[0]["execution_observation"]["phase"], "waiting_user")
+        self.assertEqual(self.app.workspaces.services(self.pid), [])
+
     def test_idle_commander_wakes_in_place_and_crash_resumes_with_verified_board(self):
         self.bin.write_text(COMMANDER_FIXTURE)
         os.environ['CLAUDE_CONFIG_DIR'] = str(self.base / 'native-transcripts')
@@ -411,7 +433,7 @@ class NativeWorkspaceTests(unittest.TestCase):
         rid, aid = run["id"], run["agent_id"]
         self.until(lambda: self.app.run_info(rid)["status"] == "timed_out")
         self.until(lambda: self.app.tmux("has-session", "-t", run["session"]).returncode != 0)
-        self.app.workspaces.start_watchdog(self.pid)
+        self.launch(role="commander")
         time.sleep(3.2)
         self.assertEqual(self.app.workspaces.agent(aid)["run_ids"], [rid])
         self.assertEqual((self.question / "outputs" / aid).read_text(), "read this original question")
@@ -429,13 +451,14 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.assertEqual(calls[-1]["argv"][calls[-1]["argv"].index("--output-format") + 1], "stream-json")
         self.assertIn("--verbose", calls[-1]["argv"])
 
-    def test_worker_entry_extends_print_budget_and_messages_use_original_hints(self):
+    def test_worker_entry_extends_print_budget_and_receives_targeted_orders(self):
         run = self.app.workspaces.create_session(self.pid, {"execution_mode": "print", "mission": "WAIT_FOR_INTERRUPT", "minutes": 1})
         aid = run["agent_id"]
         self.until(lambda: self.app.run_info(run["id"])["activity"].get("last_tool") == "Read")
         result = self.app.workspaces.message(aid, {"text": "preserve current scripts"})
-        self.assertEqual(result["status"], "saved")
-        self.assertIn("preserve current scripts", self.app.graph(self.pid)["hints"][-1]["content"])
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(self.app.graph(self.pid)["hints"], [])
+        self.assertEqual(ChatJournal(self.app.state, aid).inbox()[0]["text"], "preserve current scripts")
         env = {**os.environ, "SAPPER_MODE": "workspace", "SAPPER_WEB_STATE": str(self.app.state),
                "SAPPER_ROOT": str(self.app.root), "SAPPER_TMUX_SOCKET": self.socket,
                "SAPPER_WORKSPACE_ID": self.pid, "SAPPER_CLAUDE_BIN": str(self.bin),
@@ -506,13 +529,13 @@ class NativeWorkspaceTests(unittest.TestCase):
         run = self.launch(role="scout", execution_mode="print")
         self.until(lambda: self.app.run_info(run["id"])["status"] == "exited")
         self.app.workspaces.delete_agent(run["agent_id"])
-        self.app.workspaces.start_watchdog(self.pid)
+        main = self.launch(role="commander")
         time.sleep(3.4)
         record = self.app.workspaces.agent(run["agent_id"], include_deleted=True)
         self.assertEqual(record["desired_state"], "stopped")
         self.assertTrue(record["deleted_at"])
         self.assertEqual(len(record["run_ids"]), 1)
-        self.assertEqual(self.app.workspaces.agents(self.pid), [])
+        self.assertFalse(any(a["id"] == run["agent_id"] for a in self.app.workspaces.agents(self.pid)))
 
     def test_delete_attached_role_keeps_external_terminal_without_rediscovery(self):
         session = "external-delete-fixture"
@@ -533,6 +556,11 @@ class NativeWorkspaceTests(unittest.TestCase):
         scout = self.until(completed_child)
         self.assertEqual(scout["role"], "scout")
         self.assertEqual(scout["execution_mode"], "print")
+        outputs = [json.loads(line) for line in (self.base / "hook-results.jsonl").read_text().splitlines()]
+        commander_hook = next(row["output"] for row in outputs if row["agent"] == commander["agent_id"])
+        scout_hook = next(row["output"] for row in outputs if row["agent"] == scout["id"])
+        self.assertIn("[Sapper 指挥官职责", commander_hook)
+        self.assertNotIn("[Sapper 指挥官职责", scout_hook)
         self.assertNotEqual(scout["cwd"], str(self.question))
         self.assertEqual((Path(scout["cwd"]) / ".sapper").resolve(), self.question / ".sapper")
         self.assertEqual((Path(scout["cwd"]) / "CLAUDE.md").read_text(), "@../../CLAUDE.md\n")
@@ -562,13 +590,34 @@ class NativeWorkspaceTests(unittest.TestCase):
 
     def test_watchdog_does_not_restart_explicitly_stopped_agent(self):
         run = self.launch(role="general")
-        self.app.workspaces.start_watchdog(self.pid)
-        self.assertEqual(len(self.app.workspaces.agents(self.pid)), 1)
+        self.launch(role="commander")
+        self.assertEqual(len(self.app.workspaces.agents(self.pid)), 2)
         self.app.workspaces.stop_agent(run["agent_id"])
         time.sleep(3.4)
         record = self.app.workspaces.agent(run["agent_id"])
         self.assertEqual(record["desired_state"], "stopped")
         self.assertEqual(len(record["run_ids"]), 1)
+
+    def test_new_commander_survives_a_paused_historical_commander(self):
+        old = self.launch(role="commander")
+        self.app.workspaces.stop_agent(old["agent_id"])
+        self.app.workspaces.commander.configure(old["agent_id"], "paused", "历史会话已停止")
+        profile = self.app.save_profile({"name":"lv-glm-fixture", "model":"fixture-model", "api_key":"fixture-only"})
+        self.app.save_role_models({"assignments":{"commander":profile["id"]},
+            "expected_revision":self.app.role_models()["revision"]}, self.pid)
+        request = {"role":"commander", "new_session":True, "request_id":str(uuid.uuid4())}
+        run = self.app.workspaces.dispatch(self.pid, request)
+        self.until(lambda: "NATIVE_READY" in self.app.log(run["id"])["text"])
+        service = next(s for s in self.app.workspaces.services(self.pid) if s["status"] in ("starting", "running"))
+        self.until(lambda: run["agent_id"] in self.app.log(service["run_id"])["text"])
+        self.assertEqual(self.app.workspaces.dispatch(self.pid, request)["id"], run["id"])
+        with self.assertRaisesRegex(WorkspaceError, "仍在运行"):
+            self.app.workspaces.dispatch(self.pid, {"role":"commander", "new_session":True})
+        time.sleep(13)  # Past the companion's startup grace and two watchdog sweeps.
+        self.assertEqual(self.app.run_info(run["id"])["status"], "running")
+        self.assertEqual(self.app.run_info(service["run_id"])["status"], "running")
+        self.assertEqual(self.app.workspaces.agent(run["agent_id"])["profile_id"], profile["id"])
+        self.assertEqual(self.app.workspaces.agent(old["agent_id"])["desired_state"], "stopped")
 
     def test_model_change_requires_explicit_new_session(self):
         profile = self.app.save_profile({"name": "one", "model": "fixture-v1"})
@@ -631,26 +680,20 @@ class NativeWorkspaceTests(unittest.TestCase):
         other.mkdir()
         p = self.app.workspaces.bind({"path": str(other)})
         self.app.workspaces.enable(p["id"], {})
-        commander = self.launch(role="commander", workspace_scope=[self.pid, p["id"]])
+        with self.assertRaisesRegex(WorkspaceError, "当前工作区"):
+            self.launch(role="commander", workspace_scope=[self.pid, p["id"]])
+        commander = self.launch(role="commander")
         first = self.launch()
-        with mock.patch.dict(os.environ, {"SAPPER_MAX_WORKERS": "1"}):
-            with self.assertRaises(WorkspaceError):
-                self.app.workspaces.create_session(p["id"], {"parent_agent_id": commander["agent_id"]})
         basis = self.app.store(p["id"]).add_fact("other workspace input", "test")["id"]
-        second = self.app.workspaces.create_session(p["id"], {"mission": "other", "from": basis, "parent_agent_id": commander["agent_id"]})
+        with self.assertRaisesRegex(WorkspaceError, "不属于"):
+            self.app.workspaces.create_session(p["id"], {"mission": "other", "from": basis, "parent_agent_id": commander["agent_id"]})
+        second = self.app.workspaces.create_session(p["id"], {"mission": "other"})
         self.until(lambda: "NATIVE_READY" in self.app.log(second["id"])["text"])
         self.app.workspaces.stop_workspace(self.pid)
         self.assertEqual(self.app.run_info(first["id"])["status"], "stopped")
-        self.assertEqual(self.app.workspaces.agent(commander["agent_id"])["workspace_scope"], [p["id"]])
-        self.assertFalse(any(a["id"] == commander["agent_id"] for a in self.app.workspaces.agents(self.pid)))
-        self.assertEqual(self.app.tmux("has-session", "-t", second["session"]).returncode, 0)
-        with self.assertRaises(WorkspaceError):
-            self.app.workspaces.create_session(self.pid, {"parent_agent_id": commander["agent_id"]})
-        self.assertEqual(len(self.app.store(self.pid).list_facts()), 1)
-        self.assertEqual(len(self.app.store(p["id"]).list_facts()), 2)
-        self.app.workspaces.stop_workspace(p["id"])
         self.assertEqual(self.app.workspaces.agent(commander["agent_id"])["desired_state"], "stopped")
-        self.assertEqual(self.app.run_info(second["id"])["status"], "stopped")
+        self.assertEqual(self.app.tmux("has-session", "-t", second["session"]).returncode, 0)
+        self.assertEqual(self.app.workspaces.agent(second["agent_id"])["desired_state"], "running")
 
     def test_authenticated_terminal_http_and_sse_reconnect(self):
         run = self.launch()

@@ -23,6 +23,7 @@
 
 | 文档 | 内容 |
 | --- | --- |
+| [终端、文件与 Agent 状态](./17-main-agent-chat.md) | 工作区默认终端、全部角色状态、原生交互与精确恢复 |
 | [Agent MCP、Skills 与会话存储](./16-agent-resources.md) | Web 资源选择、会话隔离、API Key 启动与精确恢复 |
 | [角色与协作拓扑](./15-agent-topology.md) | 实时拓扑、状态依据、分组交互、布局稳定性与验证 |
 | [产品需求与交互](./01-product-requirements.md) | 网页管理范围、操作语义、保留能力与验收 |
@@ -58,7 +59,7 @@ Web 新建角色加载 `sapper-native-roles/4`：Commander 按原 4.6／4.10 条
 
 原 CLI 保留解题循环与图格式；增加 `web` 入口及显式受管环境下的上下文追加，没有迁移数据或替换工具集合。原 worker／watchdog 默认分支保留，新本地分支仅由 `SAPPER_MODE=workspace` 启用。真实 hooks 已修复并加入子进程回归。
 
-启动：`python3 lib/sapper.py web`，在 `http://127.0.0.1:8766/` 使用 `.sapper-web/token` 中的口令登录。详见[启动与使用](./05-running.md)。
+启动：`./sapperctl start`，在 `http://127.0.0.1:8766/` 使用 `.sapper-web/token` 中的口令登录。前台运行及服务管理详见[启动与使用](./05-running.md)。
 
 终端已增加 xterm.js 与原 tmux PTY 流式输出、完整输入、尺寸调整、断线续传；不替换既有外部输出订阅。此前 79 项回归及真实 Claude 会话验证已通过；最新原生功能回归与真实 `auto` 验收见[覆盖说明](./09-native-capability-coverage.md)。Linux／HTTPS、Docker 构建及任意供应商兼容性仍未实测。
 

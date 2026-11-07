@@ -17,6 +17,7 @@ import time
 import uuid
 
 import sapper
+from sapper_chat import native_transcript
 from sapper_context import atomic_private
 
 IDLE_SECONDS = 60
@@ -98,7 +99,7 @@ class CommanderMonitor:
             raise sapper.FGError("状态说明必须为最多 1000 字符的文本")
         with self.manager.lifecycle():
             agent = self.manager.agent(aid)
-            if agent["role"] != "commander" or agent.get("legacy") or agent.get("execution_mode") != "tui":
+            if agent["role"] != "commander" or agent.get("legacy") or agent.get("execution_mode") not in ("tui", "chat"):
                 raise sapper.FGError("仅支持受管指挥官的续轮控制")
             with self.locked(aid) as data:
                 data.update(control=control, reason=reason)
@@ -109,13 +110,11 @@ class CommanderMonitor:
         return self.view(aid)
 
     def transcript(self, agent):
-        sid = agent.get("claude_session_id", "")
-        if not re.fullmatch(r"[a-f0-9-]{36}", sid):
-            return None
-        root = Path(agent.get("claude_config_dir") or os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
-        # UUID is authoritative. Never use the newest session in a directory.
-        paths = list(root.glob("*/" + sid + ".jsonl"))
-        return paths[0] if len(paths) == 1 else None
+        if agent.get("execution_mode") == "chat":
+            from sapper_chat import ChatJournal
+            path = ChatJournal(self.app.state, agent["id"]).events
+            return path if path.is_file() else None
+        return native_transcript(agent)
 
     def observe(self, agent, data):
         path = self.transcript(agent)
@@ -153,9 +152,17 @@ class CommanderMonitor:
     def event(self, agent, data, event):
         if not isinstance(event, dict) or event.get("isSidechain"):
             return
+        if event.get("runId", agent.get("run_id")) != agent.get("run_id"):
+            return
         if event.get("sessionId", agent["claude_session_id"]) != agent["claude_session_id"]:
             return
         kind = event.get("type")
+        if kind == "result" and agent.get("execution_mode") == "chat":
+            data.update(phase="idle", idle_since=timestamp(event.get("timestamp")), tools={})
+            return
+        if kind == "control_request" and agent.get("execution_mode") == "chat":
+            data["phase"] = "waiting_user"
+            return
         if kind not in ("user", "assistant"):
             return
         at = timestamp(event.get("timestamp"))
@@ -213,7 +220,7 @@ class CommanderMonitor:
                 data["phase"] = "responding"
 
     def event_signature(self, agent, rows):
-        scope = agent.get("workspace_scope", [agent["workspace_id"]])
+        scope = [agent["workspace_id"]]
         items = [(a["id"], a.get("run_id"), a.get("status")) for a in rows
                  if a.get("parent_agent_id") == agent["id"]]
         for wid in scope:
@@ -265,13 +272,13 @@ class CommanderMonitor:
             if row and row.get("run_id") != agent.get("run_id"):
                 return  # A concurrent manual resume replaced this snapshot.
             if (agent.get("desired_state") != "running" or agent.get("legacy")
-                    or agent.get("execution_mode") != "tui"):
+                    or agent.get("execution_mode") not in ("tui", "chat")):
                 return
             with self.locked(aid) as data:
                 self.observe(agent, data)
                 if data.get("control") != "active":
                     return
-                scope = agent.get("workspace_scope", [agent["workspace_id"]])
+                scope = [agent["workspace_id"]]
                 if scope and all(self.app.project(w)["status"] == "completed" for w in scope):
                     data.update(control="completed", reason="关联工作区均已完成")
                     return
@@ -310,11 +317,12 @@ class CommanderMonitor:
                         return
                     # Never overwrite an unfinished user input line. Transcript
                     # evidence determines idleness; the pane is only a send guard.
-                    pane = self.app.capture(row["pane_id"])["text"]
-                    prompts = re.findall(r"^\s*❯(.*)$", pane, re.M)
-                    if not prompts or prompts[-1].strip():
-                        data["attention"] = "等待空闲输入框；未发送或重启"
-                        return
+                    if agent.get("execution_mode") != "chat":
+                        pane = self.app.capture(row["pane_id"])["text"]
+                        prompts = re.findall(r"^\s*❯(.*)$", pane, re.M)
+                        if not prompts or prompts[-1].strip():
+                            data["attention"] = "等待空闲输入框；未发送或重启"
+                            return
                     token = uuid.uuid4().hex
                     data["wake"] = {"id": token, "run_id": run["id"], "sent_at": now,
                                     "attempt": wake.get("attempt", 0) + 1 if pending else 1,
@@ -322,7 +330,11 @@ class CommanderMonitor:
                     data.update(verification="wake_sent", event_signature=signature)
                     # Persist before input can execute board in a separate process.
                     atomic_private(self.path(aid), data)
-                    self.app.send(row["pane_id"], {"text": self.prompt(token)})
+                    if agent.get("execution_mode") == "chat":
+                        from sapper_chat import ChatJournal
+                        ChatJournal(self.app.state, aid).enqueue(self.prompt(token), internal=True)
+                    else:
+                        self.app.send(row["pane_id"], {"text": self.prompt(token)})
                     self.app.audit("commander.wake_sent", agent=aid, wake=token)
                     return
             # Crash recovery is separate from healthy-process wakeup.
