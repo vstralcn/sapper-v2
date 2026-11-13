@@ -229,6 +229,11 @@ The console's "facts & intents" form accepts the same three fields, and the
 record detail view shows the source, commands and artifact digests. Artifact
 rules match the CLI: inside the project directory, no symlinks, 64 MiB each.
 
+Graph output and prompts only add an `[ev]` tag per provenance-backed fact;
+`sapper show fact <id>` prints the full source, commands and artifact digests.
+That keeps a few hundred evidenced facts from multiplying the reason/explore
+prompt (measured at roughly +3% for 200 facts).
+
 Target responses and artifacts remain untrusted data. Command arguments can
 contain credentials — do not write API keys, passwords, or tokens into
 reproduction commands.

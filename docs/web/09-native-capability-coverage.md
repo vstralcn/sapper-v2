@@ -69,6 +69,8 @@ Web 受管 `view` 继续导出／服务 HTML，但不会在服务器上自动弹
 
 工作区角色的基础提示词（`sapper-native-roles/6`）也写入了这三个参数与凭据禁忌；新建角色和显式恢复的角色自动获得，运行中的旧角色不被热改。
 
+图与提示词里，带证据的事实只加一个 `[ev]` 标记，命令与哈希用 `sapper show fact <id>` 读取。这是按实测定的：如果每条事实都内联来源／命令／工件，200 条事实的 reason prompt 会从 31 KB 涨到 77 KB（+147%）；改成标记后只 +3%。
+
 `family` 表单提供 `add/list/show/metric/spend/budget/decide`。族状态、同族最多两个开放意图、尝试预算、手工记账 USD 预算与无改善止损都在原 Store 内判断：族进入 parked／solved／ruled_out／need_human 后，同族新意图和原生派发会被拒绝，网页没有绕过这些门槛的参数。恢复或调整预算需要显式理由；成本只按实际账单手工登记，不做 token 估算，也不为解法族另建第二套 API。
 
 ## 兼容修正

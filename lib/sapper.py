@@ -1428,6 +1428,17 @@ def _hint_brief(h: dict) -> dict:
     return {"id": h["id"], "creator": h["creator"], "content": h["content"]}
 
 
+def _evidence_marker(fact: dict) -> str:
+    """Tag a prompt line when the fact carries recorded provenance.
+
+    Commands and artifact digests stay out of prompts on purpose: a graph where
+    every fact has evidence would otherwise multiply every reason/explore
+    prompt. `sapper show fact <id>` and the node doc carry the detail, the same
+    way `doc` itself is not inlined.
+    """
+    return " [ev]" if fact.get("evidence") else ""
+
+
 def _to_yaml_like(g: dict) -> str:
     """Compact human-readable dump of the graph for prompts.
     Shows title + description (the two summary layers) but NOT `doc` — the
@@ -1445,15 +1456,7 @@ def _to_yaml_like(g: dict) -> str:
             pairs = " ".join(f"{k}={_prompt_inline(str(v))}" for k, v in f["data"].items())
             data = f" {{{pairs}}}"
         has_doc = " (has doc)" if f.get("doc") else ""
-        evidence = f.get("evidence") or {}
-        evidence_parts = []
-        if evidence.get("source"):
-            evidence_parts.append("source=" + _prompt_inline(evidence["source"])[:120])
-        for item in (evidence.get("reproduction") or [])[:2]:
-            evidence_parts.append("repro=" + _prompt_inline(item.get("command", ""))[:160])
-        for item in (evidence.get("artifacts") or [])[:3]:
-            evidence_parts.append("artifact=" + item.get("sha256", "")[:16] + ":" + _prompt_inline(item.get("path", ""))[:100])
-        evidence_text = " [evidence: " + "; ".join(evidence_parts) + "]" if evidence_parts else ""
+        evidence_text = _evidence_marker(f)
         lines.append(
             f"  - {f['id']}: {kind}{title}{_prompt_inline(f['description'])}{data}{src}{has_doc}{evidence_text}"
         )
@@ -1479,7 +1482,9 @@ def _to_yaml_like(g: dict) -> str:
             )
     lines.append(
         "note: nodes marked (has doc) carry a detailed layer — read it with "
-        "`sapper doc <id>` when you need the full context."
+        "`sapper doc <id>` when you need the full context. Facts marked [ev] have "
+        "recorded provenance; `sapper show fact <id>` prints the source, commands "
+        "and artifact digests."
     )
     return "\n".join(lines)
 
@@ -3248,6 +3253,8 @@ def _agents_system_prompt(store: Store) -> str:
         "For reproducible claims, include --repro-command with the exact command; "
         "attach small raw outputs with --artifact. These options only record evidence; "
         "they do not execute the command. Never record API keys or credentials in commands/artifacts. "
+        "Facts marked [ev] in the graph have provenance on file: run `sapper show fact <id>` "
+        "for the exact command and artifact digests before repeating that work. "
         "Cite exact commands, hosts/ports, response evidence. Stay scoped to the "
         "assigned intent and the authorized targets. Capture flags immediately; "
         "harvest credentials/loot as you find them.\n\n"

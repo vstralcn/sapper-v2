@@ -207,6 +207,10 @@ text and never executed; artifacts must be regular files inside the project
 directory and are content-addressed under `.sapper/artifacts/<sha256>` (64 MiB
 cap). Record the command you actually ran, and keep credentials out of it.
 
+Graph output and prompts tag an evidenced fact with `[ev]` only; run
+`sapper show fact <id>` to read the source, commands and artifact digests. That
+is deliberate: inlining every command would multiply the reason/explore prompt.
+
 `sapper family add|list|show|metric|spend|budget|decide` tracks one mechanism
 hypothesis behind a numeric metric, attempt budget, and hand-recorded USD spend.
 A family parks itself on stall or budget exhaustion, and only an explicit

@@ -100,6 +100,9 @@ Reject only when execution would be clearly inappropriate:
 ```
 {graph_yaml}
 ```
+Facts tagged `[ev]` carry recorded provenance (source, reproduction commands,
+artifact digests). This block shows only the tag to stay compact; read the
+detail with `sapper show fact <id>` before redoing or duplicating that work.
 
 ## Valid fact ids
 ```
