@@ -164,6 +164,7 @@ function recordNode(record, intent) {
   const top = element("div", "record-top");
   top.append(element("span", "node-id", record.id));
   if (record.kind) top.append(element("span", "kind-label", record.kind));
+  if (record.evidence) top.append(element("span", "kind-label", "证据"));
   if (intent) top.append(element("span", "badge" + (record.to ? " neutral" : ""), record.to ? "已结束" : record.requires_confirmation && !record.confirmed_at ? "待确认" : "待执行"));
   node.append(top, element("div", "record-title", record.title || record.description));
   if (record.title) node.append(element("p", "record-description", record.description));
@@ -184,11 +185,22 @@ function recordNode(record, intent) {
   node.addEventListener("keydown", event => { if (event.key === "Enter") openDetail(record); });
   return node;
 }
+function evidenceText(evidence) {
+  if (!evidence) return "";
+  const lines = [];
+  if (evidence.source) lines.push(`证据来源：${evidence.source}`);
+  for (const item of evidence.reproduction || []) lines.push(`复现命令：${item.command}${item.cwd ? "（" + item.cwd + "）" : ""}`);
+  for (const item of evidence.artifacts || []) lines.push(`工件：${String(item.sha256 || "").slice(0, 16)} · ${item.path} · ${item.size} 字节`);
+  return lines.join("\n");
+}
 function openDetail(record) {
   state.detail = record;
   $("detail-title").textContent = record.title || record.id;
   $("detail-meta").textContent = `${record.id} · ${record.creator} · ${time(record.created_at)}`;
   $("detail-description").textContent = record.description;
+  const evidence = evidenceText(record.evidence);
+  $("detail-evidence").textContent = evidence;
+  $("detail-evidence").hidden = !evidence;
   $("detail-doc").value = record.doc || "";
   $("detail-dialog").showModal();
 }
@@ -199,6 +211,7 @@ function openRecord(action) {
   $("record-from-label").hidden = action !== "intent";
   $("record-confirm-label").hidden = action !== "intent";
   $("record-kind-label").hidden = action !== "fact";
+  for (const id of ["record-evidence-source-label", "record-repro-label", "record-artifact-label"]) $(id).hidden = action !== "fact";
   $("record-from").replaceChildren(...state.graph.facts.filter(f => f.id !== "goal").map(f => {
     const option = element("option", "", `${f.id} · ${f.title || f.description}`);
     option.value = f.id;
@@ -467,10 +480,16 @@ submit("record-form", async data => {
   payload.from = data.getAll("from");
   payload.requires_confirmation = data.has("requires_confirmation");
   if (!payload.kind) delete payload.kind;
+  const lines = name => String(payload[name] || "").split("\n").map(line => line.trim()).filter(Boolean);
+  const commands = lines("repro_commands");
+  const artifacts = lines("artifacts");
+  if (commands.length) payload.repro_commands = commands; else delete payload.repro_commands;
+  if (artifacts.length) payload.artifacts = artifacts; else delete payload.artifacts;
+  if (!String(payload.evidence_source || "").trim()) delete payload.evidence_source;
   await taskApi(action, {method: "POST", body: payload});
   $("record-dialog").close();
   await refreshTask();
-  toast("已通过原接口保存记录");
+  toast(commands.length || artifacts.length || payload.evidence_source ? "已保存记录与证据" : "已通过原接口保存记录");
 });
 submit("terminal-form", async () => {
   const pane = $("pane-select").value;

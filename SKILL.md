@@ -153,6 +153,11 @@ sapper confirm i007                                            # approve gated w
 sapper claim i003 --worker alice                                # reserve an intent
 sapper release i003 --worker alice                              # release your reservation
 sapper hint "check the middleware order"                       # message commander
+sapper fact "..." --repro-command 'curl -i http://127.0.0.1/' --artifact out.txt
+                                                               # record provenance (never executed)
+sapper family add parser --hypothesis "length check bypass" \
+  --metric-name valid_inputs --budget-attempts 8 --budget-usd 8  # bounded solution family
+sapper intent --from f001 --family parser "test parser diff"   # at most 2 open per family
 sapper peers --discover                                        # list tmux panes
 sapper peers --add harley --target api-6:0.0                   # authorize a peer
 sapper send harley "status?"                                   # send + log message
@@ -161,8 +166,9 @@ sapper teardown [--purge]                                      # opt-out THIS pr
 ```
 
 Run `sapper validate` before autonomous dispatch or before committing graph data.
-It checks node schemas, fact dependencies, intent results, source links, and
-whether the project status agrees with a goal edge. A `--confirm` intent is
+It checks node schemas, fact dependencies, intent results, source links, artifact
+presence/size/SHA-256, family attempt links, and whether the project status agrees
+with a goal edge. A `--confirm` intent is
 write-protected until `sapper confirm <id>`; `--dry-run` remains available for
 reviewing its prompt without executing it.
 
@@ -192,6 +198,26 @@ Click a node or edge-label for a detail panel; drag to pan, scroll to zoom.
 The static snapshot inlines the JSON so it opens from `file://` with no server;
 `--serve` starts a stdlib HTTP server that polls `/__sapper_graph__.json` and
 redraws on change — keep it open in a window while you work.
+
+### evidence / family — provenance and bounded exploration
+
+`sapper fact` and `sapper done` accept `--evidence-source`, repeatable
+`--repro-command`, and repeatable `--artifact`. Commands are stored verbatim as
+text and never executed; artifacts must be regular files inside the project
+directory and are content-addressed under `.sapper/artifacts/<sha256>` (64 MiB
+cap). Record the command you actually ran, and keep credentials out of it.
+
+Graph output and prompts tag an evidenced fact with `[ev]` only; run
+`sapper show fact <id>` to read the source, commands and artifact digests. That
+is deliberate: inlining every command would multiply the reason/explore prompt.
+
+`sapper family add|list|show|metric|spend|budget|decide` tracks one mechanism
+hypothesis behind a numeric metric, attempt budget, and hand-recorded USD spend.
+A family parks itself on stall or budget exhaustion, and only an explicit
+`sapper family decide <key> --state probing --rationale "..."` brings it back.
+Metric facts must be provenance-backed and named
+(`--data metric=7 --data metric_name=valid_inputs`). Prompts receive only a
+bounded family summary — never the full attempt history.
 
 ### dispatch — spawn a Sonnet agent step
 

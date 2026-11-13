@@ -209,7 +209,60 @@ docker run -d --name sapper ... sapper:latest
 Single-graph operation, the fact-intent CLI, and multi-challenge sweeps:
 see [SKILL.md](SKILL.md).
 
-## 7. Safety & Responsibility: The Taggant Proposal
+## 7. Evidence Provenance & Reproduction
+
+`fact` and `done` can carry a source, raw artifacts, and reproduction commands.
+Commands are stored verbatim as text and are never executed by Sapper. Artifacts
+must be regular files inside the current project directory; they are copied to
+`.sapper/artifacts/<sha256>`, capped at 64 MiB each.
+
+```bash
+sapper fact "service returned HTTP 200" -k service \
+  --evidence-source "authorized local lab" \
+  --repro-command 'curl -i http://127.0.0.1/' \
+  --artifact evidence/response.txt
+
+sapper validate  # checks graph plus artifact presence, size and SHA-256
+```
+
+The console's "facts & intents" form accepts the same three fields, and the
+record detail view shows the source, commands and artifact digests. Artifact
+rules match the CLI: inside the project directory, no symlinks, 64 MiB each.
+
+Graph output and prompts only add an `[ev]` tag per provenance-backed fact;
+`sapper show fact <id>` prints the full source, commands and artifact digests.
+That keeps a few hundred evidenced facts from multiplying the reason/explore
+prompt (measured at roughly +3% for 200 facts).
+
+Target responses and artifacts remain untrusted data. Command arguments can
+contain credentials — do not write API keys, passwords, or tokens into
+reproduction commands.
+
+## 8. Solution-Family Portfolio & Stop-Loss
+
+Group intents that test one mechanism hypothesis into a family, with a
+measurable metric, attempt budget, and manually accounted spend:
+
+```bash
+sapper family add parser --label "Parser differential" \
+  --hypothesis "length validation differs across parser states" \
+  --metric-name valid_inputs --direction higher \
+  --budget-attempts 8 --budget-usd 8 --stall-limit 3
+sapper intent --from f001 --family parser "test parser differential"
+# a metric fact needs --data metric=N --data metric_name=valid_inputs plus provenance
+sapper family spend parser --amount 0.50 --note "worker/API spend from run log"
+sapper family show parser
+sapper family decide parser --state probing --rationale "reviewed new falsifiable test"
+```
+
+At most two intents of one family stay open at a time. A family parks itself
+after the stall limit passes without verified metric improvement, or after the
+attempt or manually recorded USD budget is exhausted; resuming or entering a
+terminal state requires an explicit rationale. Cost is never guessed or inferred
+from token counts — record the real bill. Only a bounded family summary is
+injected into the reason prompt, never the full attempt history.
+
+## 9. Safety & Responsibility: The Taggant Proposal
 
 Fine offensive tools from past seasons have been abused. Script kiddies used
 to be limited in the harm they could do; with AI, the same open-source tools
@@ -224,7 +277,7 @@ Adversarial assumptions (expert stripping, framing) call for cryptographic
 design, which needs community co-building — our own capacity is limited, so
 join us; we may try to include it in a future release.
 
-## 8. Roadmap & Credits
+## 10. Roadmap & Credits
 
 - **Taggant co-building**: decentralized signatures / redundant multi-channel
   marking / zero-key verification for defenders — discuss in issues

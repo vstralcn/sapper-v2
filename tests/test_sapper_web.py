@@ -1,6 +1,7 @@
 """Web adapter tests. Real CLI/tmux tests use an isolated socket and fake model CLI."""
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
@@ -46,6 +47,55 @@ class ConsoleTests(unittest.TestCase):
         self.app.graph_action(self.pid, "doc", {"id": fact["id"], "doc": "evidence", "expected_doc": None})
         with self.assertRaises(sapper.FGError):
             self.app.graph_action(self.pid, "doc", {"id": fact["id"], "doc": "stale", "expected_doc": None})
+
+    def test_graph_actions_record_evidence_without_executing_commands(self):
+        root = Path(self.app.project(self.pid)["path"])
+        (root / "response.txt").write_text("HTTP/1.1 200 OK\n", encoding="utf-8")
+        digest = hashlib.sha256((root / "response.txt").read_bytes()).hexdigest()
+        fact = self.app.graph_action(self.pid, "fact", {
+            "description": "endpoint answered 200", "kind": "service",
+            "evidence_source": "authorized local lab",
+            "repro_commands": ["curl -i http://127.0.0.1/", "   "],
+            "artifacts": ["response.txt"],
+        })
+        evidence = fact["evidence"]
+        self.assertEqual(evidence["source"], "authorized local lab")
+        self.assertEqual([c["command"] for c in evidence["reproduction"]], ["curl -i http://127.0.0.1/"])
+        self.assertEqual(evidence["reproduction"][0]["cwd"], str(root.resolve()))
+        artifact = evidence["artifacts"][0]
+        self.assertEqual(artifact["sha256"], digest)
+        self.assertEqual(artifact["path"], "artifacts/" + digest)
+        self.assertTrue((self.app.store(self.pid).root / artifact["path"]).is_file())
+        self.assertEqual(sapper.validate_graph(self.app.store(self.pid)), [])
+        self.assertIsNone(self.app.graph_action(self.pid, "fact", {"description": "no provenance"}).get("evidence"))
+        intent = self.app.graph_action(self.pid, "intent", {"from": [fact["id"]], "description": "confirm 200"})
+        self.app.graph_action(self.pid, "claim", {"id": intent["id"], "worker": "web-worker"})
+        done = self.app.graph_action(self.pid, "done", {
+            "id": intent["id"], "description": "replayed the request", "worker": "web-worker",
+            "repro_commands": ["curl -i http://127.0.0.1/"],
+        })
+        self.assertEqual(done["concluded_intent"], intent["id"])
+        self.assertEqual(done["evidence"]["reproduction"][0]["command"], "curl -i http://127.0.0.1/")
+        self.assertEqual(sapper.validate_graph(self.app.store(self.pid)), [])
+
+    def test_graph_action_evidence_rejects_escapes_and_bad_payloads(self):
+        root = Path(self.app.project(self.pid)["path"])
+        outside = self.base / "outside.txt"
+        outside.write_text("private", encoding="utf-8")
+        with self.assertRaisesRegex(WebError, "inside current project"):
+            self.app.graph_action(self.pid, "fact", {"description": "x", "artifacts": [str(outside)]})
+        (root / "escape.txt").symlink_to(outside)
+        with self.assertRaisesRegex(WebError, "symlinks"):
+            self.app.graph_action(self.pid, "fact", {"description": "x", "artifacts": ["escape.txt"]})
+        with self.assertRaisesRegex(WebError, "does not exist"):
+            self.app.graph_action(self.pid, "fact", {"description": "x", "artifacts": ["missing.txt"]})
+        with self.assertRaisesRegex(WebError, "文本列表"):
+            self.app.graph_action(self.pid, "fact", {"description": "x", "repro_commands": "curl -i http://127.0.0.1/"})
+        with self.assertRaisesRegex(WebError, "证据来源必须为文本"):
+            self.app.graph_action(self.pid, "fact", {"description": "x", "evidence_source": ["lab"]})
+        store = self.app.store(self.pid)
+        self.assertEqual([f["id"] for f in store.list_facts()], ["goal"])
+        self.assertEqual(sapper.validate_graph(store), [])
 
     def test_discovery_preserves_existing_graph_and_skips_shared_alias(self):
         path = self.app.root / "existing"
@@ -194,6 +244,30 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.request("/api/logout", "POST", {})[0], 200)
         self.assertEqual(self.request("/api/projects")[0], 401)
 
+    def test_authenticated_fact_action_records_provenance_and_rejects_escapes(self):
+        self.login()
+        p = self.app.create_project({"name": "evidence", "goal": "web evidence fixture"})
+        root = Path(p["path"])
+        (root / "capture.txt").write_text("HTTP/1.1 200 OK\n", encoding="utf-8")
+        body = {"description": "captured 200", "kind": "service", "evidence_source": "local lab",
+                "repro_commands": ["curl -i http://127.0.0.1/"], "artifacts": ["capture.txt"]}
+        status, _, raw = self.request(f"/api/projects/{p['id']}/fact", "POST", body)
+        self.assertEqual(status, 200)
+        fact = json.loads(raw)
+        digest = hashlib.sha256((root / "capture.txt").read_bytes()).hexdigest()
+        self.assertEqual(fact["evidence"]["artifacts"][0]["path"], "artifacts/" + digest)
+        self.assertEqual(fact["evidence"]["reproduction"][0]["command"], "curl -i http://127.0.0.1/")
+        outside = Path(self.temp.name) / "outside.txt"
+        outside.write_text("private", encoding="utf-8")
+        code, _, raw = self.request(f"/api/projects/{p['id']}/fact", "POST",
+                                    {"description": "escape", "artifacts": [str(outside)]})
+        self.assertEqual(code, 400)
+        self.assertIn("inside current project", json.loads(raw)["error"])
+        self.assertEqual(self.request(f"/api/projects/{p['id']}/fact", "POST",
+                                      {"description": "bad", "repro_commands": "curl -i http://127.0.0.1/"})[0], 400)
+        graph = json.loads(self.request(f"/api/projects/{p['id']}/graph")[2])
+        self.assertEqual([f["id"] for f in graph["facts"] if f["id"] != "goal"], [fact["id"]])
+
     def test_web_picker_binds_external_directory_without_startup_options(self):
         question = self.app.root.parent / "external 题目"
         question.mkdir()
@@ -334,7 +408,7 @@ class HttpTests(unittest.TestCase):
         pid = p["id"]
         status, _, raw = self.request("/api/native/catalog")
         self.assertEqual(status, 200)
-        self.assertEqual(len(json.loads(raw)["commands"]), 31)
+        self.assertEqual(len(json.loads(raw)["commands"]), 32)
         body = {"operation": "fact", "values": {"description": "HTTP fixture"}}
         self.assertEqual(self.request(f"/api/native/{pid}/preview", "POST", body, {"X-Sapper-CSRF": "bad"})[0], 403)
         status, _, raw = self.request(f"/api/native/{pid}/preview", "POST", body)
