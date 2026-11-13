@@ -145,7 +145,7 @@ async function reloadExtensionLibrary(preserve = true) {
   if (!workspaceResourcesDirty) $("extensions-selection-status").textContent = "已读取保存的资源选择。";
 }
 function showSettingsTab(tab) {
-  for (const name of ["models", "mcp", "skills", "workspaces"]) {
+  for (const name of ["models", "mcp", "skills", "workspaces", "account"]) {
     const active = name === tab;
     $(`settings-${name}-panel`).hidden = !active;
     const nav = document.querySelector(`[data-settings-tab="${name}"]`);

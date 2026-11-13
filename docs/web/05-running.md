@@ -9,6 +9,7 @@
 在仓库根目录使用管理脚本：
 
 ```bash
+./sapperctl auth-init --username admin  # 首次运行：交互设置管理员密码，至少 6 个字符
 ./sapperctl start      # 后台启动；重复运行会报告已有实例
 ./sapperctl status     # 查看 Web PID、当前 tmux socket 的受管会话数和在线模型桥数
 ./sapperctl restart    # 只重启 Web；任务、watchdog 和模型桥继续运行
@@ -16,15 +17,17 @@
 ./sapperctl stop       # 关闭 Web、当前实例的受管运行（含 watchdog）和模型桥
 ./sapperctl claude-status  # 查看 Claude 用户级后台服务
 ./sapperctl stop-claude    # 显式关闭 Claude transient daemon 及其后台会话
+./sapperctl password-reset --username admin  # 本机重置密码并撤销所有旧登录会话
 ```
 
-macOS、Linux 和 Windows 的 WSL2 内使用相同命令，需让 Python 3.10+、tmux 和 Claude Code 在同一系统环境及用户下可用。Linux 使用 procps 的 `ps`，macOS 识别相对路径启动的旧服务时使用系统 `lsof`。Windows 在 WSL2 的终端里进入仓库目录执行。服务默认只监听本机，日志在所选状态目录的 `web-server.log`，登录口令在 `token` 文件中。
+macOS、Linux 和 Windows 的 WSL2 内使用相同命令，需让 Python 3.10+、tmux 和 Claude Code 在同一系统环境及用户下可用。Linux 使用 procps 的 `ps`，macOS 识别相对路径启动的旧服务时使用系统 `lsof`。Windows 在 WSL2 的终端里进入仓库目录执行。服务默认只监听本机，日志在所选状态目录的 `web-server.log`，账号与会话保存在 `auth.sqlite3` 中。
 
 同一用户从本仓库用默认参数执行的 `python3 lib/sapper.py web` 或 `python3 lib/sapper_web.py` 也能识别。对以前手动指定其他启动参数的服务，请从原入口停止并核对配置后再切换。共享 tmux 服务器上的其他会话、独立原生编队（用 `fleet down` 管理）、外部登记的终端和 Claude 用户级 daemon 各有自己的生命周期。`stop` 只控制本实例创建的任务以及经本状态目录凭据确认的模型桥。`stop-claude` 对应 Claude CLI 的 `daemon stop --any`，会关闭 Claude transient daemon 及其脱离终端运行的会话，影响 Claude 用户级服务，不属于单个 Sapper 实例；它需要单独显式调用。
 
 需要独立实例时，在首次启动指定专用目录、端口和 tmux socket。配置保存在该状态目录的 `sapperctl.json`，以后只需指定同一目录：
 
 ```bash
+./sapperctl auth-init --state "$HOME/.local/state/sapper-lab" --username admin
 ./sapperctl start --state "$HOME/.local/state/sapper-lab" --root "$HOME/sapper-tasks" --port 8877 --tmux-socket sapper-lab
 ./sapperctl stop --state "$HOME/.local/state/sapper-lab"
 ```
@@ -33,11 +36,24 @@ macOS、Linux 和 Windows 的 WSL2 内使用相同命令，需让 Python 3.10+�
 
 题目目录在网页文件夹选择器中点选后直接绑定，可选择执行机上当前服务用户有权限访问的已有目录，无需预先配置允许范围，也不要求复制到 `runs/`。文件夹选择器提供任务根目录、用户主目录、文件系统根目录和已绑定目录入口，支持点击面包屑或“上一级”导航；打开目标文件夹后点击“选择此文件夹”，无需填写路径。默认 `--root` 为仓库 `runs/`，用于新建任务和自动发现；旧参数 `--workspace-root` 继续兼容，作为可选目录快捷入口。Web 私有配置目录及其内部目录仍不能绑定或浏览。
 
-打开 <http://127.0.0.1:8766/>，在另一个终端读取口令并登录：
+打开 <http://127.0.0.1:8766/>，使用初始化时设置的用户名和密码登录。网页“全局设置 → 账号与密码”提供修改密码入口，需输入当前密码；修改或本机重置密码后，所有旧登录会话立即失效。密码输入不回显，不通过命令行参数传递。
+
+前台 CLI 提供相同账号管理入口；自定义实例必须使用相同的 `--state`：
 
 ```bash
-cat .sapper-web/token
+python3 lib/sapper.py web --init-admin --username admin
+python3 lib/sapper.py web --reset-password --username admin
 ```
+
+从旧版升级时需执行一次 `auth-init`。旧 `.sapper-web/token` 文件保留原样，但新版本不再读取或接受它。尚未初始化时，网页提示本机初始化命令，业务接口保持需要登录。
+
+### 账号与 SQLite 存储
+
+当前提供单管理员账号，拥有当前 Web 实例的全部工作区操作权限。`auth.sqlite3` 使用 Python 标准库 SQLite，表包括 `users`（用户名、scrypt 加盐密码哈希与凭据版本）、`sessions`（会话标识的 SHA-256 摘要、CSRF、到期时间）和 `login_attempts`（按来源地址及账号限流的记录）。密码采用 scrypt `N=32768, r=8, p=3`，对应 [OWASP 推荐参数组合](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#scrypt)，无需安装 Python 依赖。
+
+登录会话有效期为 12 小时，Web 重启后在有效期内继续使用。Cookie 带 `HttpOnly`、`SameSite=Strict`；配置 HTTPS `--public-url` 后增加 `Secure`。登录和改密验证合计每个来源地址、每个账号每分钟最多尝试 10 次；计数持久化，重启不会清空。本机密码重置会清除会话及限流记录。
+
+认证数据库文件权限为 600、状态目录权限为 700。备份时可停止 Web 后复制 `auth.sqlite3`，或使用 SQLite 在线备份接口；数据库内包含有效会话和密码哈希，需按凭据保护。既有模型、工作区及 Agent 配置继续使用原 JSON/JSONL，事实图仍由 `.sapper/` 保存。
 
 登录、刷新或点击“总体概览”后先显示所有工作区与运行情况；点击具体工作区后进入文件／终端／角色界面。侧栏“全局上下文”提供全角色共享环境配置。
 
@@ -86,6 +102,8 @@ sapper flag 'flag{...}' -c <平台题目代码> --no-submit  # 本次只记录
 角色卡片的“停止”保留角色供后续恢复；“删除角色”会先停止其受管任务，再从列表和看板移除，watchdog 不再恢复它。文件、运行日志、原生会话历史和共享图记录保留；已有子角色独立保留并可继续运行、恢复。关联多个工作区的角色删除后会在所有关联工作区消失。对于显式接入的外部终端，删除只移除角色登记，终端继续运行并可从终端选择框访问。
 
 网页记录角色来源、父角色、任务、模型、cwd、原生 Claude UUID、run ID 和实际 pane。后台通过原 `worker.sh` 派出的角色同样登记；图贡献按原事实／意图的 creator 展示，详情仍读原图。没有可靠模型事件时只显示“进程存活”，不猜测“思考中／卡死”。
+
+新建或恢复的 worker 使用跳过逐次审批模式，权限审计的来源记录为 `worker_policy`。正在运行的会话需恢复后才会采用新的启动权限，其他角色沿用各自的权限设置。
 
 新建角色使用 `sapper-native-roles/1` 基础职责。Commander 按原版条件执行“4 分钟 scout → 普通 worker／General → 不同角度升级 → 回收”；General 亲自攻坚，并在存在独立侦察、验证或 fuzz 工作时可派最多两个约 5 分钟小队。它不是固定开局人数：已有证据或无独立工作时可以不派发。创建窗口可展开查看实际追加提示词；角色卡显示版本和摘要。正在运行的旧角色不会被热修改，显式恢复后加载当前版本。
 

@@ -33,8 +33,9 @@
       <span class="section-label">连接你的 agent</span>
       <h1>原来的能力，<br>更顺手的工作台。</h1>
       <p>在浏览器查看任务、操作会话、补充信息。你的 agent 继续按原来的方式工作。</p>
-      <label>访问口令<input id="access-token" type="password" autocomplete="current-password" required placeholder="输入启动时生成的访问口令"></label>
-      <p class="field-help">口令保存在服务启动时提示的 <code>.sapper-web/token</code> 文件中。</p>
+      <label>用户名<input id="login-username" name="username" autocomplete="username" maxlength="64" required></label>
+      <label>密码<input id="login-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required></label>
+      <p id="login-help" class="field-help">使用管理员账号登录。忘记密码时，可在服务器本机执行 <code>./sapperctl password-reset</code>。</p>
       <button class="button primary" type="submit">进入工作台 <span aria-hidden="true">↗</span></button>
       <p id="login-error" role="alert" class="error-text"></p>
     </form>
@@ -208,6 +209,7 @@
       <button type="button" data-settings-tab="mcp"><span aria-hidden="true">⌘</span> MCP 服务器 <span id="settings-mcp-count" class="count">0</span></button>
       <button type="button" data-settings-tab="skills"><span aria-hidden="true">▤</span> Skills <span id="settings-skill-count" class="count">0</span></button>
       <p>使用范围</p><button type="button" data-settings-tab="workspaces"><span aria-hidden="true">▱</span> 工作区配置</button>
+      <p>登录管理</p><button type="button" data-settings-tab="account"><span aria-hidden="true">◎</span> 账号与密码</button>
       <div class="settings-nav-note">资源只需添加一次。<br>工作区按需选择，新角色启动时生效。</div>
     </nav><div class="settings-content">
     <section id="settings-models-panel" class="settings-panel" aria-label="全局模型">
@@ -259,6 +261,17 @@
           <form id="extensions-defaults-form"><div id="extensions-default-options"></div><p id="extensions-selection-status" class="field-help" role="status"></p><div class="dialog-actions"><button id="extensions-reload" type="button" class="button">重新读取</button><button class="button primary" type="submit">保存资源选择</button></div></form>
         </section>
       </div>
+    </section>
+    <section id="settings-account-panel" class="settings-panel" aria-label="账号与密码" hidden>
+      <div class="settings-section-heading"><div><h3>账号与密码</h3><p>修改密码后，所有已登录设备都需要重新登录。</p></div></div>
+      <form id="password-form">
+        <label>用户名<input id="account-username" name="username" autocomplete="username" readonly></label>
+        <label>当前密码<input name="current_password" type="password" autocomplete="current-password" maxlength="1024" required></label>
+        <label>新密码<input name="new_password" type="password" autocomplete="new-password" minlength="6" maxlength="1024" required><span class="field-help">至少 6 个字符，可使用长口令。</span></label>
+        <label>确认新密码<input name="confirm_password" type="password" autocomplete="new-password" minlength="6" maxlength="1024" required></label>
+        <p id="password-error" class="error-text" role="alert"></p>
+        <div class="dialog-actions"><button type="submit" class="button primary">修改密码并重新登录</button></div>
+      </form>
     </section>
     <p id="extensions-status" class="settings-status field-help" role="status"></p>
     </div></div>

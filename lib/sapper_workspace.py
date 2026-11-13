@@ -679,8 +679,12 @@ class Workspaces:
         skip_permissions = data.get("skip_permissions", (existing or {}).get("skip_permissions", False))
         if type(skip_permissions) is not bool:
             raise WorkspaceError("skip_permissions 必须为布尔值")
+        if role == "worker":
+            skip_permissions = True
         permissions = permission_audit(data, existing, skip_permissions,
                                        inherited_source=inherited_permission_source)
+        if role == "worker":
+            permissions["permission_source"] = "worker_policy"
         if mode == "chat" and not all(cap.get(k) for k in ("stream_input", "replay_user")):
             raise WorkspaceError("当前 Claude CLI 缺少网页对话所需的结构化输入与消息回执能力", 409)
         parent = (existing or {}).get("parent_agent_id") or data.get("parent_agent_id") or None
@@ -829,6 +833,9 @@ class Workspaces:
                 if existing:
                     continuation = (text(data, "continuation") if "continuation" in data else
                                     "继续原任务。先核对共享图和已保存文件，保留有效成果，从未完成的步骤继续；不要仅因恢复而重复探索。\n原任务：" + mission)
+                    if role == "commander":
+                        continuation = (sapper_roles.commander_briefing(REPO / "docker/commander/worker.sh")
+                                        + "\n\n" + continuation)
                 if mode != "chat":
                     argv += [continuation]
             if cwd != root and not existing:

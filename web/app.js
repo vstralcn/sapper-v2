@@ -65,6 +65,10 @@ function taskApi(action, options = {}) {
 }
 function showLogin() {
   state.csrf = "";
+  state.username = "";
+  document.querySelectorAll("dialog[open]").forEach(dialog => dialog.close());
+  $("password-form").reset();
+  $("password-error").textContent = "";
   $("workspace").hidden = true;
   $("login").hidden = false;
   if (typeof disconnectNative === "function") disconnectNative();
@@ -74,6 +78,7 @@ async function showWorkspace() {
   state.project = null;
   $("login").hidden = true;
   $("workspace").hidden = false;
+  $("account-username").value = state.username;
   const [health, profiles] = await Promise.all([api("/health"), api("/profiles")]);
   state.profiles = profiles;
   $("root-path").textContent = health.root;
@@ -441,17 +446,30 @@ function submit(id, action) {
     try { await action(new FormData(event.currentTarget)); }
     catch (error) {
       if (id === "login-form") $("login-error").textContent = error.message;
+      else if (id === "password-form") $("password-error").textContent = error.message;
       else toast(error.message, true);
     } finally { if (btn) btn.disabled = false; }
   });
 }
 
 submit("login-form", async () => {
-  const result = await api("/session", {method: "POST", body: {token: $("access-token").value.trim()}});
+  const result = await api("/session", {method: "POST", body: {username: $("login-username").value.trim(), password: $("login-password").value}});
   state.csrf = result.csrf;
-  $("access-token").value = "";
+  state.username = result.username;
+  $("login-password").value = "";
   $("login-error").textContent = "";
   await showWorkspace();
+});
+submit("password-form", async data => {
+  if (data.get("new_password") !== data.get("confirm_password")) throw new Error("两次输入的新密码不一致");
+  await api("/account/password", {method: "POST", body: {current_password: data.get("current_password"), new_password: data.get("new_password")}});
+  showLogin();
+  $("login-error").textContent = "密码已修改，请使用新密码登录。";
+});
+$("profiles-dialog").addEventListener("close", () => {
+  $("password-form").reset();
+  $("account-username").value = state.username || "";
+  $("password-error").textContent = "";
 });
 submit("create-form", async data => {
   const result = await api("/projects", {method: "POST", body: Object.fromEntries(data)});
@@ -581,8 +599,14 @@ setInterval(async () => {
 }, 2000);
 
 document.addEventListener("DOMContentLoaded", async () => {
-  try { const session = await api("/session"); state.csrf = session.csrf; await showWorkspace(); }
-  catch { showLogin(); }
+  try { const session = await api("/session"); state.csrf = session.csrf; state.username = session.username; await showWorkspace(); }
+  catch {
+    showLogin();
+    try {
+      const auth = await api("/auth");
+      if (!auth.configured) $("login-help").textContent = "请先在服务器本机执行 ./sapperctl auth-init 初始化管理员；独立实例请指定对应的 --state 目录。";
+    } catch (error) { $("login-error").textContent = error.message; }
+  }
 }, {once:true});
 
 const profileProtocolNames={anthropic:'Anthropic Messages',responses:'Responses',chat_completions:'Chat Completions'};

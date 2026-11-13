@@ -59,7 +59,7 @@ Web 新建角色加载 `sapper-native-roles/4`：Commander 按原 4.6／4.10 条
 
 原 CLI 保留解题循环与图格式；增加 `web` 入口及显式受管环境下的上下文追加，没有迁移数据或替换工具集合。原 worker／watchdog 默认分支保留，新本地分支仅由 `SAPPER_MODE=workspace` 启用。真实 hooks 已修复并加入子进程回归。
 
-启动：`./sapperctl start`，在 `http://127.0.0.1:8766/` 使用 `.sapper-web/token` 中的口令登录。前台运行及服务管理详见[启动与使用](./05-running.md)。
+首次运行 `./sapperctl auth-init` 设置管理员账号和密码，再执行 `./sapperctl start`，在 `http://127.0.0.1:8766/` 登录。账号与会话保存在 `.sapper-web/auth.sqlite3`。前台运行及服务管理详见[启动与使用](./05-running.md)。
 
 终端已增加 xterm.js 与原 tmux PTY 流式输出、完整输入、尺寸调整、断线续传；不替换既有外部输出订阅。此前 79 项回归及真实 Claude 会话验证已通过；最新原生功能回归与真实 `auto` 验收见[覆盖说明](./09-native-capability-coverage.md)。Linux／HTTPS、Docker 构建及任意供应商兼容性仍未实测。
 

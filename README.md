@@ -19,6 +19,12 @@ board, decides, and dispatches; generals and soldiers attack in parallel; a
 zero-strategy watchdog keeps everyone alive. All knowledge settles into a
 layered fact graph — individuals die, the graph survives.
 
+The Web console provides workspace management, native terminals, role topology,
+and model/MCP/Skills settings. It uses username/password login backed by SQLite,
+while the CLI and agents share the existing JSON fact-intent graph.
+See [Quick Start](#6-quick-start) for setup and the [Web architecture](#web-console-and-storage)
+for the runtime and storage layout.
+
 ---
 
 ## 1. The Nüwa Test
@@ -130,7 +136,7 @@ next three are institutions that grew out of iteration:
 - **Division of labor** — commander / general / scout / soldier, plus the
   **signalman** it invented itself.
 
-At runtime there are only three windows: the **commander** (read board →
+The competition deployment uses three terminal windows: the **commander** (read board →
 judge → dispatch, never executes an attack itself), the **AI legion**
 (generals and soldiers in tmux panes), and the **watchdog** (pure script:
 relaunches a crashed commander with `--continue`, rotates keys, wraps up at
@@ -141,6 +147,52 @@ the buzzer — zero strategy, keep-alive only).
 Further reading: [docker/commander/SPEC.md](docker/commander/SPEC.md)
 (architecture contract) · [BATTLE-REPORT.md](BATTLE-REPORT.md) (campaign
 retrospective)
+
+### Web console and storage
+
+The Web backend runs on the same execution machine as the CLI and tmux. It
+manages workspaces, starts or resumes native Claude Code sessions, and streams
+their terminal output to the browser. Agents use the Sapper CLI and hooks to
+read and write the shared fact-intent graph.
+
+```mermaid
+flowchart LR
+    Browser[Browser] --> Web[Web API]
+    Web --> Auth[Authentication module]
+    Auth --> DB[(SQLite: accounts and login sessions)]
+    Web --> CLI[Sapper CLI]
+    Web --> Tmux[tmux terminals]
+    Tmux --> Agent[Native Claude Code sessions]
+    Agent -->|Tools and hooks| CLI
+    CLI <--> Graph[Workspace JSON fact-intent graph]
+```
+
+Authentication is implemented in [`lib/sapper_auth.py`](lib/sapper_auth.py),
+using Python's built-in SQLite and scrypt support. The database has three tables:
+`users` stores the administrator account and salted password hash; `sessions`
+stores login-session token digests, CSRF values and expiry times;
+`login_attempts` stores rate-limit records. Login issues an HttpOnly,
+SameSite=Strict cookie; authenticated write requests also require CSRF validation. An
+HTTPS `--public-url` enables Secure cookies.
+
+| Data | Default location | Storage |
+| --- | --- | --- |
+| Administrator, browser login sessions, login rate limits | `.sapper-web/auth.sqlite3` | SQLite |
+| Model profiles, workspace bindings, shared context, MCP/Skills library | `.sapper-web/config.json`, `.sapper-web/global-context.json`, `.sapper-web/extensions.json` | JSON |
+| Agent records, runs, management audit and captured output | `.sapper-web/agents/`, `.sapper-web/runs/`, `.sapper-web/actions.jsonl` | JSON, JSONL and log files |
+| Shared project state, facts, intents and hints | `<workspace>/.sapper/` | JSON files |
+| New managed agent sessions and resource snapshots | `<workspace>/.sapper/sessions/` | Snapshot files and native JSONL transcripts |
+
+Browser login sessions and native agent sessions have separate lifecycles.
+Login sessions last 12 hours and survive Web restarts; password changes and
+resets revoke them. `sapperctl restart` restarts the Web process while managed
+tmux jobs and model bridges continue running. SQLite stores Web authentication;
+the fact-intent graph remains shared by the Web console, CLI and agents through
+the existing filesystem store.
+
+Source and details: [`lib/sapper_web.py`](lib/sapper_web.py),
+[`lib/sapper_workspace.py`](lib/sapper_workspace.py),
+[Web usage](docs/web/05-running.md), [agent resources and sessions](docs/web/16-agent-resources.md).
 
 ## 5. Results & Emergence
 
@@ -179,18 +231,90 @@ Multi-stage deep-dive chains (an industry report puts their success rate at
 
 ## 6. Quick Start
 
-Basic Web controls, using the original CLI, tmux sessions, and fact graph:
+### Requirements
+
+Run on macOS, Linux, or Windows through WSL2 with Python 3.10+, tmux, and
+Claude Code CLI 2.1.318+ available in the same environment. New managed sessions
+also require the CLI's [resource-isolation capabilities](docs/web/16-agent-resources.md).
+The Web backend uses the
+Python standard library, including SQLite; frontend assets are bundled, so no
+pip install, npm build, or separate database server is needed. Agent launches
+need a model API key configured in the Web console or service environment.
+
+### Start and sign in
+
+From the repository root, initialize the administrator in a local interactive
+terminal, then start the Web service:
 
 ```bash
-./sapperctl start                         # http://127.0.0.1:8766/
-./sapperctl status                        # Web, managed tmux sessions and model bridges
-# ./sapperctl restart   (Web only)      ./sapperctl stop   (all Sapper-managed services)
-# ./sapperctl claude-status            ./sapperctl stop-claude (Claude daemon and detached sessions)
-# Read the login token in another terminal: cat .sapper-web/token
+./sapperctl auth-init --username admin
+./sapperctl start
 ```
 
-Includes tasks, graph records, hints, original command launches, tmux snapshots
-and input controls, logs, and attachments. The home page shows an overall view. Global shared context is configurable through startup prompts and hooks. Workspace mode binds existing folders, launches/resumes native Claude sessions by ID, and tracks roles and dispatches. Choose existing task folders directly in the Web folder picker; no startup allowlist is required. See [Web usage and limits](docs/web/05-running.md). Model profiles support Messages, Responses and Chat Completions, model discovery and connection tests; see [protocol details](docs/web/10-model-protocols.md).
+Enter a password of at least 6 characters twice; password input is hidden.
+Open [http://127.0.0.1:8766/](http://127.0.0.1:8766/) and sign in with that
+username and password. The current account model is one administrator with
+access to all workspaces managed by this Web instance.
+
+To upgrade from token login, run `auth-init` once, then `./sapperctl restart`
+if the old Web service is running. Existing workspaces remain registered. The
+old `.sapper-web/token` file is retained but is no longer accepted for login.
+
+### Open a workspace and launch an agent
+
+1. Click **Open challenge folder** (打开题目目录) and select an existing folder
+   on the execution machine, or create a new task. Existing files stay in place.
+2. Click **Enable sapper** (启用 sapper) to initialize or reuse its `.sapper/`
+   graph and install the project hooks.
+3. In **Global settings** (全局设置), configure a model connection and, as
+   needed, register MCP servers and Skills. Select resources for the workspace.
+4. Click **Dispatch role** (派发角色), choose the role, mission and model, and
+   launch. Use the native terminal for interaction, **Roles and collaboration**
+   (角色与协作) for topology, and **Facts and intents** (事实与意图) for shared memory.
+
+The overview shows all workspaces. **Global context** (全局上下文) configures
+shared environment information for prompts and hooks. **Native capabilities**
+(原生功能) exposes existing CLI operations. See [Web usage](docs/web/05-running.md)
+and [model protocols](docs/web/10-model-protocols.md) for details.
+
+### Passwords and service management
+
+Change your password in **Global settings → Account and password**
+(全局设置 → 账号与密码), using the current password. For recovery, run
+`./sapperctl password-reset --username admin` in a terminal on the server.
+Both operations revoke all existing browser login sessions and require a new login.
+
+| Command | Effect |
+| --- | --- |
+| `./sapperctl status` | Show the Web PID, managed tmux sessions and model bridges |
+| `./sapperctl restart` | Restart Web while keeping managed jobs and model bridges running |
+| `./sapperctl stop-web` | Stop Web |
+| `./sapperctl stop` | Stop Web, this instance's managed jobs and its model bridges |
+| `./sapperctl claude-status` | Inspect the Claude user daemon |
+| `./sapperctl stop-claude` | Stop the Claude user daemon and its detached sessions across instances |
+
+### Independent instances and foreground mode
+
+Use a separate state directory, port and tmux socket for each independent
+instance. After the first start, the launch settings are saved in that state
+directory; reuse its `--state` for later management and password recovery:
+
+```bash
+./sapperctl auth-init --state "$HOME/.local/state/sapper-lab" --username admin
+./sapperctl start --state "$HOME/.local/state/sapper-lab" \
+  --root "$HOME/sapper-tasks" --port 8877 --tmux-socket sapper-lab
+./sapperctl status --state "$HOME/.local/state/sapper-lab"
+./sapperctl password-reset --state "$HOME/.local/state/sapper-lab" --username admin
+./sapperctl stop --state "$HOME/.local/state/sapper-lab"
+```
+
+For foreground operation, use `python3 lib/sapper.py web`. Its account-management
+commands are `python3 lib/sapper.py web --init-admin --username admin` and
+`python3 lib/sapper.py web --reset-password --username admin`; both accept
+`--state`. For remote access, use an HTTPS reverse proxy and configure
+`--public-url` as described in [deployment](docs/web/05-running.md#6-linux域名网关).
+
+### CLI and Docker
 
 ```bash
 bash install.sh                      # symlink the sapper CLI (stdlib-only, zero deps)

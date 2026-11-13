@@ -220,6 +220,10 @@ class ChatLifecycleTests(unittest.TestCase):
         self.assertEqual(enabled["claude_session_id"], run["claude_session_id"])
         self.assertIn("--dangerously-skip-permissions", enabled["command"])
         self.assertTrue(self.app.workspaces.agent(aid)["skip_permissions"])
+        calls = [json.loads(line) for line in (self.base / "calls.jsonl").read_text().splitlines()]
+        self.assertIn("[Sapper 指挥官职责 · commander]", calls[-1]["argv"][-1])
+        self.assertIn("不得亲自查询比赛平台", calls[-1]["argv"][-1])
+        self.assertIn("原任务：", calls[-1]["argv"][-1])
         self.app.workspaces.stop_agent(aid)
         retained = self.app.workspaces.resume(aid, {})
         self.until(lambda: "NATIVE_READY" in self.app.log(retained["id"])["text"])
@@ -251,6 +255,10 @@ class ChatLifecycleTests(unittest.TestCase):
         resumed = self.app.workspaces.dispatch(self.pid, {"role":"commander", "execution_mode":"chat"})
         self.assertEqual(resumed["claude_session_id"], run["claude_session_id"])
         self.assertEqual(resumed["agent_id"], main)
+        launch = json.loads((self.app.state / "runs" / resumed["id"] / "launch.json").read_text())
+        self.assertIn("[Sapper 指挥官职责 · commander]", launch["initial_prompt"])
+        self.assertIn("不得亲自查询比赛平台", launch["initial_prompt"])
+        self.assertIn("原任务：", launch["initial_prompt"])
         self.until(lambda: self.app.workspaces.chat_view(self.pid)["phase"] == "idle")
         self.assertEqual(sum(s["status"] in ("starting","running") for s in self.app.workspaces.services(self.pid)), 1)
         with self.assertRaisesRegex(Exception, "问题已结束"):

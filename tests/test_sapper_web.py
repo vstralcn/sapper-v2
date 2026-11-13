@@ -83,7 +83,7 @@ class ConsoleTests(unittest.TestCase):
         stored = next(p for p in self.app.config()["profiles"] if p["id"] == one["id"])
         self.assertEqual(stored["api_key"], "synthetic-secret-one")
         self.assertEqual(stat.S_IMODE(self.app.config_path.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(self.app.token_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.app.auth.path.stat().st_mode), 0o600)
         self.app.delete_profile(two["id"])
         self.assertEqual(len(self.app.profiles()), 1)
 
@@ -177,6 +177,7 @@ class HttpTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         base = Path(self.temp.name)
         self.app = Console(base / "tasks", base / "state")
+        self.app.auth.initialize("admin", "fixture web password 123")
         self.server = WebServer(("127.0.0.1", 0), self.app, prefix="/sapper")
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -204,10 +205,43 @@ class HttpTests(unittest.TestCase):
         return result
 
     def login(self):
-        status, headers, body = self.request("/api/session", "POST", {"token": self.app.token})
+        status, headers, body = self.request("/api/session", "POST", {"username": "admin", "password": "fixture web password 123"})
         self.assertEqual(status, 200)
         self.cookie = headers["Set-Cookie"].split(";", 1)[0]
         self.csrf = json.loads(body)["csrf"]
+
+    def test_password_login_rejects_legacy_token_and_sets_private_cookie(self):
+        (self.app.state / "token").write_text("legacy-fixture-token-that-is-no-longer-accepted")
+        self.assertEqual(self.request("/api/auth")[0], 200)
+        self.assertEqual(self.request("/api/session", "POST", {"token": (self.app.state / "token").read_text()})[0], 401)
+        self.server.secure_cookie = True
+        status, headers, body = self.request("/api/session", "POST", {"username": "admin", "password": "fixture web password 123"})
+        self.assertEqual(status, 200)
+        for attribute in ("HttpOnly", "SameSite=Strict", "Path=/sapper", "Secure"):
+            self.assertIn(attribute, headers["Set-Cookie"])
+        self.assertEqual(json.loads(body)["username"], "admin")
+        self.assertNotIn(b"password", body)
+
+    def test_password_change_requires_session_csrf_and_current_password(self):
+        data = {"current_password": "fixture web password 123", "new_password": "abc123"}
+        self.assertEqual(self.request("/api/account/password", "POST", data)[0], 401)
+        self.login()
+        cookie = self.cookie
+        self.assertEqual(self.request("/api/account/password", "POST", data, {"X-Sapper-CSRF": "wrong"})[0], 403)
+        self.assertEqual(self.request("/api/account/password", "POST", {**data, "current_password": "wrong"})[0], 400)
+        self.assertEqual(self.request("/api/account/password", "POST", {**data, "new_password": "short"})[0], 400)
+        status, headers, _ = self.request("/api/account/password", "POST", data)
+        self.assertEqual(status, 200)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+        self.assertEqual(self.request("/api/session", headers={"Cookie": cookie})[0], 401)
+        self.assertEqual(self.request("/api/session", "POST", {"username": "admin", "password": data["new_password"]})[0], 200)
+
+    def test_existing_cookie_remains_valid_after_console_reload(self):
+        self.login()
+        self.server.console = Console(self.app.root, self.app.state)
+        status, _, body = self.request("/api/session")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["csrf"], self.csrf)
 
     def test_role_models_require_auth_csrf_and_persist_under_subpath(self):
         self.assertEqual(self.request("/api/role-models")[0], 401)

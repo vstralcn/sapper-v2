@@ -4408,6 +4408,12 @@ def cmd_web(args) -> int:
     for root in args.workspace_root:
         argv += ["--workspace-root", root]
     argv += ["--claude-bin", args.claude_bin]
+    if args.init_admin:
+        argv += ["--init-admin"]
+    if args.reset_password:
+        argv += ["--reset-password"]
+    if args.username:
+        argv += ["--username", args.username]
     return web_main(argv)
 
 
@@ -4430,6 +4436,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tmux-socket", default=None)
     sp.add_argument("--workspace-root", action="append", default=[], help="optional directory picker shortcut; directories can also be selected in the Web UI")
     sp.add_argument("--claude-bin", default=os.environ.get("SAPPER_CLAUDE_BIN", "claude"))
+    credentials = sp.add_mutually_exclusive_group()
+    credentials.add_argument("--init-admin", action="store_true", help="initialize the Web administrator in a local terminal")
+    credentials.add_argument("--reset-password", action="store_true", help="reset the Web password and revoke existing sessions")
+    sp.add_argument("--username", help="administrator username for initialization or password reset")
     sp.set_defaults(func=cmd_web)
 
     sp = sub.add_parser("init", help="create a fact graph in --store")

@@ -60,7 +60,7 @@ class PermissionAuditTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with mock.patch.object(self.app, "tmux", side_effect=tmux), mock.patch.object(self.app, "panes", return_value=[]):
-            run = self.manager.create_session(self.pid, {"role": "worker", "skip_permissions": True,
+            run = self.manager.create_session(self.pid, {"role": "scout", "execution_mode": "tui", "skip_permissions": True,
                                                        "request_id": "first"})
             agent = self.manager.agent(run["agent_id"])
             self.assertTrue(agent["skip_permissions"])
@@ -93,11 +93,23 @@ class PermissionAuditTests(unittest.TestCase):
              mock.patch.object(self.app, "panes", return_value=[]), contextlib.redirect_stdout(io.StringIO()) as output:
             worker(["spawn", self.pid, "--from", basis, "--request-id", "cli-dispatch"])
         run = json.loads(output.getvalue())
-        self.assertEqual(run["permission_source"], "parent_agent")
+        self.assertEqual(run["permission_source"], "worker_policy")
         self.assertFalse(run["input_present"])
         self.assertIsNone(run["input_skip_permissions"])
         self.assertTrue(run["effective_skip_permissions"])
         self.assertEqual(run["request_id"], "cli-dispatch")
+
+    def test_worker_policy_applies_to_new_and_resumed_sessions(self):
+        self.prepare()
+        with mock.patch.object(self.app, "tmux", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+             mock.patch.object(self.app, "panes", return_value=[]):
+            run = self.manager.create_session(self.pid, {"role": "worker", "execution_mode": "print",
+                                                       "skip_permissions": False})
+            resumed = self.manager.resume(run["agent_id"], {"skip_permissions": False})
+        for result in (run, resumed):
+            self.assertIn("--dangerously-skip-permissions", result["command"])
+            self.assertTrue(result["effective_skip_permissions"])
+            self.assertEqual(result["permission_source"], "worker_policy")
 
 
 if __name__ == "__main__":

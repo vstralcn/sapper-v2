@@ -39,6 +39,7 @@ from sapper_native import NativeSurface, NativeError
 from sapper_permission_audit import FIELDS as PERMISSION_AUDIT_FIELDS
 from sapper_extensions import ExtensionError, clean_environment, api_environment
 import sapper_models
+from sapper_auth import AuthError, AuthStore, SESSION_SECONDS, manage_credentials
 
 REPO = Path(__file__).resolve().parent.parent
 SAPPER = REPO / "lib" / "sapper.py"
@@ -122,17 +123,7 @@ class Console:
         self.config_path = self.state / "config.json"
         self.context_path = self.state / "global-context.json"
         self.lock = threading.RLock()
-        self.sessions = {}
-        self.login_failures = {}
-        self.token_path = self.state / "token"
-        if not self.token_path.exists():
-            fd = os.open(self.token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(secrets.token_urlsafe(32) + "\n")
-        os.chmod(self.token_path, 0o600)
-        self.token = self.token_path.read_text().strip()
-        if len(self.token) < 20:
-            raise WebError("登录 token 至少需要 20 个字符，请更换 token 文件")
+        self.auth = AuthStore(self.state)
         bindir = self.state / "bin"
         bindir.mkdir(exist_ok=True)
         shim = bindir / "sapper"
@@ -1213,10 +1204,7 @@ class Handler(BaseHTTPRequestHandler):
         item = cookie.get("sapper_web")
         if not item:
             return None
-        session = self.server.console.sessions.get(item.value)
-        if session and session["expires"] > time.time():
-            return session
-        return None
+        return self.server.console.auth.session(item.value)
 
     def dispatch(self, method):
         app = self.server.console
@@ -1243,32 +1231,29 @@ class Handler(BaseHTTPRequestHandler):
                 filename = "index.html" if path == "/" else path[1:]
                 data = (STATIC / filename).read_bytes()
                 return self.reply(200, data, mimetypes.guess_type(filename)[0] + "; charset=utf-8")
+            if path == "/api/auth" and method == "GET":
+                return self.reply(200, {"configured": app.auth.configured()})
             if path == "/api/session" and method == "POST":
                 body = self.body()
-                ip = self.client_address[0]
-                now = time.time()
-                attempts = [t for t in app.login_failures.get(ip, []) if now - t < 60]
-                if len(attempts) >= 10:
-                    raise WebError("登录尝试过多，请一分钟后重试", 429)
-                if not isinstance(body.get("token"), str) or not hmac.compare_digest(body["token"], app.token):
-                    app.login_failures[ip] = attempts + [now]
-                    raise WebError("访问口令不正确", 401)
-                sid, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
-                app.sessions[sid] = {"csrf": csrf, "expires": now + 43200}
-                cookie = f"sapper_web={sid}; HttpOnly; SameSite=Strict; Path={prefix or '/'}; Max-Age=43200"
+                sid, result = app.auth.login(body.get("username"), body.get("password"), self.client_address[0])
+                cookie = f"sapper_web={sid}; HttpOnly; SameSite=Strict; Path={prefix or '/'}; Max-Age={SESSION_SECONDS}"
                 if self.server.secure_cookie:
                     cookie += "; Secure"
-                return self.reply(200, {"authenticated": True, "csrf": csrf}, headers={"Set-Cookie": cookie})
+                return self.reply(200, result, headers={"Set-Cookie": cookie})
             session = self.session()
             if not session:
-                raise WebError("请先输入 Web 访问口令登录", 401)
+                raise WebError("请先使用用户名和密码登录", 401)
             if method != "GET" and not hmac.compare_digest(self.headers.get("X-Sapper-CSRF", ""), session["csrf"]):
                 raise WebError("请求校验失败，请刷新后重试", 403)
             if path == "/api/session" and method == "GET":
-                return self.reply(200, {"authenticated": True, "csrf": session["csrf"]})
+                return self.reply(200, {"authenticated": True, **{k: session[k] for k in ("csrf", "username", "role")}})
+            if path == "/api/account/password" and method == "POST":
+                body = self.body()
+                app.auth.change_password(session, body.get("current_password"), body.get("new_password"), self.client_address[0])
+                return self.reply(200, {"ok": True}, headers={"Set-Cookie": self.expired_cookie()})
             if path == "/api/logout" and method == "POST":
-                session["expires"] = 0
-                return self.reply(200, {"ok": True}, headers={"Set-Cookie": f"sapper_web=; Path={prefix or '/'}; Max-Age=0"})
+                app.auth.logout(session)
+                return self.reply(200, {"ok": True}, headers={"Set-Cookie": self.expired_cookie()})
             if path == "/api/health" and method == "GET":
                 return self.reply(200, {"root": str(app.root), "state": str(app.state),
                                        "tmux": bool(shutil.which("tmux")), "claude": bool(shutil.which("claude")),
@@ -1489,7 +1474,7 @@ class Handler(BaseHTTPRequestHandler):
                     if action in ("hint", "fact", "intent", "confirm", "doc", "claim", "release", "done", "complete", "brainstorm-pick"):
                         return self.reply(200, app.graph_action(pid, action, self.body()))
             raise WebError("接口不存在", 404)
-        except (WebError, WorkspaceError, NativeError, ExtensionError) as exc:
+        except (AuthError, WebError, WorkspaceError, NativeError, ExtensionError) as exc:
             self.reply(exc.status, {"error": str(exc)})
         except (sapper.FGError, KBError, ValueError, TypeError, KeyError) as exc:
             self.reply(400, {"error": app.redact(str(exc))})
@@ -1505,6 +1490,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.dispatch("DELETE")
 
+    def expired_cookie(self):
+        cookie = f"sapper_web=; HttpOnly; SameSite=Strict; Path={self.server.prefix or '/'}; Max-Age=0"
+        return cookie + ("; Secure" if self.server.secure_cookie else "")
+
 
 def main(argv=None):
     if argv is None and len(sys.argv) >= 3 and sys.argv[1] == "_runner":
@@ -1519,7 +1508,19 @@ def main(argv=None):
     parser.add_argument("--tmux-socket", default=None, help="可选 tmux -L socket 名称")
     parser.add_argument("--workspace-root", action="append", type=Path, default=[], help="目录浏览快捷入口（可选，可重复指定；也可直接在网页选择目录）")
     parser.add_argument("--claude-bin", default=os.environ.get("SAPPER_CLAUDE_BIN", "claude"), help="原 Claude Code 可执行文件")
+    credentials = parser.add_mutually_exclusive_group()
+    credentials.add_argument("--init-admin", action="store_true", help="在本机终端初始化 Web 管理员")
+    credentials.add_argument("--reset-password", action="store_true", help="在本机终端重置 Web 管理员密码并撤销旧会话")
+    parser.add_argument("--username", help="初始化或重置密码的管理员用户名")
     args = parser.parse_args(argv)
+    if args.init_admin or args.reset_password:
+        try:
+            manage_credentials(args.state.expanduser().resolve(), "auth-init" if args.init_admin else "password-reset", args.username)
+        except (AuthError, OSError, EOFError) as exc:
+            parser.exit(1, f"{exc}\n")
+        return 0
+    if args.username:
+        parser.error("--username 需与 --init-admin 或 --reset-password 一起使用")
     if args.url_prefix and not re.fullmatch(r"(?:/[A-Za-z0-9_-]+)+", args.url_prefix):
         parser.error("--url-prefix 必须是 /sapper 形式的路径")
     if args.public_url:
@@ -1530,7 +1531,9 @@ def main(argv=None):
     server = WebServer((args.host, args.port), app, args.public_url, args.url_prefix)
     print(f"Sapper Web: http://{args.host}:{server.server_port}{args.url_prefix}/", flush=True)
     print(f"任务目录: {app.root}", flush=True)
-    print(f"访问口令保存在: {app.token_path}（使用 cat 在本机查看）", flush=True)
+    print(f"认证数据库: {app.auth.path}", flush=True)
+    if not app.auth.configured():
+        print("请先在本机初始化管理员：" + shlex.join([sys.executable, str(Path(__file__).resolve()), "--state", str(app.state), "--init-admin"]), flush=True)
     print("原 agent 进程独立运行；退出此 Web 服务不会停止已有 tmux 会话。", flush=True)
     try:
         server.serve_forever()

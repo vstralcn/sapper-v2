@@ -711,7 +711,8 @@ class NativeWorkspaceTests(unittest.TestCase):
             c, r = request(url + "/stream")
             self.assertEqual(r.status, 401)
             r.read(); c.close()
-            c, r = request("/api/session", "POST", {"token": self.app.token}, {"Content-Type": "application/json"})
+            self.app.auth.initialize("admin", "fixture stream password 123")
+            c, r = request("/api/session", "POST", {"username": "admin", "password": "fixture stream password 123"}, {"Content-Type": "application/json"})
             headers = {"Cookie": r.getheader("Set-Cookie").split(";", 1)[0]}
             csrf = json.loads(r.read())["csrf"]; c.close()
             c, r = request(url + "/input", "POST", {"data": "blocked"}, headers)
@@ -723,7 +724,9 @@ class NativeWorkspaceTests(unittest.TestCase):
                 self.assertEqual(r.getheader("X-Accel-Buffering"), "no")
                 cursor = ""
                 while True:
-                    line = r.readline().decode().strip()
+                    raw = r.readline()
+                    self.assertTrue(raw, "terminal stream closed before delivering output")
+                    line = raw.decode().strip()
                     if line.startswith("id: "): cursor = line[4:]
                     if line.startswith("data: "):
                         event = json.loads(line[6:])
@@ -746,6 +749,18 @@ class NativeWorkspaceTests(unittest.TestCase):
             self.assertEqual(response.status, 200); response.read(); logout.close()
             self.assertIn('"type": "ended"', r.read().decode())
             c.close()
+            sid, _ = self.app.auth.login("admin", "fixture stream password 123", "fixture")
+            reset_headers = {"Cookie": f"sapper_web={sid}"}
+            c, r = request(url + "/stream", headers=reset_headers)
+            self.assertEqual(r.status, 200)
+            while not r.readline().startswith(b"data: "):
+                pass
+            self.app.auth.reset_password("admin", "fixture replacement stream password 456")
+            self.assertIn('"type": "ended"', r.read().decode())
+            c.close()
+            c, r = request(url + "/stream", headers=reset_headers)
+            self.assertEqual(r.status, 401)
+            r.read(); c.close()
         finally:
             server.shutdown(); server.server_close(); thread.join()
 

@@ -52,7 +52,9 @@ def main():
                 errors = []
                 page.on('pageerror', lambda error: errors.append(str(error)))
                 page.goto(f'http://127.0.0.1:{server.server_port}/sapper/')
-                page.locator('#access-token').fill(app.token_path.read_text().strip())
+                app.auth.initialize("admin", "fixture browser password 123")
+                page.locator("#login-username").fill("admin")
+                page.locator("#login-password").fill("fixture browser password 123")
                 page.locator('#login-form button[type=submit]').click()
                 expect(page.locator('#workspace')).to_be_visible()
                 page.locator('#profiles-button').click()
