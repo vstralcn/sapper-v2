@@ -111,6 +111,12 @@ Reject only when execution would be clearly inappropriate:
 {open_intents}
 ```
 
+## Registered solution families (bounded portfolio summary)
+Use only these registered keys in an intent's optional `family` field. Reuse an active family when the new intent tests its stated hypothesis; start a new family only for a genuinely distinct mechanism. Never assign to parked/terminal families. If none fits, omit `family` and explain the new hypothesis in the intent doc.
+```
+{families}
+```
+
 ## Hints (human)
 ```
 {hints}

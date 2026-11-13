@@ -49,7 +49,7 @@ class NativeContractTests(unittest.TestCase):
         native = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices
         catalog = {c["name"]: c for c in self.app.native.catalog()["commands"]}
         self.assertEqual(set(catalog), set(native) - EXCLUDED)
-        self.assertEqual(len(catalog), 31)
+        self.assertEqual(len(catalog), 32)
         for name, command in catalog.items():
             expected = {a.dest for a in native[name]._actions if not isinstance(a, argparse._HelpAction)}
             if name == "flag": expected.remove("submit")

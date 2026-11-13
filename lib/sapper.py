@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -35,6 +36,8 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from sapper_evidence import ingest_artifacts, provenance as build_provenance
 
 __version__ = "1.0.0"
 
@@ -65,6 +68,46 @@ def normalize_fact_kind(kind: str | None) -> str | None:
             f"unknown fact kind {kind!r}; expected one of: {', '.join(FACT_KINDS)}"
         )
     return k
+
+
+def normalize_fact_evidence(evidence: dict | None) -> dict | None:
+    if evidence is None:
+        return None
+    if not isinstance(evidence, dict):
+        raise FGError("fact evidence must be an object")
+    source = evidence.get("source")
+    if source is not None and not isinstance(source, str):
+        raise FGError("evidence source must be a string or null")
+    reproduction = evidence.get("reproduction", [])
+    artifacts = evidence.get("artifacts", [])
+    if not isinstance(reproduction, list) or not isinstance(artifacts, list):
+        raise FGError("evidence reproduction and artifacts must be lists")
+    commands = []
+    for item in reproduction:
+        if not isinstance(item, dict) or not isinstance(item.get("command"), str) or not item["command"].strip():
+            raise FGError("each reproduction entry requires a non-empty command")
+        cwd = item.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            raise FGError("reproduction cwd must be a string")
+        commands.append({"command": item["command"].strip(), "cwd": cwd})
+    normalized_artifacts = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            raise FGError("artifact evidence entries must be objects")
+        sha, path, size = item.get("sha256"), item.get("path"), item.get("size")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise FGError("artifact evidence requires a lowercase SHA-256")
+        if not isinstance(path, str) or not path.startswith("artifacts/") or ".." in Path(path).parts:
+            raise FGError("artifact evidence path must stay inside artifacts/")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise FGError("artifact evidence size must be a non-negative integer")
+        normalized_artifacts.append({"id": sha, "path": path, "sha256": sha, "size": size,
+                                     "name": str(item.get("name", sha)),
+                                     "captured_at": str(item.get("captured_at", ""))})
+    if not (source and source.strip()) and not commands and not normalized_artifacts:
+        raise FGError("evidence must include a source, reproduction command, or artifact")
+    return {"source": source.strip() if source and source.strip() else None,
+            "reproduction": commands, "artifacts": normalized_artifacts}
 
 
 def normalize_fact_data(data: dict | None) -> dict[str, str] | None:
@@ -249,7 +292,8 @@ class Store:
 
     def add_fact(self, description: str, creator: str, source_intent: str | None = None,
                  title: str | None = None, doc: str | None = None,
-                 kind: str | None = None, data: dict | None = None) -> dict:
+                 kind: str | None = None, data: dict | None = None,
+                 evidence: dict | None = None) -> dict:
         if not isinstance(description, str) or not description.strip():
             raise FGError("fact description cannot be empty")
         if not isinstance(creator, str) or not creator.strip():
@@ -258,6 +302,7 @@ class Store:
             _validate_lookup_id(source_intent, "intent")
         kind = normalize_fact_kind(kind)
         data = normalize_fact_data(data)
+        evidence = normalize_fact_evidence(evidence)
         with self.locked():
             source = None
             if source_intent is not None:
@@ -273,10 +318,17 @@ class Store:
                 "doc": (doc.strip() if doc and doc.strip() else None),
                 "kind": kind,
                 "data": data,
+                "evidence": evidence,
                 "created_at": now_iso(),
                 "creator": creator,
                 "source_intent": source_intent,
             }
+            if source is not None and source.get("family"):
+                import sapper_family
+                try:
+                    sapper_family.validate_fact_result(self, source, fact)
+                except ValueError as exc:
+                    raise FGError(str(exc)) from exc
             atomic_write_json(self.facts_dir / f"{fid}.json", fact)
             if source is not None:
                 source["to"] = fid
@@ -284,6 +336,7 @@ class Store:
                 source["concluded_at"] = now_iso()
                 source["worker"] = creator or source.get("worker")
                 self.save_intent(source)
+                self._family_transition(source, "done", fact=fact, actor=creator)
             return fact
 
     # -- intents --
@@ -296,6 +349,29 @@ class Store:
         if not p.exists():
             raise FGError(f"intent {iid} not found")
         return _read_node(p, "intent")
+
+    FAMILY_STATES = {"probing", "promising", "scaling", "parked", "solved", "ruled_out", "need_human"}
+
+    def _assert_intent_family_active(self, intent: dict) -> None:
+        if not intent.get("family"):
+            return
+        import sapper_family
+        try:
+            family = sapper_family.get(self, intent["family"])
+        except ValueError as exc:
+            raise FGError(str(exc)) from exc
+        if family["state"] in {"parked", "solved", "ruled_out", "need_human"}:
+            raise FGError(f"intent {intent['id']} belongs to {family['state']} family {family['id']}")
+
+    def _family_transition(self, intent: dict, state: str, fact: dict | None = None,
+                           actor: str | None = None) -> None:
+        if not intent.get("family"):
+            return
+        import sapper_family
+        try:
+            sapper_family.transition_intent(self, intent, state, fact=fact, actor=actor)
+        except ValueError as exc:
+            raise FGError(str(exc)) from exc
 
     def _validate_from(self, fact_ids: list[str]) -> None:
         if not isinstance(fact_ids, list) or not fact_ids:
@@ -320,6 +396,7 @@ class Store:
         doc: str | None = None,
         *,
         assigned_worker: str | None = None,
+        family: str | None = None,
     ) -> dict:
         if not isinstance(description, str) or not description.strip():
             raise FGError("intent description cannot be empty")
@@ -328,6 +405,8 @@ class Store:
         if assigned_worker is not None and (not isinstance(assigned_worker, str)
                                             or not assigned_worker.strip() or requires_confirmation):
             raise FGError("assignment needs a worker and an intent ready to be claimed")
+        if family is not None and not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", family):
+            raise FGError("invalid family key")
         if not isinstance(from_ids, list) or any(not isinstance(fid, str) for fid in from_ids):
             raise FGError("intent `from` ids must be a list of strings")
         # A hyper-edge only needs each dependency once; de-duplicate model or
@@ -335,9 +414,15 @@ class Store:
         from_ids = list(dict.fromkeys(from_ids))
         with self.locked():
             self._validate_from(from_ids)
+            if family is not None:
+                import sapper_family
+                family_record = sapper_family.get(self, family)
+                if family_record["state"] in sapper_family.TERMINAL_STATES:
+                    raise FGError(f"family {family} is {family_record['state']}")
             iid = self._next_id("intent", "i")
             intent = {
                 "id": iid,
+                "family": family,
                 "title": (title.strip() if title and title.strip() else None),
                 "from": from_ids,
                 "to": None,
@@ -352,6 +437,15 @@ class Store:
                 "concluded_at": None,
             }
             atomic_write_json(self.intents_dir / f"{iid}.json", intent)
+            if family is not None:
+                import sapper_family
+                try:
+                    sapper_family.reserve_intent(self, family, iid)
+                    if assigned_worker:
+                        sapper_family.transition_intent(self, intent, "claimed", actor=assigned_worker)
+                except ValueError as exc:
+                    (self.intents_dir / f"{iid}.json").unlink(missing_ok=True)
+                    raise FGError(str(exc)) from exc
             return intent
 
     def save_intent(self, intent: dict) -> None:
@@ -435,6 +529,7 @@ class Store:
             intent["concluded_at"] = now_iso()
             intent["worker"] = worker or intent.get("worker")
             self.save_intent(intent)
+            self._family_transition(intent, "done", fact=target_fact if to_fact_id != GOAL_ID else None, actor=worker)
             if to_fact_id == GOAL_ID:
                 project = self.load_project()
                 project["status"] = "completed"
@@ -485,6 +580,7 @@ class Store:
     def conclude_with_new_fact(
         self, iid: str, description: str, worker: str, title: str | None = None,
         doc: str | None = None, kind: str | None = None, data: dict | None = None,
+        evidence: dict | None = None,
         *,
         allow_unconfirmed: bool = False,
     ) -> tuple[dict, dict]:
@@ -495,6 +591,7 @@ class Store:
         *before* any fact file is written, so nothing is orphaned."""
         kind = normalize_fact_kind(kind)
         data = normalize_fact_data(data)
+        evidence = normalize_fact_evidence(evidence)
         with self.locked():
             intent = self.get_intent(iid)
             if intent["to"] is not None:
@@ -513,16 +610,24 @@ class Store:
                 "doc": (doc.strip() if doc and doc.strip() else None),
                 "kind": kind,
                 "data": data,
+                "evidence": evidence,
                 "created_at": now_iso(),
                 "creator": worker,
                 "source_intent": iid,
             }
+            if intent.get("family"):
+                import sapper_family
+                try:
+                    sapper_family.validate_fact_result(self, intent, fact)
+                except ValueError as exc:
+                    raise FGError(str(exc)) from exc
             atomic_write_json(self.facts_dir / f"{fid}.json", fact)
             intent["to"] = fid
             intent["status"] = "done"
             intent["concluded_at"] = now_iso()
             intent["worker"] = worker or intent.get("worker")
             self.save_intent(intent)
+            self._family_transition(intent, "done", fact=fact, actor=worker)
             return fact, intent
 
     def claim_intent(self, iid: str, worker: str) -> dict:
@@ -532,12 +637,14 @@ class Store:
                 raise FGError(f"intent {iid} already concluded")
             if intent.get("requires_confirmation") and not intent.get("confirmed_at"):
                 raise FGError(f"intent {iid} requires confirmation before it can be claimed")
+            self._assert_intent_family_active(intent)
             owner = intent.get("worker")
             if owner and owner != worker:
                 raise FGError(f"intent {iid} claimed by {owner}")
             intent["worker"] = worker
             intent["status"] = "claimed"
             self.save_intent(intent)
+            self._family_transition(intent, "claimed", actor=worker)
             return intent
 
     def release_intent(self, iid: str, worker: str, *, if_owned: bool = False) -> dict:
@@ -552,6 +659,7 @@ class Store:
             intent["worker"] = None
             intent["status"] = "open"
             self.save_intent(intent)
+            self._family_transition(intent, "open", actor=worker)
             return intent
 
     def confirm_intent(self, iid: str) -> dict:
@@ -682,6 +790,11 @@ def _node_schema_errors(data: object, kind: str) -> list[str]:
         if "kind" in data and data["kind"] is not None:
             if not isinstance(data["kind"], str) or data["kind"] not in FACT_KINDS:
                 errors.append(f"'kind' must be null or one of: {', '.join(FACT_KINDS)}")
+        if "evidence" in data and data["evidence"] is not None:
+            try:
+                normalize_fact_evidence(data["evidence"])
+            except FGError as exc:
+                errors.append(f"invalid 'evidence': {exc}")
         if "data" in data and data["data"] is not None:
             d = data["data"]
             if not isinstance(d, dict):
@@ -695,6 +808,8 @@ def _node_schema_errors(data: object, kind: str) -> list[str]:
                         errors.append("'data' values must be scalars")
                         break
     elif kind == "intent":
+        if data.get("family") is not None and not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(data.get("family"))):
+            errors.append("'family' must be a valid family key or null")
         if not isinstance(data.get("from"), list) or not data.get("from") or not all(
             isinstance(x, str) and x != GOAL_ID and _VALID_NODE_ID_RE.fullmatch(x)
             for x in data.get("from", [])
@@ -905,6 +1020,21 @@ def validate_graph(store: Store) -> list[str]:
             if schema:
                 errors.append(f"{kind} {path.name}: {'; '.join(schema)}")
                 continue
+            if kind == "fact" and data.get("evidence"):
+                for artifact in data["evidence"].get("artifacts", []):
+                    stored = store.root / artifact["path"]
+                    if not stored.is_file():
+                        errors.append(f"fact {data['id']}: artifact {artifact['sha256']} is missing")
+                        continue
+                    if stored.stat().st_size != artifact["size"]:
+                        errors.append(f"fact {data['id']}: artifact {artifact['sha256']} size mismatch")
+                        continue
+                    digest = hashlib.sha256()
+                    with stored.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    if digest.hexdigest() != artifact["sha256"]:
+                        errors.append(f"fact {data['id']}: artifact {artifact['sha256']} hash mismatch")
             node_id = data["id"]
             if path.stem != node_id:
                 errors.append(f"{kind} {path.name}: filename does not match id {node_id!r}")
@@ -919,6 +1049,15 @@ def validate_graph(store: Store) -> list[str]:
     elif facts[GOAL_ID].get("description") != project.get("goal"):
         errors.append("goal fact description does not match project goal")
     for iid, intent in intents.items():
+        family_key = intent.get("family")
+        if family_key:
+            try:
+                import sapper_family
+                family = sapper_family.get(store, family_key)
+                if not any(attempt.get("intent_id") == iid for attempt in family.get("attempts", [])):
+                    errors.append(f"intent {iid}: missing family attempt {family_key}")
+            except (ValueError, OSError, json.JSONDecodeError) as exc:
+                errors.append(f"intent {iid}: invalid family {family_key}: {exc}")
         for fid in intent["from"]:
             if fid not in facts:
                 errors.append(f"intent {iid}: missing dependency fact {fid}")
@@ -1170,7 +1309,15 @@ def render_graph_text(store: Store) -> str:
             pairs = " ".join(f"{key}={_scrub_inline(str(val))}" for key, val in f["data"].items())
             data = f"  ({pairs})"
         doc = "  📄" if f.get("doc") else ""
-        lines.append(f"  {f['id']}: {k}{t}{_scrub_inline(f['description'])}{data}{src}{doc}")
+        evidence = f.get("evidence") or {}
+        source = f"  source={_scrub_inline(evidence['source'])[:100]}" if evidence.get("source") else ""
+        artifacts = evidence.get("artifacts") or []
+        artifact_text = (f"  artifacts={','.join(a.get('sha256', '')[:12] for a in artifacts[:3])}"
+                         if artifacts else "")
+        repro = evidence.get("reproduction") or []
+        repro_text = f"  repro={_scrub_inline(repro[0].get('command', ''))[:100]}" if repro else ""
+        lines.append(f"  {f['id']}: {k}{t}{_scrub_inline(f['description'])}{data}{src}{doc}"
+                     f"{source}{artifact_text}{repro_text}")
     lines.append("")
     lines.append("## intents")
     for i in g["intents"]:
@@ -1182,13 +1329,33 @@ def render_graph_text(store: Store) -> str:
             flag = f"  ~{i['worker']}"
         t = f"[{_scrub_inline(i['title'])}]  " if i.get("title") else ""
         doc = "  📄" if i.get("doc") else ""
-        lines.append(f"  {i['id']}: {i['from']} -> {to}  {t}{_scrub_inline(i['description'])[:70]}{flag}{doc}")
+        family = f"  family={_scrub_inline(i['family'])}" if i.get("family") else ""
+        lines.append(f"  {i['id']}: {i['from']} -> {to}  {t}{_scrub_inline(i['description'])[:70]}{flag}{doc}{family}")
     if g["hints"]:
         lines.append("")
         lines.append("## hints")
         for h in g["hints"]:
             lines.append(f"  {h['id']} ({_scrub_inline(h['creator'])}): {_scrub_inline(h['content'])}")
     return "\n".join(lines)
+
+
+def render_family_block(store: Store, limit: int = 12) -> str:
+    import sapper_family
+    families = sapper_family.list_all(store)
+    lines = []
+    for family in families[:limit]:
+        active = sum(row["state"] in {"open", "claimed"} for row in family.get("attempts", []))
+        line = (f"{family['id']}: {family['label']} | hypothesis={_prompt_inline(family['hypothesis'])[:100]} | "
+                f"state={family['state']} | metric={family.get('metric')} {family['metric_name']} | "
+                f"attempts={len(family.get('attempts', []))}/{family['budget_attempts']} "
+                f"active={active} | spend=${family['spend_usd']:.2f}/${family['budget_usd']:.2f} | "
+                f"stall={family['no_progress']}/{family['stall_limit']}")
+        if family.get("stop_reason"):
+            line += " | stop=" + _prompt_inline(family["stop_reason"])[:100]
+        lines.append(line)
+    if len(families) > limit:
+        lines.append(f"({len(families) - limit} additional families omitted; inspect with `sapper family list`)")
+    return "\n".join(lines) if lines else "(no registered solution families)"
 
 
 def render_prompt(store: Store, template_text: str, time_budget: str = "") -> str:
@@ -1209,6 +1376,7 @@ def render_prompt(store: Store, template_text: str, time_budget: str = "") -> st
         ),
         "max_intents": "3",
         "time_budget": _prompt_inline(time_budget),
+        "families": render_family_block(store),
     }
     return _replace_placeholders(template_text, replacements)
 
@@ -1277,8 +1445,17 @@ def _to_yaml_like(g: dict) -> str:
             pairs = " ".join(f"{k}={_prompt_inline(str(v))}" for k, v in f["data"].items())
             data = f" {{{pairs}}}"
         has_doc = " (has doc)" if f.get("doc") else ""
+        evidence = f.get("evidence") or {}
+        evidence_parts = []
+        if evidence.get("source"):
+            evidence_parts.append("source=" + _prompt_inline(evidence["source"])[:120])
+        for item in (evidence.get("reproduction") or [])[:2]:
+            evidence_parts.append("repro=" + _prompt_inline(item.get("command", ""))[:160])
+        for item in (evidence.get("artifacts") or [])[:3]:
+            evidence_parts.append("artifact=" + item.get("sha256", "")[:16] + ":" + _prompt_inline(item.get("path", ""))[:100])
+        evidence_text = " [evidence: " + "; ".join(evidence_parts) + "]" if evidence_parts else ""
         lines.append(
-            f"  - {f['id']}: {kind}{title}{_prompt_inline(f['description'])}{data}{src}{has_doc}"
+            f"  - {f['id']}: {kind}{title}{_prompt_inline(f['description'])}{data}{src}{has_doc}{evidence_text}"
         )
     lines.append("intents:")
     for i in g["intents"]:
@@ -1288,9 +1465,10 @@ def _to_yaml_like(g: dict) -> str:
             flag = " [needs_confirmation]"
         title = f"[{_prompt_inline(i['title'])}] " if i.get("title") else ""
         has_doc = " (has doc)" if i.get("doc") else ""
+        family = f" [family:{_prompt_inline(i['family'])}]" if i.get("family") else ""
         lines.append(
             f"  - {i['id']}: {i['from']} -> {to}{flag} | {title}"
-            f"{_prompt_inline(i['description'])}{has_doc}"
+            f"{_prompt_inline(i['description'])}{has_doc}{family}"
         )
     if g["hints"]:
         lines.append("hints:")
@@ -1686,6 +1864,54 @@ def cmd_pick(args) -> int:
     return 0
 
 
+def cmd_family(args) -> int:
+    store = Store(Path(args.store))
+    store.require()
+    import sapper_family
+    try:
+        with store.locked():
+            if args.action == "add":
+                result = sapper_family.create(store, args.key, args.label, args.hypothesis,
+                    args.metric_name, args.budget_attempts, args.budget_usd,
+                    args.stall_limit, args.direction, args.actor)
+            elif args.action == "list":
+                result = [{"id": family["id"], "label": family["label"],
+                    "hypothesis": family["hypothesis"], "state": family["state"],
+                    "metric": family["metric"], "metric_name": family["metric_name"],
+                    "attempts": len(family["attempts"]),
+                    "active": sum(a["state"] in {"open", "claimed"} for a in family["attempts"]),
+                    "budget_attempts": family["budget_attempts"],
+                    "spend_usd": family["spend_usd"], "budget_usd": family["budget_usd"],
+                    "no_progress": family["no_progress"], "stall_limit": family["stall_limit"],
+                    "stop_reason": family["stop_reason"], "review_due": family["review_due"]}
+                    for family in sapper_family.list_all(store)]
+            elif args.action == "show":
+                result = sapper_family.get(store, args.key)
+            elif args.action == "metric":
+                result = sapper_family.set_metric(store, args.key, args.fact, args.actor)
+            elif args.action == "spend":
+                result = sapper_family.add_spend(store, args.key, args.amount, args.note or "", args.actor)
+            elif args.action == "budget":
+                result = sapper_family.set_budget(store, args.key, args.new_attempt_budget,
+                    args.new_usd_budget, args.rationale or "", args.actor)
+            else:
+                result = sapper_family.decide(store, args.key, args.state, args.rationale or "", args.actor)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except ValueError as exc:
+        raise FGError(str(exc)) from exc
+
+
+def _collect_fact_evidence(args) -> dict | None:
+    source = getattr(args, "evidence_source", None)
+    commands = getattr(args, "repro_command", None) or []
+    try:
+        artifacts = ingest_artifacts(Path(args.store), getattr(args, "artifact", None))
+        return build_provenance(source, commands, artifacts)
+    except ValueError as exc:
+        raise FGError(str(exc)) from exc
+
+
 def cmd_fact(args) -> int:
     store = Store(Path(args.store))
     store.require()
@@ -1697,6 +1923,7 @@ def cmd_fact(args) -> int:
         doc=_read_doc_arg(args),
         kind=args.kind,
         data=parse_kv_pairs(args.data),
+        evidence=_collect_fact_evidence(args),
     )
     print(fact["id"])
     if args.json:
@@ -1715,6 +1942,7 @@ def cmd_intent(args) -> int:
         requires_confirmation=args.confirm,
         title=args.title,
         doc=_read_doc_arg(args),
+        family=getattr(args, "family", None),
     )
     print(intent["id"])
     if args.json:
@@ -2945,7 +3173,7 @@ def cmd_done(args) -> int:
     # atomic fact-create + conclude (no orphan if intent already done — review H1)
     fact, intent = store.conclude_with_new_fact(
         args.id, args.fact, args.worker, title=args.title, doc=_read_doc_arg(args),
-        kind=args.kind, data=parse_kv_pairs(args.data),
+        kind=args.kind, data=parse_kv_pairs(args.data), evidence=_collect_fact_evidence(args),
     )
     print(f"{args.id} -> {fact['id']}  ({intent['status']})")
     return 0
@@ -3017,6 +3245,9 @@ def _agents_system_prompt(store: Store) -> str:
         "  sapper kb show <kb-id>                               # full kb entry (methods+commands)\n"
         "  sapper done <intent> --fact \"<text>\" -k <kind> -d key=value  # conclude an intent\n"
         "Rules: record only confirmed observations — a scanner warning is not a vuln. "
+        "For reproducible claims, include --repro-command with the exact command; "
+        "attach small raw outputs with --artifact. These options only record evidence; "
+        "they do not execute the command. Never record API keys or credentials in commands/artifacts. "
         "Cite exact commands, hosts/ports, response evidence. Stay scoped to the "
         "assigned intent and the authorized targets. Capture flags immediately; "
         "harvest credentials/loot as you find them.\n\n"
@@ -3069,6 +3300,8 @@ def _dispatch_explore(store, templates_dir, intent, model, timeout, skip, cwd, a
         raise FGError(
             f"intent {intent['id']} requires confirmation; run `sapper confirm {intent['id']}` first"
         )
+    if not args.dry_run:
+        store._assert_intent_family_active(intent)
     if not skip:
         # explore needs to actually do work (shell, edits); without skip-permissions
         # it will prompt the user for each tool use, which is usually not what
@@ -3394,10 +3627,17 @@ def _apply_reason(store: Store, kind: str, data) -> str:
             t = t.strip() if isinstance(t, str) and t.strip() else None
             d = it.get("doc")
             d = d.strip() if isinstance(d, str) and d.strip() else None
-            intent = store.add_intent(
-                from_ids=from_ids, description=desc, creator="reason",
-                requires_confirmation=req, title=t, doc=d,
-            )
+            family = it.get("family")
+            family = family.strip() if isinstance(family, str) and family.strip() else None
+            try:
+                intent = store.add_intent(
+                    from_ids=from_ids, description=desc, creator="reason",
+                    requires_confirmation=req, title=t, doc=d, family=family,
+                )
+            except FGError:
+                if family:
+                    continue
+                raise
             made.append(intent["id"])
         return f"proposed intents: {', '.join(made) if made else '(none valid)'}"
     return "unknown"
@@ -4398,6 +4638,14 @@ def cmd_web(args) -> int:
     return web_main(argv)
 
 
+def _add_evidence_arguments(parser) -> None:
+    parser.add_argument("--evidence-source", default=None, help="source or context for the observation")
+    parser.add_argument("--repro-command", action="append", default=None,
+                        help="reproduction command text, stored but never executed (repeatable)")
+    parser.add_argument("--artifact", action="append", default=None,
+                        help="project-local artifact to hash and copy to .sapper/artifacts (repeatable)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sapper",
@@ -4464,6 +4712,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="read the detailed document from this file path")
     sp.add_argument("--creator", default="user")
     sp.add_argument("--from-intent", default=None, help="intent that produced this fact")
+    _add_evidence_arguments(sp)
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_fact)
 
@@ -4477,6 +4726,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--doc-file", default=None,
                     help="read the detailed document from this file path")
     sp.add_argument("--creator", default="user")
+    sp.add_argument("--family", default=None, help="assign this intent to a registered solution family")
     sp.add_argument("--confirm", action="store_true", help="requires human confirmation")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_intent)
@@ -4608,6 +4858,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--doc-file", default=None,
                     help="read the detailed document from this file path")
     sp.add_argument("--worker", default="agent")
+    _add_evidence_arguments(sp)
     sp.set_defaults(func=cmd_done)
 
     sp = sub.add_parser("complete", help="mark the project goal satisfied")
@@ -4831,6 +5082,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--deadline", default=None,
                     help="stop at this ISO 8601 local time (e.g. 2026-10-17T13:00:00)")
     sp.set_defaults(func=cmd_auto)
+
+    sp = sub.add_parser("family", help="manage solution-family budgets, metrics and stop-loss")
+    sp.add_argument("action", choices=["add", "list", "show", "metric", "spend", "budget", "decide"])
+    sp.add_argument("key", nargs="?", default=None)
+    sp.add_argument("--label", default=None)
+    sp.add_argument("--hypothesis", default=None)
+    sp.add_argument("--metric-name", default=None)
+    sp.add_argument("--direction", choices=["higher", "lower"], default="higher")
+    sp.add_argument("--budget-attempts", type=int, default=8)
+    sp.add_argument("--budget-usd", type=float, default=8.0)
+    sp.add_argument("--stall-limit", type=int, default=3)
+    sp.add_argument("--fact", default=None)
+    sp.add_argument("--amount", type=float, default=None)
+    sp.add_argument("--new-attempt-budget", type=int, default=None)
+    sp.add_argument("--new-usd-budget", type=float, default=None)
+    sp.add_argument("--note", default=None)
+    sp.add_argument("--state", choices=sorted(Store.FAMILY_STATES), default=None)
+    sp.add_argument("--rationale", default=None)
+    sp.add_argument("--actor", default="user")
+    sp.set_defaults(func=cmd_family)
 
     return p
 

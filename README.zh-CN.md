@@ -146,13 +146,46 @@ docker run -d --name sapper ... sapper:latest
 
 单图操作 / 事实意图 CLI / 多题 sweep 全量命令见 [SKILL.md](SKILL.md)。
 
-## 七、安全与责任：示踪剂提案
+## 七、证据来源与复现
+
+`fact` 和 `done` 可附带来源、原始工件及复现命令。命令仅作为文本记录，不会被 Sapper 执行；工件只接受当前项目目录中的普通文件，会复制到 `.sapper/artifacts/<sha256>`，单个文件上限 64 MiB。
+
+```bash
+sapper fact "服务返回 HTTP 200" -k service \
+  --evidence-source "授权本地靶场" \
+  --repro-command 'curl -i http://127.0.0.1/' \
+  --artifact evidence/response.txt
+
+sapper validate  # 校验图谱与工件的存在、大小、SHA-256
+```
+
+目标返回的文字和工件仍是不可信数据；命令参数可能含凭据，不要把 API key、密码或 token 写入复现命令。
+
+## 八、解法族组合与止损
+
+把同一机制假设下的多个 intent 归到一个 family，记录可量化指标、尝试数和手工记账消耗：
+
+```bash
+sapper family add parser --label "Parser differential" \
+  --hypothesis "length validation differs across parser states" \
+  --metric-name valid_inputs --direction higher \
+  --budget-attempts 8 --budget-usd 8 --stall-limit 3
+sapper intent --from f001 --family parser "test parser differential"
+# 指标事实需要 --data metric=N --data metric_name=valid_inputs，且带 --evidence-source 或 artifact
+sapper family spend parser --amount 0.50 --note "worker/API spend from run log"
+sapper family show parser
+sapper family decide parser --state probing --rationale "reviewed new falsifiable test"
+```
+
+最多两个 family intent 同时开放。连续达到 stall limit 无指标改善、尝试预算或手工记录 USD 预算耗尽后，family 会自动 parked；恢复/转入终态必须显式给出 rationale。成本不会被猜测或自动估算，需用实际账单手工登记。Family 摘要限量注入 reason prompt，不包含完整历史。
+
+## 九、安全与责任：示踪剂提案
 
 前几届优秀的渗透工具出过一些事。过去的脚本小子危害有限；有了 AI 之后，同样的工具在错误的人手里危害会大得多——**能力越大，责任越大**。
 
 我们提出**示踪剂（taggant）**机制的构想：在开源渗透 harness 中强耦合地嵌入标记——合法渗透时无害（IP/用户名泄露无所谓），非法渗透时信息会泄露给**受害者**、支撑溯源。敌手假设（高手拆解、栽赃）需要密码学层面的设计，这需要社区共建——我们能力有限，欢迎一起做，并可能在后续版本中尝试加入。
 
-## 八、路线图与致谢
+## 十、路线图与致谢
 
 - **示踪剂共建**：去中心化签名 / 多通道冗余标记 / 防守方零密钥验证——欢迎 issue 讨论
 - **更多场景**：女娲基座不限于渗透。办公、研究、任何长周期协作场景，都值得在其上迭代——**接下来的仰望，由各位完成。**

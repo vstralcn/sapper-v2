@@ -334,7 +334,7 @@ class HttpTests(unittest.TestCase):
         pid = p["id"]
         status, _, raw = self.request("/api/native/catalog")
         self.assertEqual(status, 200)
-        self.assertEqual(len(json.loads(raw)["commands"]), 31)
+        self.assertEqual(len(json.loads(raw)["commands"]), 32)
         body = {"operation": "fact", "values": {"description": "HTTP fixture"}}
         self.assertEqual(self.request(f"/api/native/{pid}/preview", "POST", body, {"X-Sapper-CSRF": "bad"})[0], 403)
         status, _, raw = self.request(f"/api/native/{pid}/preview", "POST", body)

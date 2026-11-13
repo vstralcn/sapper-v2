@@ -33,7 +33,7 @@
 | [下一阶段：工作区与角色](./06-workspace-and-roles-plan.md) | 绑定题目目录、原 Claude Code 会话、角色还原、真实 hook 缺口与分阶段验收 |
 | [全局上下文与总体概览](./08-global-context-and-overview.md) | 全角色共享环境配置、注入方式／版本、首页与最新验收 |
 | [工作区实现与验收记录](./07-workspace-implementation.md) | 本次实现、实际验证、原模式兼容边界与剩余环境验收 |
-| [非平台原生功能覆盖](./09-native-capability-coverage.md) | 31 个原生命令、配置与模板、通信、原调度／编队、覆盖范围和最新验收 |
+| [非平台原生功能覆盖](./09-native-capability-coverage.md) | 32 个原生命令、配置与模板、通信、原调度／编队、覆盖范围和最新验收 |
 | [模型协议与连接测试](./10-model-protocols.md) | Messages／Responses／Chat Completions、获取模型、测试生成、实际工具调用与适配服务 |
 | [原生角色提示词对齐与实现](./11-native-role-prompts-plan.md) | 默认角色职责、原生条件派发策略、真实看板、创建预览与验收记录 |
 | [恢复后继续执行规划](./12-resume-continuation-plan.md) | 已确认的恢复后等待输入缺陷、后台任务边界、推荐交互与验收条件 |
@@ -44,7 +44,7 @@
 
 登录与刷新默认进入总体概览，汇总全部工作区、活动角色和最近运行。侧栏“全局上下文”可配置服务器、本机工具等共享信息，通过启动提示词和会话 hooks 传给各角色，显示启动／hook 版本；详见[新功能说明](./08-global-context-and-overview.md)。
 
-侧栏／工作区“原生功能”现已覆盖原 CLI 的 31 个非平台命令及参数，可预览命令、选择配置并直接执行。包含原 `auto/dispatch/command/sweep/fleet`、授权通信、知识库新增／导入／正文、模板与编队配置编辑，以及图生命周期操作。排除 `arena/bench/flag --submit`；原 CLI 保留。具体能力和原生流程与交互会话的区别见[覆盖说明](./09-native-capability-coverage.md)。
+侧栏／工作区“原生功能”现已覆盖原 CLI 的 32 个非平台命令及参数，可预览命令、选择配置并直接执行。包含原 `auto/dispatch/command/sweep/fleet`、授权通信、知识库新增／导入／正文、模板与编队配置编辑，以及图生命周期操作。排除 `arena/bench/flag --submit`；原 CLI 保留。具体能力和原生流程与交互会话的区别见[覆盖说明](./09-native-capability-coverage.md)。
 
 模型配置可选择 Anthropic Messages、OpenAI Responses 或 Chat Completions，获取并筛选模型、手动填写 ID、测试文本生成。新协议通过本机 HTTP 适配连接原 Claude Code，不替换其工具循环。配置页可查看／停止后台适配服务；详见[模型配置说明](./10-model-protocols.md)。
 
