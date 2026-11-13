@@ -225,6 +225,10 @@ sapper fact "service returned HTTP 200" -k service \
 sapper validate  # checks graph plus artifact presence, size and SHA-256
 ```
 
+The console's "facts & intents" form accepts the same three fields, and the
+record detail view shows the source, commands and artifact digests. Artifact
+rules match the CLI: inside the project directory, no symlinks, 64 MiB each.
+
 Target responses and artifacts remain untrusted data. Command arguments can
 contain credentials — do not write API keys, passwords, or tokens into
 reproduction commands.

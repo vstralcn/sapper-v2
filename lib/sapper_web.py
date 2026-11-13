@@ -33,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import sapper
 import sapper_context
+import sapper_evidence
 from kb import KnowledgeBase, KBError
 from sapper_workspace import Workspaces, WorkspaceError, ROLES
 from sapper_native import NativeSurface, NativeError
@@ -284,6 +285,34 @@ class Console:
         root = Path(self.project(pid)["path"])
         return sapper.Store(self.inside(root / ".sapper", root))
 
+    def evidence(self, store, pid, data):
+        """Translate a graph-action payload into fact provenance.
+
+        Mirrors the CLI: reproduction commands are stored as text and never
+        executed, and artifacts must be regular files inside the bound project
+        directory, copied into the graph under their SHA-256.
+        """
+        source = data.get("evidence_source")
+        raw_commands = data.get("repro_commands") or []
+        raw_artifacts = data.get("artifacts") or []
+        if source is not None and not isinstance(source, str):
+            raise WebError("证据来源必须为文本")
+        for name, value in (("repro_commands", raw_commands), ("artifacts", raw_artifacts)):
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise WebError("复现命令与工件必须是文本列表")
+            if len(value) > 32:
+                raise WebError("单条事实最多记录 32 条复现命令和 32 个工件")
+        commands = [item.strip() for item in raw_commands if item.strip()]
+        artifacts = [item.strip() for item in raw_artifacts if item.strip()]
+        if not (source and source.strip()) and not commands and not artifacts:
+            return None
+        cwd = Path(self.project(pid)["path"]).resolve()
+        try:
+            items = sapper_evidence.ingest_artifacts(store.root, artifacts, cwd=cwd)
+        except ValueError as exc:
+            raise WebError(str(exc)) from exc
+        return sapper_evidence.provenance(source, commands, items, cwd)
+
     def create_project(self, data):
         name = require_text(data, "name", 64)
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
@@ -321,7 +350,8 @@ class Console:
         elif action == "fact":
             result = store.add_fact(require_text(data, "description"), "web-user",
                                     source_intent=data.get("from_intent") or None,
-                                    title=data.get("title"), doc=data.get("doc"), kind=data.get("kind"), data=data.get("data"))
+                                    title=data.get("title"), doc=data.get("doc"), kind=data.get("kind"),
+                                    data=data.get("data"), evidence=self.evidence(store, pid, data))
         elif action == "intent":
             result = store.add_intent(data.get("from", []), require_text(data, "description"),
                                       "web-user", requires_confirmation=bool(data.get("requires_confirmation")),
@@ -334,7 +364,8 @@ class Console:
             result = store.release_intent(require_text(data, "id", 64), require_text(data, "worker", 100))
         elif action == "done":
             fact, intent = store.conclude_with_new_fact(require_text(data, "id", 64), require_text(data, "description"),
-                require_text(data, "worker", 100), title=data.get("title"), doc=data.get("doc"), kind=data.get("kind"), data=data.get("data"))
+                require_text(data, "worker", 100), title=data.get("title"), doc=data.get("doc"), kind=data.get("kind"),
+                data=data.get("data"), evidence=self.evidence(store, pid, data))
             result = {**fact, "concluded_intent": intent["id"]}
         elif action == "complete":
             result = store.complete_project(data.get("from", []), require_text(data, "note"), require_text(data, "worker", 100))
