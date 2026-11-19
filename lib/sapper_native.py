@@ -26,6 +26,7 @@ LABELS = {
     "brainstorm-pick": "选择头脑风暴方案", "setup": "启用项目接入", "teardown": "撤销项目接入",
     "view": "导出／查看原生图", "flag": "本地 Flag 记账", "kb": "原知识库", "command": "原生多任务指挥官",
     "fleet": "原生 tmux 编队", "sweep": "原生多任务轮转", "auto": "原生自主推进",
+    "family": "解法族组合与止损",
 }
 FIELD_LABELS = {"description": "描述", "title": "标题", "from_": "依据事实 ID", "id": "节点 ID", "worker": "执行者标签",
     "creator": "来源标签", "kind": "类型", "data": "结构化数据（每行 key=value）", "doc": "详细文档", "query": "检索内容",
@@ -43,7 +44,13 @@ FIELD_LABELS = {"description": "描述", "title": "标题", "from_": "依据事�
     "print": "输出 HTML", "serve": "启动原生图服务", "host": "原生服务监听地址", "port": "原生服务端口",
     "set": "设置文档内容", "set_file": "从文件设置文档", "edit": "在原终端编辑文档", "force": "覆盖原内容",
     "purge": "同时删除图数据", "agents": "生成原 AGENTS 说明", "format": "输出格式", "no_log": "不记通信日志", "raw": "不加发送者前缀",
-    "doc_file": "从文件读取文档", "detail_file": "知识正文文件", "log": "记录终端捕获内容", "entity": "节点类型"}
+    "doc_file": "从文件读取文档", "detail_file": "知识正文文件", "log": "记录终端捕获内容", "entity": "节点类型",
+    "evidence_source": "证据来源", "repro_command": "复现命令（每行一条，仅记录不执行）",
+    "artifact": "工件路径（每行一个，须在项目目录内）", "family": "解法族 key",
+    "key": "解法族 key", "label": "显示名称", "hypothesis": "机制假设", "metric_name": "指标名",
+    "direction": "指标方向", "budget_attempts": "尝试预算", "budget_usd": "USD 预算（手工记账）",
+    "stall_limit": "无改善止损轮数", "amount": "本次记账金额（USD）", "new_attempt_budget": "新尝试预算",
+    "new_usd_budget": "新 USD 预算", "state": "目标状态", "rationale": "理由", "actor": "操作者"}
 
 
 def cleanup_bridge(directory):

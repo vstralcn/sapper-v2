@@ -100,6 +100,9 @@ Reject only when execution would be clearly inappropriate:
 ```
 {graph_yaml}
 ```
+Facts tagged `[ev]` carry recorded provenance (source, reproduction commands,
+artifact digests). This block shows only the tag to stay compact; read the
+detail with `sapper show fact <id>` before redoing or duplicating that work.
 
 ## Valid fact ids
 ```
@@ -109,6 +112,12 @@ Reject only when execution would be clearly inappropriate:
 ## Open intents
 ```
 {open_intents}
+```
+
+## Registered solution families (bounded portfolio summary)
+Use only these registered keys in an intent's optional `family` field. Reuse an active family when the new intent tests its stated hypothesis; start a new family only for a genuinely distinct mechanism. Never assign to parked/terminal families. If none fits, omit `family` and explain the new hypothesis in the intent doc.
+```
+{families}
 ```
 
 ## Hints (human)

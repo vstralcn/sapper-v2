@@ -119,6 +119,9 @@ Each node has THREE documentation layers — use them correctly:
 ```
 {graph_yaml}
 ```
+Facts tagged `[ev]` carry recorded provenance (source, reproduction commands,
+artifact digests). This block shows only the tag to stay compact; use
+`sapper show fact <id>` when you need the exact prior command or artifact.
 
 ## Prior similar work (recall)
 The orchestrator pre-ran `sapper recall` against this intent's description. If
