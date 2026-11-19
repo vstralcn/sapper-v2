@@ -10,6 +10,7 @@ import shlex
 import time
 
 from sapper_workspace import WorkspaceError
+from sapper_auth import AuthError
 
 
 class TerminalBridge:
@@ -121,7 +122,9 @@ class TerminalBridge:
             previous_snapshot = None
             heartbeat = time.monotonic()
             last_check = 0
-            while session["expires"] > time.time() and handler.session() is session:
+            # Persistent sessions are loaded as fresh records, not shared objects.
+            # Recheck on each cycle so logout, reset and expiry also close SSE.
+            while handler.session() == session:
                 if source["mode"] == "snapshot":
                     snap = self.snapshot(pane)
                     if snap["text"] != previous_snapshot:
@@ -154,5 +157,5 @@ class TerminalBridge:
                     handler.wfile.flush()
                     heartbeat = now
             send({"type": "ended"})
-        except (BrokenPipeError, ConnectionResetError, OSError, WorkspaceError):
+        except (AuthError, BrokenPipeError, ConnectionResetError, OSError, WorkspaceError):
             pass

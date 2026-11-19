@@ -65,6 +65,10 @@ function taskApi(action, options = {}) {
 }
 function showLogin() {
   state.csrf = "";
+  state.username = "";
+  document.querySelectorAll("dialog[open]").forEach(dialog => dialog.close());
+  $("password-form").reset();
+  $("password-error").textContent = "";
   $("workspace").hidden = true;
   $("login").hidden = false;
   if (typeof disconnectNative === "function") disconnectNative();
@@ -74,6 +78,7 @@ async function showWorkspace() {
   state.project = null;
   $("login").hidden = true;
   $("workspace").hidden = false;
+  $("account-username").value = state.username;
   const [health, profiles] = await Promise.all([api("/health"), api("/profiles")]);
   state.profiles = profiles;
   $("root-path").textContent = health.root;
@@ -117,15 +122,16 @@ async function refreshTask() {
   if (state.view === "overview") return refreshOverview();
   const pid = state.project?.id;
   if (!pid) return;
+  const navigation = state.navigation;
   const [graph, panes, runs] = await Promise.all([taskApi("graph"), api("/panes"), api(`/runs?project=${pid}`)]);
-  if (pid !== state.project?.id) return;
+  if (pid !== state.project?.id || navigation !== state.navigation) return;
   state.graph = graph;
   const project = state.projects.find(p => p.id === pid);
   if (project) {
     const count = graph.facts.filter(f => f.id !== "goal").length;
     if (project.facts !== count) {project.facts = count; renderProjects();}
   }
-  state.panes = panes.filter(p => p.project_id === pid || p.role === "commander");
+  state.panes = panes.filter(p => p.project_id === pid);
   state.runs = runs;
   $("breadcrumb").textContent = state.project.name;
   $("project-name").textContent = state.project.name;
@@ -329,7 +335,9 @@ async function refreshLog() {
   if ($("follow-log").checked) $("log-output").scrollTop = $("log-output").scrollHeight;
 }
 async function loadFiles() {
-  const result = await taskApi("files?path=" + encodeURIComponent(state.folder));
+  const pid = state.project?.id, folder = state.folder, navigation = state.navigation;
+  const result = await taskApi("files?path=" + encodeURIComponent(folder));
+  if (pid !== state.project?.id || folder !== state.folder || navigation !== state.navigation) return;
   $("files-path").textContent = state.folder === "." ? "" : "/ " + state.folder;
   $("files-up").hidden = state.folder === ".";
   const list = $("files-list");
@@ -408,6 +416,11 @@ function updateRunOptions() {
   $("dispatch-options").hidden = kind !== "dispatch";
   $("custom-options").hidden = kind !== "custom";
   $("agent-options").hidden = !["auto", "dispatch"].includes(kind);
+  const form=$("run-form").elements;
+  const worker=kind==="auto"||kind==="dispatch"&&/^i\d+$/.test(form.target.value.trim());
+  const warning=AgentTopologyModel.permissionWarning(form.skip_permissions.checked,worker&&!form.dry_run.checked);
+  $("run-permission-warning").textContent=warning;
+  $("run-permission-warning").hidden=!warning;
 }
 async function startRun(data) {
   data.request_id = crypto.randomUUID();
@@ -446,17 +459,30 @@ function submit(id, action) {
     try { await action(new FormData(event.currentTarget)); }
     catch (error) {
       if (id === "login-form") $("login-error").textContent = error.message;
+      else if (id === "password-form") $("password-error").textContent = error.message;
       else toast(error.message, true);
     } finally { if (btn) btn.disabled = false; }
   });
 }
 
 submit("login-form", async () => {
-  const result = await api("/session", {method: "POST", body: {token: $("access-token").value.trim()}});
+  const result = await api("/session", {method: "POST", body: {username: $("login-username").value.trim(), password: $("login-password").value}});
   state.csrf = result.csrf;
-  $("access-token").value = "";
+  state.username = result.username;
+  $("login-password").value = "";
   $("login-error").textContent = "";
   await showWorkspace();
+});
+submit("password-form", async data => {
+  if (data.get("new_password") !== data.get("confirm_password")) throw new Error("两次输入的新密码不一致");
+  await api("/account/password", {method: "POST", body: {current_password: data.get("current_password"), new_password: data.get("new_password")}});
+  showLogin();
+  $("login-error").textContent = "密码已修改，请使用新密码登录。";
+});
+$("profiles-dialog").addEventListener("close", () => {
+  $("password-form").reset();
+  $("account-username").value = state.username || "";
+  $("password-error").textContent = "";
 });
 submit("create-form", async data => {
   const result = await api("/projects", {method: "POST", body: Object.fromEntries(data)});
@@ -466,13 +492,9 @@ submit("create-form", async data => {
   $("create-dialog").close();
   $("create-form").reset();
   await refreshProjects();
-  toast("任务已通过原 Store 初始化");
-});
-submit("hint-form", async () => {
-  await taskApi("hint", {method: "POST", body: {content: $("hint-content").value}});
-  $("hint-content").value = "";
-  await refreshTask();
-  toast("已保存至原 hint；尚不代表 agent 已读取");
+  setTab("workspace");
+  openAgent("commander");
+  toast("工作区已创建，请确认初步配置");
 });
 submit("record-form", async data => {
   const payload = Object.fromEntries(data);
@@ -524,9 +546,10 @@ submit("knowledge-form", loadKnowledge);
 
 $("new-project").onclick = $("empty-create").onclick = () => $("create-dialog").showModal();
 $("refresh-projects").onclick = () => guarded(refreshProjects);
-$("start-run").onclick = () => openRun();
 $("open-shell").onclick = () => openRun("shell");
 $("run-kind").onchange = updateRunOptions;
+$("run-form").addEventListener("input",updateRunOptions);
+$("run-form").addEventListener("change",updateRunOptions);
 $("add-fact").onclick = () => openRecord("fact");
 $("add-intent").onclick = () => openRecord("intent");
 $("worker-manage").onclick = () => $("worker-dialog").showModal();
@@ -595,8 +618,14 @@ setInterval(async () => {
 }, 2000);
 
 document.addEventListener("DOMContentLoaded", async () => {
-  try { const session = await api("/session"); state.csrf = session.csrf; await showWorkspace(); }
-  catch { showLogin(); }
+  try { const session = await api("/session"); state.csrf = session.csrf; state.username = session.username; await showWorkspace(); }
+  catch {
+    showLogin();
+    try {
+      const auth = await api("/auth");
+      if (!auth.configured) $("login-help").textContent = "请先在服务器本机执行 ./sapperctl auth-init 初始化管理员；独立实例请指定对应的 --state 目录。";
+    } catch (error) { $("login-error").textContent = error.message; }
+  }
 }, {once:true});
 
 const profileProtocolNames={anthropic:'Anthropic Messages',responses:'Responses',chat_completions:'Chat Completions'};

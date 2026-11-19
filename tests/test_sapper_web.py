@@ -133,7 +133,7 @@ class ConsoleTests(unittest.TestCase):
         stored = next(p for p in self.app.config()["profiles"] if p["id"] == one["id"])
         self.assertEqual(stored["api_key"], "synthetic-secret-one")
         self.assertEqual(stat.S_IMODE(self.app.config_path.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(self.app.token_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.app.auth.path.stat().st_mode), 0o600)
         self.app.delete_profile(two["id"])
         self.assertEqual(len(self.app.profiles()), 1)
 
@@ -174,12 +174,60 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(first["text"] + second["text"], expected)
         self.assertEqual(second["offset"], len(expected.encode()))
 
+    def test_run_list_collects_credentials_once_and_refreshes_them_next_batch(self):
+        self.app.save_profile({"name": "test", "model": "fixture", "api_key": "fixture-profile-secret"})
+        private_json(self.app.state / "agents" / ("b" * 16 + ".json"),
+                     {"mcp_env_refs": ["SAPPER_TEST_MCP_SECRET"], "deleted_at": "historical"})
+        private_json(self.app.state / "model-bridges" / "fixture" / "ready.json",
+                     {"token": "fixture-bridge-secret"})
+        for i in range(4):
+            directory = self.app.run_path(f"{i:016x}")
+            private_json(directory / "run.json", {"id": f"{i:016x}", "project_id": self.pid,
+                         "status": "exited", "created_at": str(i), "command": "fixture-profile-secret"})
+            private_json(directory / "activity.json", {"latest_message":
+                         "fixture-profile-secret fixture-bridge-secret fixture-mcp-old fixture-mcp-new"})
+        extensions = self.app.workspaces.extensions
+        for secret in ("fixture-mcp-old", "fixture-mcp-new"):
+            with mock.patch.dict(os.environ, {"SAPPER_TEST_MCP_SECRET": secret}), \
+                    mock.patch.object(extensions, "credential_values", wraps=extensions.credential_values) as collect:
+                records = self.app.runs()
+            collect.assert_called_once()
+            self.assertEqual(len(records), 4)
+            result = json.dumps(records)
+            for hidden in ("fixture-profile-secret", "fixture-bridge-secret", secret):
+                self.assertNotIn(hidden, result)
+
+    def test_workspace_status_and_overview_share_run_queries(self):
+        aid, rid = "a" * 16, "b" * 16
+        private_json(self.app.run_path(rid) / "run.json", {"id": rid, "project_id": self.pid,
+                     "session": "fixture", "status": "exited", "created_at": "2026-01-01", "exit_code": 0})
+        self.app.workspaces.save_agent({"id": aid, "workspace_id": self.pid, "role": "worker",
+                                       "run_id": rid, "created_at": "2026-01-01"})
+        private_json(self.app.state / "services" / "fixture.json",
+                     {"id": "fixture", "workspace_id": self.pid, "run_id": rid})
+        with mock.patch.object(self.app, "runs", wraps=self.app.runs) as runs, \
+                mock.patch.object(self.app, "panes", return_value=[]) as panes:
+            status = self.app.workspace_status(self.pid)
+            self.assertEqual(status["agents"][0]["status"], "exited")
+            self.assertEqual(status["agents"][0]["exit_code"], 0)
+            self.assertEqual(status["services"][0]["status"], "exited")
+            runs.assert_called_once_with()
+            panes.assert_called_once_with()
+        with mock.patch.object(self.app, "runs", wraps=self.app.runs) as runs, \
+                mock.patch.object(self.app, "panes", return_value=[]), \
+                mock.patch.object(self.app.workspaces, "capabilities", return_value={"available": False}):
+            overview = self.app.overview()
+            self.assertEqual(overview["agents"][0]["id"], aid)
+            self.assertEqual(overview["recent_runs"][0]["id"], rid)
+            runs.assert_called_once_with()
+
 
 class HttpTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         base = Path(self.temp.name)
         self.app = Console(base / "tasks", base / "state")
+        self.app.auth.initialize("admin", "fixture web password 123")
         self.server = WebServer(("127.0.0.1", 0), self.app, prefix="/sapper")
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -207,10 +255,43 @@ class HttpTests(unittest.TestCase):
         return result
 
     def login(self):
-        status, headers, body = self.request("/api/session", "POST", {"token": self.app.token})
+        status, headers, body = self.request("/api/session", "POST", {"username": "admin", "password": "fixture web password 123"})
         self.assertEqual(status, 200)
         self.cookie = headers["Set-Cookie"].split(";", 1)[0]
         self.csrf = json.loads(body)["csrf"]
+
+    def test_password_login_rejects_legacy_token_and_sets_private_cookie(self):
+        (self.app.state / "token").write_text("legacy-fixture-token-that-is-no-longer-accepted")
+        self.assertEqual(self.request("/api/auth")[0], 200)
+        self.assertEqual(self.request("/api/session", "POST", {"token": (self.app.state / "token").read_text()})[0], 401)
+        self.server.secure_cookie = True
+        status, headers, body = self.request("/api/session", "POST", {"username": "admin", "password": "fixture web password 123"})
+        self.assertEqual(status, 200)
+        for attribute in ("HttpOnly", "SameSite=Strict", "Path=/sapper", "Secure"):
+            self.assertIn(attribute, headers["Set-Cookie"])
+        self.assertEqual(json.loads(body)["username"], "admin")
+        self.assertNotIn(b"password", body)
+
+    def test_password_change_requires_session_csrf_and_current_password(self):
+        data = {"current_password": "fixture web password 123", "new_password": "abc123"}
+        self.assertEqual(self.request("/api/account/password", "POST", data)[0], 401)
+        self.login()
+        cookie = self.cookie
+        self.assertEqual(self.request("/api/account/password", "POST", data, {"X-Sapper-CSRF": "wrong"})[0], 403)
+        self.assertEqual(self.request("/api/account/password", "POST", {**data, "current_password": "wrong"})[0], 400)
+        self.assertEqual(self.request("/api/account/password", "POST", {**data, "new_password": "short"})[0], 400)
+        status, headers, _ = self.request("/api/account/password", "POST", data)
+        self.assertEqual(status, 200)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+        self.assertEqual(self.request("/api/session", headers={"Cookie": cookie})[0], 401)
+        self.assertEqual(self.request("/api/session", "POST", {"username": "admin", "password": data["new_password"]})[0], 200)
+
+    def test_existing_cookie_remains_valid_after_console_reload(self):
+        self.login()
+        self.server.console = Console(self.app.root, self.app.state)
+        status, _, body = self.request("/api/session")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["csrf"], self.csrf)
 
     def test_role_models_require_auth_csrf_and_persist_under_subpath(self):
         self.assertEqual(self.request("/api/role-models")[0], 401)

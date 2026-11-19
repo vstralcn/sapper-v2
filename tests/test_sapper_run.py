@@ -11,6 +11,19 @@ from sapper_web import private_json
 
 
 class RunOutputTests(unittest.TestCase):
+    def test_phases_track_pending_tools_questions_and_round_end(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = RunOutput(Path(temp), private_json)
+            def emit(event, phase):
+                output.observe(json.dumps(event))
+                self.assertEqual(output.activity["phase"], phase)
+            emit({"type":"system", "subtype":"init"}, "unknown")
+            emit({"type":"assistant", "message":{"content":[{"type":"tool_use", "id":"read", "name":"Read"}]}}, "tool_running")
+            emit({"type":"assistant", "message":{"content":[{"type":"tool_use", "id":"ask", "name":"AskUserQuestion"}]}}, "waiting_user")
+            emit({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"ask"}]}}, "tool_running")
+            emit({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"read"}]}}, "responding")
+            emit({"type":"assistant", "message":{"stop_reason":"end_turn", "content":[{"type":"text", "text":"done"}]}}, "idle")
+
     def test_tool_events_retries_text_and_final_error_are_preserved(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)

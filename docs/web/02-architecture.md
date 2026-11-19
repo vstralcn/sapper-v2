@@ -12,12 +12,14 @@
 | 模型执行与自主循环 | 同文件的 `run_claude`、`cmd_auto`、`cmd_command`、`cmd_fleet` | 调用原命令，不替换 CLI 或工具循环 |
 | 图查看页 | 同文件的 `cmd_view`、`_view_serve` 和 [view_template.html](../../lib/view_template.html) | 复用图数据和展示；当前只有 GET 页面与图接口 |
 | worker 管理 | [worker.sh](../../docker/commander/worker.sh) 的 `spawn/msg/peek/list/board/hint/kill` | 包装现有操作，保留参数与行为 |
-| 会话保活与凭据轮换 | [watchdog.sh](../../docker/commander/watchdog.sh) | 展示与接入原机制，不新增第二个保活控制器 |
+| 会话保活与凭据轮换 | [watchdog.sh](../../docker/commander/watchdog.sh)、[工作区监控](../../lib/sapper_workspace.py)、[指挥官监控](../../lib/sapper_commander.py) | 按运行模式分支；工作区监控循环委托指挥官监控处理续轮与恢复 |
 | 平台依赖 | [entrypoint.sh](../../docker/commander/entrypoint.sh) 强制检查比赛变量；worker 启动会请求平台 | 为显式通用模式增加可选分支，保留原比赛入口 |
 | 已有多引擎／网关路径 | worker 中 `--engine`、`--gw`、`--model` 及 pane 配置 | 在原支持范围映射网页配置，具体协议能力另行验证 |
 | 知识库、hooks 与通信 | [lib/kb.py](../../lib/kb.py)、[sapper-hook.py](../../lib/sapper-hook.py)、sapper peers/send/capture | 保留原文件、授权与调用方式 |
 
 `SAPPER_BIN` 在不同文件有不同用途：Python 调度中表示模型 CLI 前缀，worker 脚本中表示 sapper 命令；网页配置必须区分，不能将其当作统一的任意模型适配接口。
+
+watchdog 的入口按模式分流：原比赛／CLI 模式执行 `watchdog.sh` 的 shell 循环，负责原有 pane 保活、凭据轮换和比赛时限；`SAPPER_MODE=workspace` 时脚本转入 `sapper_workspace.py watch()`。工作区循环监控所属角色并委托 `CommanderMonitor` 处理主 agent 状态、续轮和恢复；具体状态与确认依据见[指挥官续轮](./14-commander-liveness.md)。
 
 ## 2. 结构
 

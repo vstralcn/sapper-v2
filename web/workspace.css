@@ -45,7 +45,17 @@
 .extension-resource { display: flex; align-items: center; gap: 12px; padding: 8px 0; flex-wrap: wrap; }
 .extension-resource > span { flex: 1; overflow-wrap: anywhere; }
 .extension-group { margin-bottom: 12px; }
+#dispatch-settings{margin:16px 0}#dispatch-settings>label,#dispatch-settings>fieldset{margin-top:16px}
 .extension-group .inline-check { display: inline-flex; margin-right: 16px; overflow-wrap: anywhere; }
 #extensions-dialog details { margin-top: 20px; }
 #extensions-dialog form { margin-top: 12px; }
 #extensions-dialog textarea { font-family: monospace; }
+
+.workspace-agents .agent-preview{max-height:470px;overflow:auto}
+.workspace-agents .agent-preview-row{padding:10px 6px;border-radius:4px}
+.workspace-agents .agent-preview-row:hover,.workspace-agents .agent-preview-row[aria-pressed=true]{background:var(--surface)}
+.workspace-agents .agent-preview-info{display:flex;flex:1;min-width:0;flex-direction:column;gap:5px}
+.agent-preview-info strong{font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis}
+.agent-preview-task{font-size:10px;color:var(--muted);overflow:hidden;text-overflow:ellipsis}
+.workspace-agents .agent-preview-status{font-size:10px}
+@media(max-width:1200px){.workspace-agents .agent-preview{max-height:300px}}

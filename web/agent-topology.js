@@ -13,7 +13,7 @@ class AgentTopologyView {
     this.elements = new Map();
     this.connected = true;
     root.innerHTML = `
-      <div class="at-heading"><div><h2>角色与协作</h2><p>查看当前分工、真实派发关系与运行观测。</p></div><div class="at-heading-tools"><span data-at="connection" class="at-connection">正在读取工作区</span><button data-at="dispatch" class="button primary">＋ 派发角色</button></div></div>
+      <div class="at-heading"><div><h2>角色与协作</h2><p>查看当前分工、真实派发关系与运行观测。</p></div><div class="at-heading-tools"><span data-at="connection" class="at-connection">正在读取工作区</span></div></div>
       <div data-at="metrics" class="at-metrics" aria-label="当前工作区完整 Agent 统计"></div>
       <div class="at-attention"><button data-at="attention" class="text-button"></button><span data-at="totals"></span></div>
       <div class="at-monitor">
@@ -92,6 +92,7 @@ class AgentTopologyView {
       c.focused = false;
     }
     if (!c.initialized) {
+      if (this.rows.length && this.rows.every(a => a.observation.status === "offline")) c.scope = "all";
       const parent = this.model.parents(this.rows);
       if (this.rows.length > 14) {
         for (const a of this.rows) if (parent.get(a.id) && this.model.descendants(a.id, parent).size >= 3) c.collapsed.add(a.id);
@@ -225,10 +226,9 @@ class AgentTopologyView {
     empty.replaceChildren();
     if (!empty.hidden) {
       empty.append(element("strong", "", this.rows.length ? "没有符合筛选条件的 Agent" : "还没有登记的 Agent"));
-      empty.append(element("p", "", this.rows.length ? "可调整状态或显示范围。" : "打开原会话或派发角色后，真实关系会显示在这里。"));
-      empty.append(button(this.rows.length ? "清除筛选" : "＋ 派发角色", "button", () => {
-        if (!this.rows.length) this.dispatch();
-        else { c.scope = "all"; c.status = "all"; this.rebuild(); this.fit(); }
+      empty.append(element("p", "", this.rows.length ? "可调整状态或显示范围。" : "点击页面上方的“派发角色”，启动本工作区主 agent。"));
+      if (this.rows.length) empty.append(button("清除筛选", "button", () => {
+        c.scope = "all"; c.status = "all"; this.rebuild(); this.fit();
       }));
     }
   }
@@ -406,7 +406,6 @@ class AgentTopologyView {
 
   bind() {
     const canvas = this.el("canvas");
-    this.el("dispatch").onclick = this.dispatch;
     this.root.querySelectorAll("[data-at-scope]").forEach(b => b.onclick = () => {
       this.current.scope = b.dataset.atScope; this.current.status = "all"; this.rebuild();
     });

@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from sapper_web import Console, WebError
+from sapper_web import Console, WebError, private_json
 from sapper_workspace import WorkspaceError, worker
 
 
@@ -28,6 +28,7 @@ class RoleModelTests(unittest.TestCase):
         self.ds = self.app.save_profile({"name": "DS", "model": "ds-fixture", "protocol": "chat_completions"})
         self.counter = 0
         self.start = mock.patch.object(self.app, "start", side_effect=self.fake_start).start()
+        mock.patch.object(self.app.workspaces, "start_watchdog", return_value={}).start()
         self.addCleanup(mock.patch.stopall)
         self.app.panes = lambda: []
 
@@ -84,6 +85,41 @@ class RoleModelTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "不能静默改变"):
             self.app.workspaces.resume(agent["id"], {})
 
+    def test_resume_error_identifies_original_route_and_current_workspace_default(self):
+        agent = self.launch(role="commander", profile_id="")
+        self.app.save_role_models({"assignments":{"commander":self.glm["id"]},
+            "expected_revision":self.app.role_models()["revision"]}, self.pid)
+        model = self.app.workspaces.resume_model_info(agent)
+        self.assertEqual(model["original_profile_id"], "")
+        self.assertEqual(model["current_profile_id"], self.glm["id"])
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(self.app, "start", wraps=Console.start.__get__(self.app)), \
+                mock.patch.object(self.app, "tmux") as tmux:
+            with self.assertRaises(WebError) as error:
+                self.app.workspaces.resume(agent["id"], {"profile_id":self.glm["id"]})
+        message = str(error.exception)
+        for expected in ("沿用原模型配置“继承原环境”", "GLM · glm-fixture", "用于新建会话", "API Key"):
+            self.assertIn(expected, message)
+        self.assertNotIn("fixture-private-key", message)
+        self.assertEqual(error.exception.status, 409)
+        self.assertEqual(self.app.workspaces.agent(agent["id"])["profile_id"], "")
+        tmux.assert_not_called()
+
+    def test_explicit_new_main_uses_current_default_and_preserves_old_identity(self):
+        old = self.launch(role="commander", profile_id="")
+        self.app.workspaces.mark_stopped(old["id"])
+        private_json(self.app.run_path(old["run_id"]) / "run.json", {
+            "id":old["run_id"], "project_id":self.pid, "status":"stopped", "created_at":old["created_at"]})
+        self.app.save_role_models({"assignments":{"commander":self.glm["id"]},
+            "expected_revision":self.app.role_models()["revision"]}, self.pid)
+        run = self.app.workspaces.dispatch(self.pid, {"role":"commander", "new_session":True})
+        new = self.app.workspaces.agent(run["agent_id"])
+        self.assertNotEqual(new["id"], old["id"])
+        self.assertNotEqual(new["claude_session_id"], old["claude_session_id"])
+        self.assertEqual(new["profile_id"], self.glm["id"])
+        self.assertEqual(self.app.workspaces.agent(old["id"])["claude_session_id"], old["claude_session_id"])
+        self.assertEqual(self.app.workspaces.agent(old["id"])["desired_state"], "stopped")
+
     def test_invalid_mapping_and_stale_revision_are_atomic(self):
         old = self.assign({"scout": self.ds["id"]})
         wrapper = self.app.save_profile({"name": "wrapper", "model": "fixture", "engine_prefix": "fixture-cli"})
@@ -125,9 +161,10 @@ class RoleModelTests(unittest.TestCase):
         self.assign({"scout": self.glm["id"]})
         self.app.save_role_models({"assignments": {"scout": self.ds["id"]},
                                   "expected_revision": self.app.role_models()["revision"]}, other["id"])
-        parent = self.launch(role="commander", profile_id=self.glm["id"], workspace_scope=[self.pid, other["id"]])
+        run = self.app.workspaces.create_session(other["id"], {"role":"commander", "profile_id":self.glm["id"]})
+        parent = self.app.workspaces.agent(run["agent_id"])
         basis = self.app.store(other["id"]).add_fact("target evidence", "user")["id"]
-        env = {"SAPPER_AGENT_ID": parent["id"], "SAPPER_WORKSPACE_ID": self.pid}
+        env = {"SAPPER_AGENT_ID": parent["id"], "SAPPER_WORKSPACE_ID": other["id"]}
         with mock.patch.dict(os.environ, env), mock.patch("sapper_workspace.console_from_environment", return_value=self.app):
             with contextlib.redirect_stdout(io.StringIO()):
                 worker(["spawn", other["id"], "--from", basis, "--role", "scout"])

@@ -12,17 +12,32 @@ function contextStatus(c){
 async function openProject(project,tab="workspace"){
   if(typeof project==="string")project=state.projects.find(p=>p.id===project);
   if(!project)throw new Error("工作区已不可用，请刷新概览");
+  state.navigation=(state.navigation||0)+1;
   disconnectNative();
-  state.view="project";state.project=project;state.folder=".";state.log=null;state.workspaceFilesPid=null;
+  state.view="project";state.project=project;state.folder=".";state.workspaceFolder=".";state.log=null;state.workspaceFilesPid=null;
+  state.graph={project, facts:[], intents:[], open_intents:[], hints:[]};
+  state.panes=[];state.runs=[];state.agents=[];state.services=[];state.memorySignature=null;
   state.agentSignature=null;state.nativePaneSignature=null;
+  state.mainAgent=null;
   localStorage.setItem("sapper-project",project.id);
   $("overview").hidden=true;$("empty-state").hidden=true;$("project-workspace").hidden=false;$("log-panel").hidden=true;
   $("home-button").classList.remove("active");
-  renderProjects();await refreshTask();setTab(tab);
-  if(tab==="files")await loadFiles();
+  $("breadcrumb").textContent=project.name;$("project-name").textContent=project.name;
+  $("project-goal").textContent=project.goal;$("project-path").textContent=project.path;
+  $("project-status").textContent="正在读取工作区…";
+  $("fact-count").textContent=project.facts;$("intent-count").textContent=project.open_intents;
+  $("hint-count").textContent="…";$("pane-count").textContent="…";
+  renderProjects();renderMemory();renderPanes();renderRuns();renderNativePanes();
+  agentTopology?.switchWorkspace(project.id);
+  $("agent-list").replaceChildren(empty("正在读取角色…"));$("service-list").replaceChildren();
+  $("workspace-file-list").replaceChildren(empty("正在读取文件…"));
+  $("files-list").replaceChildren(empty("正在读取文件…"));
+  setTab(tab);
+  await refreshTask();
 }
 
 async function showOverview(){
+  state.navigation=(state.navigation||0)+1;
   disconnectNative();state.view="overview";state.project=null;state.log=null;
   $("project-workspace").hidden=true;$("empty-state").hidden=true;$("overview").hidden=false;
   $("home-button").classList.add("active");$("breadcrumb").textContent="总体概览";
@@ -31,8 +46,9 @@ async function showOverview(){
 
 async function refreshOverview(){
   if(state.view!=="overview")return;
+  const navigation=state.navigation;
   const data=await api("/overview");
-  if(state.view!=="overview")return;
+  if(state.view!=="overview"||navigation!==state.navigation)return;
   state.overview=data;state.projects=data.projects;renderProjects();
   $("breadcrumb").textContent="总体概览";
   const signature=JSON.stringify(data);
@@ -58,7 +74,7 @@ async function refreshOverview(){
     info.append(element("strong","",a.name||a.role_label),element("p","overview-assignment",`分配任务：${a.mission?.trim()||"未记录"}`));
     if(a.activity?.latest_message)info.append(element("p","overview-activity",`最近活动：${a.activity.latest_message}`));
     info.append(element("p","",`${a.role_label} · ${p?.name||"原工作区"} · ${a.profile_name}`),element("p","agent-context",contextStatus(a.shared_context)));
-    row.append(info,element("span","badge",formatAgentStatus(a)));
+    row.append(info,element("span","badge",formatAgentStatus(a,data.panes)));
     if(p)row.append(button("角色与协作","text-button",()=>guarded(()=>openProject(p,"agents"))));return row;
   }):[empty("暂无已登记的角色。进入工作区后启动 Claude Code 或派发协作角色。")])) ;
   $("overview-runs").replaceChildren(...(data.recent_runs.length?data.recent_runs.map(run=>{

@@ -37,8 +37,10 @@ import sapper_evidence
 from kb import KnowledgeBase, KBError
 from sapper_workspace import Workspaces, WorkspaceError, ROLES
 from sapper_native import NativeSurface, NativeError
+from sapper_permission_audit import FIELDS as PERMISSION_AUDIT_FIELDS
 from sapper_extensions import ExtensionError, clean_environment, api_environment
 import sapper_models
+from sapper_auth import AuthError, AuthStore, SESSION_SECONDS, manage_credentials
 
 REPO = Path(__file__).resolve().parent.parent
 SAPPER = REPO / "lib" / "sapper.py"
@@ -122,17 +124,7 @@ class Console:
         self.config_path = self.state / "config.json"
         self.context_path = self.state / "global-context.json"
         self.lock = threading.RLock()
-        self.sessions = {}
-        self.login_failures = {}
-        self.token_path = self.state / "token"
-        if not self.token_path.exists():
-            fd = os.open(self.token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(secrets.token_urlsafe(32) + "\n")
-        os.chmod(self.token_path, 0o600)
-        self.token = self.token_path.read_text().strip()
-        if len(self.token) < 20:
-            raise WebError("登录 token 至少需要 20 个字符，请更换 token 文件")
+        self.auth = AuthStore(self.state)
         bindir = self.state / "bin"
         bindir.mkdir(exist_ok=True)
         shim = bindir / "sapper"
@@ -191,15 +183,16 @@ class Console:
 
     def overview(self):
         projects = self.projects()
-        agents = [a for a in self.workspaces.agents() if not a["id"].startswith("legacy-")]
         runs = self.runs()
+        panes = self.panes()
+        agents = [a for a in self.workspaces.agents(run_records=runs, pane_records=panes) if not a["id"].startswith("legacy-")]
         context = self.global_context()
         for project in projects:
             project["active_agents"] = sum(bool(a.get("pane_id")) for a in agents
                                            if project["id"] in a.get("workspace_scope", [a["workspace_id"]]))
         recent = [{k: r.get(k) for k in ("id", "project_id", "kind", "native_operation", "role", "profile_name", "status", "exit_code", "created_at")}
                   for r in runs[:8]]
-        return {"projects": projects, "agents": agents, "recent_runs": recent,
+        return {"projects": projects, "agents": agents, "panes": panes, "recent_runs": recent,
                 "summary": {"workspaces": len(projects), "active_agents": sum(bool(a.get("pane_id")) for a in agents),
                             "open_intents": sum(p["open_intents"] for p in projects),
                             "facts": sum(p["facts"] for p in projects)},
@@ -208,8 +201,8 @@ class Console:
                                 "python": platform.python_version(), "tmux": shutil.which("tmux") is not None,
                                 "claude": self.workspaces.capabilities(), "workspace_roots": [str(p) for p in self.workspace_roots]}}
 
-    def redact(self, value):
-        text = str(value)
+    def redaction_keys(self):
+        """Collect fresh credentials once for a batch, never cache across requests."""
         keys = [p.get("api_key", "") for p in self.config()["profiles"]]
         for path in (self.state / "model-bridges").glob("*/ready.json"):
             with contextlib.suppress(OSError, ValueError):
@@ -218,6 +211,12 @@ class Console:
             "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "SAPPER_CLAUDE_API_KEY", "OPENAI_API_KEY",
             "DEEPSEEK_API_KEY", "BENCHMARK_TOKEN")]
         keys.extend(self.workspaces.extensions.credential_values())
+        return tuple(dict.fromkeys(key for key in keys if key))
+
+    def redact(self, value, *, keys=None):
+        text = str(value)
+        if keys is None:
+            keys = self.redaction_keys()
         for key in keys:
             if key:
                 text = text.replace(key, "[已隐藏密钥]")
@@ -361,7 +360,8 @@ class Console:
         elif action == "claim":
             result = store.claim_intent(require_text(data, "id", 64), require_text(data, "worker", 100))
         elif action == "release":
-            result = store.release_intent(require_text(data, "id", 64), require_text(data, "worker", 100))
+            result = self.workspaces.release_intent(pid, require_text(data, "id", 64),
+                expected_owner=require_text(data, "worker", 100), reason=require_text(data, "reason", 1000, "用户释放意图"))
         elif action == "done":
             fact, intent = store.conclude_with_new_fact(require_text(data, "id", 64), require_text(data, "description"),
                 require_text(data, "worker", 100), title=data.get("title"), doc=data.get("doc"), kind=data.get("kind"),
@@ -597,7 +597,7 @@ class Console:
             raise WebError("运行 ID 不正确")
         return self.state / "runs" / rid
 
-    def run_info(self, rid):
+    def run_info(self, rid, *, redaction_keys=None):
         directory = self.run_path(rid)
         info = read_json(directory / "run.json")
         if not info:
@@ -605,7 +605,7 @@ class Console:
         control = read_json(directory / "control.json", {})
         if "timeout_seconds" in control:
             info["timeout_seconds"] = control["timeout_seconds"]
-        info["activity"] = json.loads(self.redact(json.dumps(read_json(directory / "activity.json", {}), ensure_ascii=False)))
+        info["activity"] = json.loads(self.redact(json.dumps(read_json(directory / "activity.json", {}), ensure_ascii=False), keys=redaction_keys))
         if info.get("timeout_seconds") is not None and info.get("started_epoch") is not None:
             info["deadline_epoch"] = info["started_epoch"] + info["timeout_seconds"]
         return info
@@ -629,6 +629,7 @@ class Console:
 
     def runs(self, pid=None):
         result = []
+        keys = self.redaction_keys()
         for path in (self.state / "runs").glob("*/run.json"):
             info = read_json(path)
             if pid and info.get("project_id") != pid:
@@ -642,9 +643,19 @@ class Console:
                         if current["status"] not in FINISHED:
                             current.update(status=current.get("stop_reason", "interrupted"), ended_at=sapper.now_iso())
                             private_json(path, current)
-            info = self.run_info(info["id"])
-            result.append(json.loads(self.redact(json.dumps(info, ensure_ascii=False))))
+            info = self.run_info(info["id"], redaction_keys=keys)
+            result.append(json.loads(self.redact(json.dumps(info, ensure_ascii=False), keys=keys)))
         return sorted(result, key=lambda r: r["created_at"], reverse=True)[:100]
+
+    def workspace_status(self, pid):
+        runs, panes = self.runs(), self.panes()
+        agents = self.workspaces.agents(pid, run_records=runs, pane_records=panes)
+        try:
+            primary, error = self.workspaces.main_agent(pid, agents=agents), None
+        except WorkspaceError as exc:
+            primary, error = None, str(exc)
+        return {"agents": agents, "primary_agent": primary, "primary_error": error,
+                "services": self.workspaces.services(pid, run_records=runs, pane_records=panes)}
 
     def start(self, pid, data, *, native=None):
         project = (native or {}).get("project_override") or self.project(pid)
@@ -676,7 +687,10 @@ class Console:
             env["SAPPER_BIN"] = shlex.quote(self.claude_bin)
         sapper_models.apply_profile(env, profile, self.state)
         if (native or {}).get("isolated_extensions") and not (env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or env.get("SAPPER_CLAUDE_API_KEY")):
-            raise WebError("独立会话仅支持 API Key：请在模型配置保存密钥，或为 Web 服务设置 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN；不使用 Claude 订阅登录", 409)
+            source = f"模型配置“{profile['name']} · {profile['model']}”" if profile else "“继承原环境”"
+            remedy = "请为此模型配置保存密钥，或为 Web 服务设置 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN。" if profile else (
+                "请为 Web 服务设置 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN；要使用已配置的工作区模型，请按当前配置新建会话。")
+            raise WebError(f"独立会话仅支持 API Key；本次实际采用{source}，未找到可用密钥。" + remedy, 409)
         argv = [sys.executable, str(SAPPER), "--store", str(Path(project["path"]) / ".sapper")]
         if native is not None:
             argv = native["argv"]
@@ -760,10 +774,14 @@ class Console:
                     "command": shlex.join(argv), "cwd": cwd,
                     "profile_name": profile["name"] if profile else "继承原环境"}
             if native:
-                info.update({k: native[k] for k in ("agent_id", "claude_session_id", "intent_id", "role", "timeout_seconds", "native_operation", "execution_mode", "output_format") if k in native})
+                info.update({k: native[k] for k in ("agent_id", "claude_session_id", "intent_id", "role", "timeout_seconds", "native_operation", "execution_mode", "output_format", "companion_required") if k in native})
+                info.update({k: native["permission_audit"][k] for k in PERMISSION_AUDIT_FIELDS
+                             if k in native.get("permission_audit", {})})
             info["supervisor_version"] = 1
             private_json(run_dir / "run.json", info)
-            private_json(run_dir / "launch.json", {"argv": argv, "env": env})
+            private_json(run_dir / "launch.json", {"argv": argv, "env": env,
+                         "initial_prompt": (native or {}).get("initial_prompt"),
+                         "resume_chat": (native or {}).get("resume_chat", False)})
             wrapper = shlex.join([sys.executable, str(Path(__file__).resolve()), "_runner", str(run_dir)])
             try:
                 proc = self.tmux("new-session", "-d", "-s", session, "-c", cwd, wrapper)
@@ -786,18 +804,41 @@ class Console:
 
     def stop(self, rid):
         with self.workspaces.lifecycle():
+            info = self.run_info(rid)
+            if info.get("role") == "watchdog":
+                for a in self.workspaces.agents(info["project_id"]):
+                    if a.get("role") == "commander" and not a.get("legacy"):
+                        self.workspaces.stop_agent(a["id"])
             return self._stop(rid)
 
     def _stop(self, rid):
+        with self.workspaces.lifecycle():
+            info = self.run_info(rid)
+            if info.get("agent_id"):
+                agent = self.workspaces.agent(info["agent_id"], include_deleted=True)
+                if agent.get("run_id") == rid:
+                    return self.workspaces.stop_agent(agent["id"])
+            return self._stop_run(rid)
+
+    def _stop_run(self, rid, *, processes=None):
+        """Low-level shutdown; workspace callers must confirm exit before release."""
         info = self.run_info(rid)
         if info.get("agent_id"):
-            self.workspaces.mark_stopped(info["agent_id"])
+            agent = self.workspaces.agent(info["agent_id"], include_deleted=True)
+            if agent.get("run_id") == rid:
+                self.workspaces.mark_stopped(info["agent_id"])
         if info["status"] in FINISHED:
             return info
+        if processes is None:
+            from sapper_processes import RunProcesses
+            try:
+                processes = RunProcesses(info)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                processes = None
         run_dir = self.run_path(rid)
         with run_lock(run_dir):
             (run_dir / "stop_requested").touch()
-        if info.get("supervisor_version") == 1 and info.get("execution_mode") == "print":
+        if info.get("supervisor_version") == 1 and info.get("execution_mode") in ("print", "chat"):
             # Let the owner interrupt Claude and drain its final output first.
             end = time.monotonic() + INTERRUPT_GRACE + TERMINATE_GRACE + 4
             while time.monotonic() < end:
@@ -811,20 +852,17 @@ class Console:
                     self.audit("run.stopped", run=rid)
                     return current
                 time.sleep(0.1)
-            # A broken wrapper still must not orphan its detached print group.
-            child_group = self.run_info(rid).get("child_process_group")
-            if child_group and child_group != os.getpgrp():
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(child_group, signal.SIGKILL)
-        group = info.get("process_group")
-        wrapper = info.get("wrapper_pid")
-        if group and group == wrapper and group != os.getpgrp():
-            # A managed tmux pane is a separate process group. Include its tools.
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(group, signal.SIGTERM)
-            time.sleep(0.2)
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(group, signal.SIGKILL)
+        if processes is not None:
+            # Never signal raw persisted PGIDs: they may now name another run.
+            # The observer includes both original groups and detached tools.
+            try:
+                processes.signal(signal.SIGTERM)
+                time.sleep(0.2)
+                processes.signal(signal.SIGKILL)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                # Still close the run's own tmux session. The workspace owner
+                # will retain claims unless its observer can confirm exit.
+                pass
         # Only the session this service created is affected. No global tmux kill.
         self.tmux("kill-session", "-t", info["session"])
         info = self.run_info(rid)
@@ -925,7 +963,15 @@ def run_child(directory):
     stop_signal = None
     reader = None
     output = None
-    managed_print = info.get("execution_mode") == "print"
+    chat_mode = info.get("execution_mode") == "chat"
+    managed_print = info.get("execution_mode") in ("print", "chat")
+    journal = None
+    initialized = threading.Event()
+    init_error = []
+    if chat_mode:
+        from sapper_chat import ChatJournal
+        journal = ChatJournal(env["SAPPER_WEB_STATE"], info["agent_id"])
+        journal.begin(info["id"], launch["initial_prompt"], resume=launch.get("resume_chat", False))
     if info.get("output_format") == "stream-json":
         from sapper_run import RunOutput
         output = RunOutput(directory, private_json)
@@ -952,6 +998,22 @@ def run_child(directory):
                 sys.stdout.buffer.write(line)
                 sys.stdout.buffer.flush()
                 output.observe(line)
+                if journal:
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    journal.receive(info["id"], info["claude_session_id"], event)
+                    if event.get("type") == "control_response" and event.get("response", {}).get("request_id") == "sapper-initialize":
+                        if event["response"].get("subtype") == "error":
+                            init_error.append(event["response"].get("error", "初始化失败"))
+                        initialized.set()
+                    elif event.get("type") == "control_request" and event.get("request", {}).get("subtype") != "can_use_tool":
+                        # Unknown requests must receive an explicit error, not hang.
+                        with journal.locked() as data:
+                            data.setdefault("responses", []).append({"type": "control_response", "response": {
+                                "subtype": "error", "request_id": event["request_id"],
+                                "error": "Unsupported control request"}})
         finally:
             child.stdout.close()
 
@@ -961,6 +1023,8 @@ def run_child(directory):
     reason = None
     try:
         options = {"start_new_session": True, "stdin": subprocess.DEVNULL} if managed_print else {}
+        if chat_mode:
+            options["stdin"] = subprocess.PIPE
         if output:
             options.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         child = subprocess.Popen(launch["argv"], cwd=info["cwd"], env=env, **options)
@@ -970,23 +1034,75 @@ def run_child(directory):
                     wrapper_pid=os.getpid(), process_group=os.getpgrp())
         if managed_print:
             info["child_process_group"] = child.pid
+        from sapper_processes import process_table
+        try:
+            births = process_table()
+            info["process_births"] = {str(pid): births[pid]["birth"] for pid in (os.getpid(), child.pid) if pid in births}
+        except (OSError, subprocess.SubprocessError):
+            info["process_observation"] = "unavailable"
         with run_lock(directory):
             private_json(directory / "run.json", info)
         note("[sapper-web] 原命令已启动，输出从此处开始采集。")
         if output:
             reader = threading.Thread(target=relay, daemon=True)
             reader.start()
+        if journal:
+            child.stdin.write((json.dumps({"type": "control_request", "request_id": "sapper-initialize",
+                "request": {"subtype": "initialize", "hooks": None}}) + "\n").encode())
+            child.stdin.flush()
         phase_end = None
         stage = None
         warned_budget = None
+        companion_checked = 0
+        companion_missing = None
         while child.poll() is None:
             now = time.monotonic()
+            if info.get("companion_required") and now - companion_checked >= 1:
+                companion_checked = now
+                alive = False
+                for path in (Path(env["SAPPER_WEB_STATE"]) / "services").glob("*.json"):
+                    service = read_json(path, {})
+                    if service.get("workspace_id") != info["project_id"]:
+                        continue
+                    run = read_json(Path(env["SAPPER_WEB_STATE"]) / "runs" / service["run_id"] / "run.json", {})
+                    if run.get("status") == "starting" and now - started < 10:
+                        alive = True
+                    elif run.get("status") == "running" and run.get("wrapper_pid"):
+                        try:
+                            os.kill(run["wrapper_pid"], 0)
+                            alive = True
+                        except ProcessLookupError:
+                            pass
+                companion_missing = None if alive else companion_missing or now
+                if companion_missing and now - started > 10 and now - companion_missing >= 2:
+                    reason = "stopped"
+                    note("[sapper-web] watchdog 已退出，主 agent 同步停止。")
+                    agent_path = Path(env["SAPPER_WEB_STATE"]) / "agents" / f"{info['agent_id']}.json"
+                    agent = read_json(agent_path, {})
+                    if agent.get("run_id") == info["id"]:
+                        agent["desired_state"] = "stopped"
+                        private_json(agent_path, agent)
+            if journal and reason is None:
+                if init_error:
+                    raise OSError("Claude Code 聊天初始化失败：" + init_error[0])
+                if not initialized.is_set() and now - started > 60:
+                    raise OSError("Claude Code 聊天初始化超时")
+                if initialized.is_set():
+                    frames = journal.outgoing(info["id"])
+                    for frame in frames:
+                        if frame["type"] == "user":
+                            frame["session_id"] = info["claude_session_id"]
+                        child.stdin.write((json.dumps(frame, ensure_ascii=False) + "\n").encode())
+                    child.stdin.flush()
+                    journal.sent(info["id"], frames)
             with run_lock(directory):
                 control = read_json(directory / "control.json", {})
                 budget = control.get("timeout_seconds", info.get("timeout_seconds"))
                 if reason is None:
-                    if stop_signal or (directory / "stop_requested").exists():
+                    if (directory / "stop_requested").exists():
                         reason = "stopped"
+                    elif stop_signal:
+                        reason = "interrupted"
                     elif budget is not None and now - started >= budget:
                         reason = "timed_out"
                     if reason:
@@ -1034,9 +1150,12 @@ def run_child(directory):
             child_signal(signal.SIGKILL)
         if reader:
             reader.join(timeout=2)
+        if journal:
+            journal.end(info["id"])
         with run_lock(directory):
             # Explicit cancellation wins a race with an otherwise normal exit.
-            reason = reason or ("stopped" if stop_signal or (directory / "stop_requested").exists() else None)
+            reason = reason or ("stopped" if (directory / "stop_requested").exists() else
+                                "interrupted" if stop_signal else None)
             info.update(status=reason or "exited", ended_at=sapper.now_iso(), exit_code=rc)
             if reason:
                 info["stop_reason"] = reason
@@ -1050,6 +1169,8 @@ def run_child(directory):
 class WebServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # A page requests many scripts/styles concurrently, including after reload.
+    request_queue_size = 64
 
     def __init__(self, address, console, public_url="", prefix=""):
         self.console = console
@@ -1114,10 +1235,7 @@ class Handler(BaseHTTPRequestHandler):
         item = cookie.get("sapper_web")
         if not item:
             return None
-        session = self.server.console.sessions.get(item.value)
-        if session and session["expires"] > time.time():
-            return session
-        return None
+        return self.server.console.auth.session(item.value)
 
     def dispatch(self, method):
         app = self.server.console
@@ -1144,32 +1262,29 @@ class Handler(BaseHTTPRequestHandler):
                 filename = "index.html" if path == "/" else path[1:]
                 data = (STATIC / filename).read_bytes()
                 return self.reply(200, data, mimetypes.guess_type(filename)[0] + "; charset=utf-8")
+            if path == "/api/auth" and method == "GET":
+                return self.reply(200, {"configured": app.auth.configured()})
             if path == "/api/session" and method == "POST":
                 body = self.body()
-                ip = self.client_address[0]
-                now = time.time()
-                attempts = [t for t in app.login_failures.get(ip, []) if now - t < 60]
-                if len(attempts) >= 10:
-                    raise WebError("登录尝试过多，请一分钟后重试", 429)
-                if not isinstance(body.get("token"), str) or not hmac.compare_digest(body["token"], app.token):
-                    app.login_failures[ip] = attempts + [now]
-                    raise WebError("访问口令不正确", 401)
-                sid, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
-                app.sessions[sid] = {"csrf": csrf, "expires": now + 43200}
-                cookie = f"sapper_web={sid}; HttpOnly; SameSite=Strict; Path={prefix or '/'}; Max-Age=43200"
+                sid, result = app.auth.login(body.get("username"), body.get("password"), self.client_address[0])
+                cookie = f"sapper_web={sid}; HttpOnly; SameSite=Strict; Path={prefix or '/'}; Max-Age={SESSION_SECONDS}"
                 if self.server.secure_cookie:
                     cookie += "; Secure"
-                return self.reply(200, {"authenticated": True, "csrf": csrf}, headers={"Set-Cookie": cookie})
+                return self.reply(200, result, headers={"Set-Cookie": cookie})
             session = self.session()
             if not session:
-                raise WebError("请先输入 Web 访问口令登录", 401)
+                raise WebError("请先使用用户名和密码登录", 401)
             if method != "GET" and not hmac.compare_digest(self.headers.get("X-Sapper-CSRF", ""), session["csrf"]):
                 raise WebError("请求校验失败，请刷新后重试", 403)
             if path == "/api/session" and method == "GET":
-                return self.reply(200, {"authenticated": True, "csrf": session["csrf"]})
+                return self.reply(200, {"authenticated": True, **{k: session[k] for k in ("csrf", "username", "role")}})
+            if path == "/api/account/password" and method == "POST":
+                body = self.body()
+                app.auth.change_password(session, body.get("current_password"), body.get("new_password"), self.client_address[0])
+                return self.reply(200, {"ok": True}, headers={"Set-Cookie": self.expired_cookie()})
             if path == "/api/logout" and method == "POST":
-                session["expires"] = 0
-                return self.reply(200, {"ok": True}, headers={"Set-Cookie": f"sapper_web=; Path={prefix or '/'}; Max-Age=0"})
+                app.auth.logout(session)
+                return self.reply(200, {"ok": True}, headers={"Set-Cookie": self.expired_cookie()})
             if path == "/api/health" and method == "GET":
                 return self.reply(200, {"root": str(app.root), "state": str(app.state),
                                        "tmux": bool(shutil.which("tmux")), "claude": bool(shutil.which("claude")),
@@ -1215,10 +1330,12 @@ class Handler(BaseHTTPRequestHandler):
                         if action == "inspect":
                             return self.reply(200, app.workspaces.inspect(wid))
                         if action == "agents":
-                            return self.reply(200, {"agents": app.workspaces.agents(wid), "services": app.workspaces.services(wid)})
+                            return self.reply(200, app.workspace_status(wid))
                         if action == "role-prompt":
                             scope = [item for item in q("scope").split(",") if item] or None
                             return self.reply(200, app.workspaces.role_info(wid, q("role") or "worker", scope))
+                        if action == "chat":
+                            return self.reply(200, app.workspaces.chat_view(wid, q("before") or None, q("agent_id") or None))
                     elif method == "POST":
                         data = self.body()
                         if action == "role-models":
@@ -1231,6 +1348,10 @@ class Handler(BaseHTTPRequestHandler):
                             return self.reply(200, app.workspaces.save_settings(wid, data))
                         if action == "sessions":
                             return self.reply(201, app.workspaces.create_session(wid, data))
+                        if action == "dispatch":
+                            return self.reply(201, app.workspaces.dispatch(wid, data))
+                        if action == "chat":
+                            return self.reply(201, app.workspaces.chat_message(wid, data))
                         if action == "attach":
                             return self.reply(200, app.workspaces.attach(wid, data))
                         if action == "watchdog":
@@ -1384,7 +1505,7 @@ class Handler(BaseHTTPRequestHandler):
                     if action in ("hint", "fact", "intent", "confirm", "doc", "claim", "release", "done", "complete", "brainstorm-pick"):
                         return self.reply(200, app.graph_action(pid, action, self.body()))
             raise WebError("接口不存在", 404)
-        except (WebError, WorkspaceError, NativeError, ExtensionError) as exc:
+        except (AuthError, WebError, WorkspaceError, NativeError, ExtensionError) as exc:
             self.reply(exc.status, {"error": str(exc)})
         except (sapper.FGError, KBError, ValueError, TypeError, KeyError) as exc:
             self.reply(400, {"error": app.redact(str(exc))})
@@ -1400,6 +1521,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.dispatch("DELETE")
 
+    def expired_cookie(self):
+        cookie = f"sapper_web=; HttpOnly; SameSite=Strict; Path={self.server.prefix or '/'}; Max-Age=0"
+        return cookie + ("; Secure" if self.server.secure_cookie else "")
+
 
 def main(argv=None):
     if argv is None and len(sys.argv) >= 3 and sys.argv[1] == "_runner":
@@ -1414,7 +1539,19 @@ def main(argv=None):
     parser.add_argument("--tmux-socket", default=None, help="可选 tmux -L socket 名称")
     parser.add_argument("--workspace-root", action="append", type=Path, default=[], help="目录浏览快捷入口（可选，可重复指定；也可直接在网页选择目录）")
     parser.add_argument("--claude-bin", default=os.environ.get("SAPPER_CLAUDE_BIN", "claude"), help="原 Claude Code 可执行文件")
+    credentials = parser.add_mutually_exclusive_group()
+    credentials.add_argument("--init-admin", action="store_true", help="在本机终端初始化 Web 管理员")
+    credentials.add_argument("--reset-password", action="store_true", help="在本机终端重置 Web 管理员密码并撤销旧会话")
+    parser.add_argument("--username", help="初始化或重置密码的管理员用户名")
     args = parser.parse_args(argv)
+    if args.init_admin or args.reset_password:
+        try:
+            manage_credentials(args.state.expanduser().resolve(), "auth-init" if args.init_admin else "password-reset", args.username)
+        except (AuthError, OSError, EOFError) as exc:
+            parser.exit(1, f"{exc}\n")
+        return 0
+    if args.username:
+        parser.error("--username 需与 --init-admin 或 --reset-password 一起使用")
     if args.url_prefix and not re.fullmatch(r"(?:/[A-Za-z0-9_-]+)+", args.url_prefix):
         parser.error("--url-prefix 必须是 /sapper 形式的路径")
     if args.public_url:
@@ -1425,7 +1562,9 @@ def main(argv=None):
     server = WebServer((args.host, args.port), app, args.public_url, args.url_prefix)
     print(f"Sapper Web: http://{args.host}:{server.server_port}{args.url_prefix}/", flush=True)
     print(f"任务目录: {app.root}", flush=True)
-    print(f"访问口令保存在: {app.token_path}（使用 cat 在本机查看）", flush=True)
+    print(f"认证数据库: {app.auth.path}", flush=True)
+    if not app.auth.configured():
+        print("请先在本机初始化管理员：" + shlex.join([sys.executable, str(Path(__file__).resolve()), "--state", str(app.state), "--init-admin"]), flush=True)
     print("原 agent 进程独立运行；退出此 Web 服务不会停止已有 tmux 会话。", flush=True)
     try:
         server.serve_forever()

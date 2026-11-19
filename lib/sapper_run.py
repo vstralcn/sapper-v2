@@ -17,7 +17,7 @@ class RunOutput:
     def __init__(self, directory, persist):
         self.directory = directory
         self.persist = persist
-        self.activity = {"events": 0, "result_received": False}
+        self.activity = {"events": 0, "result_received": False, "phase": "unknown"}
         self.tools = {}
         self.lock = threading.Lock()
         (directory / "activity.log").touch(mode=0o600)
@@ -61,11 +61,18 @@ class RunOutput:
                     value = str(block["text"])
                     self.note(value)
                     self.activity["latest_message"] = value[-500:]
+            if blocks:
+                phase = "waiting_user" if "AskUserQuestion" in self.tools.values() else "tool_running" if self.tools else "responding"
+                if kind == "assistant" and message.get("stop_reason") in ("end_turn", "stop_sequence") and not self.tools:
+                    phase = "idle"
+                self.activity["phase"] = phase
         elif kind == "result":
-            self.activity.update(result_received=True, result_is_error=bool(event.get("is_error")))
+            self.activity.update(result_received=True, result_is_error=bool(event.get("is_error")), phase="idle")
             self.note(f"[{at}] 本轮结果（{event.get('subtype', 'result')}）")
             if event.get("result"):
                 self.note(str(event["result"]))
+        elif kind == "control_request":
+            self.activity["phase"] = "waiting_user"
         elif kind == "system":
             subtype = event.get("subtype", "system")
             self.note(f"[{at}] {subtype}" + (f" · {event.get('error')} · 第 {event.get('attempt')} 次" if subtype == "api_retry" else ""))

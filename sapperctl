@@ -5,6 +5,7 @@ import contextlib
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -20,6 +21,7 @@ import socket
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO / "lib"))
 import sapper_models
+from sapper_auth import AuthStore, manage_credentials
 from sapper_web import Console, FINISHED, WebError, private_json, read_json
 
 
@@ -185,18 +187,24 @@ def stop_managed(state, config):
 
 def main():
     parser = argparse.ArgumentParser(description="Sapper 本地服务管理（macOS / Linux / WSL2）")
-    parser.add_argument("action", choices=["start", "stop", "status", "restart", "stop-web", "claude-status", "stop-claude"],
+    parser.add_argument("action", choices=["start", "stop", "status", "restart", "stop-web", "claude-status", "stop-claude", "auth-init", "password-reset"],
                         help="stop 关闭整套受管服务；restart 和 stop-web 只操作网页")
     parser.add_argument("--state", type=Path, default=REPO / ".sapper-web", help="实例状态目录")
     parser.add_argument("--port", type=int, help="首次 start 的本地端口，默认 8766")
     parser.add_argument("--root", type=Path, help="首次 start 的任务根目录")
     parser.add_argument("--tmux-socket", help="首次 start 的 tmux -L 名称，默认 default")
+    parser.add_argument("--username", help="auth-init 或 password-reset 的管理员用户名")
     args = parser.parse_args()
+    if args.username and args.action not in ("auth-init", "password-reset"):
+        parser.error("--username 只能用于 auth-init 或 password-reset")
     state = args.state.expanduser().resolve()
     os.umask(0o077)
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (state / "sapperctl.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.action in ("auth-init", "password-reset"):
+            manage_credentials(state, args.action, args.username)
+            return
         settings = state / "sapperctl.json"
         config = read_json(settings, default_config())
         requested = dict(config)
@@ -239,6 +247,8 @@ def main():
                 private_json(settings, requested)
             try:
                 start(state, requested)
+                if not AuthStore(state).configured():
+                    print("请在本机初始化管理员：" + shlex.join(["./sapperctl", "auth-init", "--state", str(state)]))
             except Exception:
                 if fresh and not web_pids(state, requested):
                     settings.unlink(missing_ok=True)
@@ -248,5 +258,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, RuntimeError, WebError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, RuntimeError, WebError, EOFError, subprocess.SubprocessError) as error:
         sys.exit(f"sapperctl：{error}")

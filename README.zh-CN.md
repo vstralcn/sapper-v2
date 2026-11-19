@@ -15,6 +15,8 @@
 
 sapper 不是一个更聪明的单 agent，而是一支会自己分工、交流、传承经验的 AI 军团：一个 AI 指挥官读板、判断、派单，将军与士兵并行渗透，零策略看门狗保活——所有知识沉淀在一张分层事实图上，个体死了，图还在。
 
+Web 工作台提供工作区管理、原生终端、角色拓扑，以及模型／MCP／Skills 配置。使用用户名、密码登录，认证数据由 SQLite 保存；CLI 与 Agent 继续共享原有 JSON 事实意图图。首次使用见[快速开始](#六快速开始)，运行与存储分工见 [Web 工作台与存储架构](#web-工作台与存储架构)。
+
 ---
 
 ## 一、女娲测试
@@ -87,11 +89,41 @@ nvwabase status                          # 看板与可干前沿
 - **经济**——模型分层：指挥官与将军用 GLM-5.3，士兵与侦察兵用 DeepSeek V4.1 Flash。旗舰脑做决策，轻量脑做量产——这就是 10 亿 token 打赢 45 亿的原因。
 - **分工**——指挥官 / 将军 / 侦察兵 / 士兵，以及它自己发明的**通信兵**。
 
-运行时只有三个窗口：**指挥官**（读板 → 判断 → 派单，永不亲手执行）、**AI 军团**（tmux 窗格里的将军与士兵）、**看门狗**（纯脚本：指挥官崩了自动 `--continue` 拉起、key 轮换、到点收卷——零策略，只保活）。
+比赛部署采用三个终端窗口：**指挥官**（读板 → 判断 → 派单，永不亲手执行）、**AI 军团**（tmux 窗格里的将军与士兵）、**看门狗**（纯脚本：指挥官崩了自动 `--continue` 拉起、key 轮换、到点收卷——零策略，只保活）。
 
 <p align="center"><img src="docs/assets/runtime-tmux.jpg" alt="实际运行：tmux 三窗——指挥官读板、士兵执行任务" width="860"></p>
 
 深入阅读：[docker/commander/SPEC.md](docker/commander/SPEC.md)（架构契约）· [BATTLE-REPORT.md](BATTLE-REPORT.md)（战役复盘）
+
+### Web 工作台与存储架构
+
+Web 后端与 CLI、tmux 运行在同一执行机上，负责工作区管理、原生 Claude Code 会话的启动与恢复，以及浏览器终端输出。Agent 通过 Sapper CLI 和 hooks 读写共享事实意图图。
+
+```mermaid
+flowchart LR
+    Browser[浏览器] --> Web[Web API]
+    Web --> Auth[认证模块]
+    Auth --> DB[(SQLite：账号与登录会话)]
+    Web --> CLI[Sapper CLI]
+    Web --> Tmux[tmux 终端]
+    Tmux --> Agent[原生 Claude Code 会话]
+    Agent -->|工具与 hooks| CLI
+    CLI <--> Graph[工作区 JSON 事实意图图]
+```
+
+认证由 [`lib/sapper_auth.py`](lib/sapper_auth.py) 实现，使用 Python 标准库的 SQLite 和 scrypt。数据库包含三张表：`users` 保存管理员账号和加盐密码哈希，`sessions` 保存登录会话标识的摘要、CSRF 值和到期时间，`login_attempts` 保存限流记录。登录后发放带 `HttpOnly`、`SameSite=Strict` 属性的 Cookie，登录后的写操作同时校验 CSRF；配置 HTTPS `--public-url` 后启用 `Secure` Cookie。
+
+| 数据 | 默认位置 | 存储方式 |
+| --- | --- | --- |
+| 管理员账号、浏览器登录会话、登录限流记录 | `.sapper-web/auth.sqlite3` | SQLite |
+| 模型配置、工作区绑定、全局上下文、MCP／Skills 资源库 | `.sapper-web/config.json`、`.sapper-web/global-context.json`、`.sapper-web/extensions.json` | JSON |
+| Agent 记录、运行状态、管理审计及终端输出 | `.sapper-web/agents/`、`.sapper-web/runs/`、`.sapper-web/actions.jsonl` | JSON、JSONL 与日志文件 |
+| 项目信息、事实、意图与人工提示 | `<工作区>/.sapper/` | JSON 文件 |
+| 新建受管 Agent 会话与资源快照 | `<工作区>/.sapper/sessions/` | 快照文件与原生 JSONL 对话记录 |
+
+浏览器登录会话与原生 Agent 会话分别管理。登录会话有效期为 12 小时，Web 重启后继续有效，修改或重置密码会撤销旧登录会话。`sapperctl restart` 只重启 Web 进程，受管 tmux 任务与模型桥继续运行。SQLite 承担 Web 认证存储；事实意图图继续通过原文件存储供 Web、CLI 和 Agent 共同使用。
+
+代码与详细说明：[`lib/sapper_web.py`](lib/sapper_web.py)、[`lib/sapper_workspace.py`](lib/sapper_workspace.py)、[Web 启动与使用](docs/web/05-running.md)、[Agent 资源与会话](docs/web/16-agent-resources.md)。
 
 ## 五、战绩与涌现
 
@@ -118,17 +150,61 @@ nvwabase status                          # 看板与可干前沿
 
 ## 六、快速开始
 
-基础网页控制台（保留原 CLI、tmux 与事实图）：
+### 环境要求
+
+支持 macOS、Linux，以及 Windows 的 WSL2 环境。Python 3.10+、tmux 和 Claude Code CLI 2.1.318+ 需在同一系统环境中可用；新建受管会话还需 CLI 提供[资源隔离参数](docs/web/16-agent-resources.md)。Web 后端使用 Python 标准库，包括内置 SQLite；前端资源随仓库提供，无需安装 pip 依赖、执行 npm 构建或单独部署数据库服务。启动 Agent 需在网页模型配置或服务环境中提供模型 API Key。
+
+### 启动与登录
+
+在仓库根目录，通过本机交互式终端初始化管理员，再启动 Web：
 
 ```bash
-./sapperctl start                         # http://127.0.0.1:8766/
-./sapperctl status                        # Web、受管 tmux 会话、模型桥
-# ./sapperctl restart   只重启网页；./sapperctl stop   关闭 Sapper 受管服务
-# ./sapperctl claude-status 查看 Claude daemon；./sapperctl stop-claude 关闭 daemon 与后台会话
-# 在另一个终端查看登录口令：cat .sapper-web/token
+./sapperctl auth-init --username admin
+./sapperctl start
 ```
 
-默认首页显示总体概览；支持全局环境提示词／hooks 配置、绑定题目原目录、原 Claude Code 启动／精确恢复、角色派发、实时 PTY 终端、事实／意图／hint、日志和附件。已有题目目录直接在网页文件夹选择器中点选并绑定，无需启动时配置允许目录。接入已有目录及功能边界见 [Web 启动与使用](docs/web/05-running.md)。 模型配置支持 Messages／Responses／Chat Completions 协议、获取模型及连接测试，见[模型协议说明](docs/web/10-model-protocols.md)。
+按提示输入两次至少 6 个字符的密码，输入过程不回显。打开 [http://127.0.0.1:8766/](http://127.0.0.1:8766/)，使用设置的用户名和密码登录。当前账号体制为单管理员，可操作此 Web 实例管理的全部工作区。
+
+从 token 认证升级时，先执行一次 `auth-init`；旧 Web 服务仍在运行时，再执行 `./sapperctl restart` 加载新代码。原有工作区绑定继续保留，旧 `.sapper-web/token` 文件保留原样，但不再用于登录。
+
+### 打开工作区并启动 Agent
+
+1. 点击“打开题目目录”，选择执行机上的已有文件夹，或新建任务。已有资料保留在原位置。
+2. 点击“启用 sapper”，初始化或复用该目录的 `.sapper/` 图，并安装项目 hooks。
+3. 在“全局设置”中配置模型连接，按需登记 MCP 服务器与 Skills，再为工作区选择资源。
+4. 点击“派发角色”，选择角色、任务和模型后启动。通过原生终端交互，在“角色与协作”查看拓扑，在“事实与意图”查看共享记忆。
+
+默认首页显示所有工作区的总体概览；“全局上下文”用于配置提示词和 hooks 共享的环境信息；“原生功能”提供已有 CLI 操作入口。完整步骤见 [Web 启动与使用](docs/web/05-running.md)，模型协议与连接测试见[模型协议说明](docs/web/10-model-protocols.md)。
+
+### 密码与服务管理
+
+在“全局设置 → 账号与密码”中输入当前密码即可修改密码。忘记密码时，在服务器本机终端执行 `./sapperctl password-reset --username admin`。修改或重置密码后，所有旧浏览器登录会话失效，需要重新登录。
+
+| 命令 | 作用 |
+| --- | --- |
+| `./sapperctl status` | 查看 Web PID、受管 tmux 会话与模型桥 |
+| `./sapperctl restart` | 重启 Web，保留受管任务与模型桥 |
+| `./sapperctl stop-web` | 关闭 Web |
+| `./sapperctl stop` | 关闭 Web、此实例的受管任务及模型桥 |
+| `./sapperctl claude-status` | 查看 Claude 用户级 daemon |
+| `./sapperctl stop-claude` | 关闭 Claude 用户级 daemon 及其脱离终端的会话，影响跨实例的用户级服务 |
+
+### 独立实例与前台运行
+
+每个独立实例使用各自的状态目录、端口和 tmux socket。首次启动后，启动配置保存到该状态目录，后续管理和密码重置使用相同的 `--state`：
+
+```bash
+./sapperctl auth-init --state "$HOME/.local/state/sapper-lab" --username admin
+./sapperctl start --state "$HOME/.local/state/sapper-lab" \
+  --root "$HOME/sapper-tasks" --port 8877 --tmux-socket sapper-lab
+./sapperctl status --state "$HOME/.local/state/sapper-lab"
+./sapperctl password-reset --state "$HOME/.local/state/sapper-lab" --username admin
+./sapperctl stop --state "$HOME/.local/state/sapper-lab"
+```
+
+前台启动使用 `python3 lib/sapper.py web`。原 CLI 同样提供 `python3 lib/sapper.py web --init-admin --username admin` 与 `python3 lib/sapper.py web --reset-password --username admin`，均可指定 `--state`。远程访问采用 HTTPS 反向代理，并配置 `--public-url`，详见[部署说明](docs/web/05-running.md#6-linux域名网关)。
+
+### CLI 与 Docker
 
 ```bash
 bash install.sh                      # 符号链接 sapper CLI（纯标准库，零依赖）
