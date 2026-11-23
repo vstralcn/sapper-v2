@@ -584,6 +584,7 @@ submit("create-form", async data => {
     result = await api("/projects", {method: "POST", body: {
       title: data.get("title").trim(), name: data.get("name").trim(), goal: data.get("goal"), context: data.get("context"),
       model_assignments: readWorkspaceModelFields($("create-model-rows")),
+      extensions: readExtensionSelection("create-extension-options"),
       attachment_ids: [...createAttachments].map(item => item.id),
     }});
     createAttachments.clear();

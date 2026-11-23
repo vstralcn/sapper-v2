@@ -219,13 +219,13 @@
     <label>任务说明<textarea name="mission" id="agent-mission" rows="4" required></textarea></label>
     <details id="dispatch-settings"><summary>主 agent 运行配置</summary>
       <label>模型<select name="profile_id" id="agent-profile"></select><span id="agent-model-hint" class="field-help"></span><button type="button" id="agent-model-settings" class="text-button">配置工作区模型</button></label>
-      <fieldset id="agent-extensions">
+      <fieldset id="agent-extensions" class="extension-picker">
         <legend>MCP 与 Skills</legend>
         <div class="agent-extensions-head">
           <label class="inline-check"><input id="agent-extensions-default" type="checkbox" checked>使用工作区配置</label>
           <button id="agent-extension-settings" type="button" class="text-button">配置工作区资源</button>
         </div>
-        <div id="agent-extension-options"></div>
+        <div id="agent-extension-options" class="extension-options"></div>
         <p id="agent-extension-status" class="field-help" role="status"></p>
       </fieldset>
       <section id="agent-role-info" class="agent-role-info"><p id="agent-role-summary"></p><p id="agent-role-source" class="field-help"></p><details><summary>查看角色职责</summary><pre id="agent-role-prompt"></pre></details></section>
@@ -250,6 +250,11 @@
     <label>任务附件 <span class="muted">选填</span><input id="create-files" type="file" multiple><span class="field-help">可选择多个文件，每个最多 16 MiB。选择后立即暂存，创建成功后可在工作区的 attachments/ 目录查看。</span></label>
     <ul id="create-file-list" aria-live="polite" hidden></ul>
     <div id="create-model-rows" class="workspace-model-fields"></div>
+    <fieldset class="extension-picker">
+      <legend>MCP 与 Skills</legend>
+      <p class="field-help">勾选此工作区默认使用的资源。</p>
+      <div id="create-extension-options" class="extension-options"></div>
+    </fieldset>
     <div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">创建任务</button></div>
   </form></dialog>
 

@@ -367,6 +367,10 @@ class Console:
                 raise WebError("目录已存在；已有图会自动出现在任务列表，请勿重复初始化", 409)
             cfg = self.config()
             assignments = self.new_workspace_models(cfg, data)
+            extensions = self.workspaces.extensions
+            if "extensions" in data:
+                library = extensions.read()
+                selection = extensions.select(library, data["extensions"])
             ids = data.get("attachment_ids", [])
             if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids) or len(ids) != len(set(ids)):
                 raise WebError("暂存附件列表不正确")
@@ -396,6 +400,10 @@ class Console:
             if context:
                 store.add_hint(context, "web-user")
             project = next(p for p in self.projects() if p["path"] == str(path))
+            if "extensions" in data and (any(selection.values()) or project["id"] in library["workspaces"]):
+                defaults = {**library["workspaces"], project["id"]: selection}
+                private_json(extensions.path, {**library, "workspaces": defaults, "revision": library["revision"] + 1})
+                rollback.callback(private_json, extensions.path, library)
             if assignments is not None:
                 self.set_workspace_models(cfg, project["id"], assignments)
                 private_json(self.config_path, cfg)

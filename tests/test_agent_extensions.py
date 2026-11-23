@@ -55,6 +55,18 @@ class ExtensionTests(unittest.TestCase):
         run = self.manager.create_session(self.pid, {"mission": "fixture", **data})
         return self.manager.agent(run["agent_id"])
 
+    def test_create_project_with_resource_selection(self):
+        selection = self.resources()
+        project = self.app.create_project({"name": "new-task", "goal": "review", "extensions": selection})
+        self.assertEqual(self.ext.view(project["id"])["selection"], selection)
+
+    def test_invalid_create_selection_can_be_corrected_and_retried(self):
+        data = {"name": "retry-task", "goal": "review", "model_assignments": {"main": ""}}
+        with self.assertRaises(ExtensionError):
+            self.app.create_project({**data, "extensions": {"skill_ids": ["missing"], "mcp_ids": []}})
+        project = self.app.create_project({**data, "extensions": {"skill_ids": [], "mcp_ids": []}})
+        self.assertEqual(self.ext.view(project["id"])["selection"], {"skill_ids": [], "mcp_ids": []})
+
     def test_global_library_without_workspace_and_independent_selections(self):
         app = Console(self.base / "empty-tasks", self.base / "empty-state")
         ext = app.workspaces.extensions

@@ -91,9 +91,10 @@ async function newWorkspaceModelOptions() {
 
 async function openCreateWorkspace() {
   const dialog = $("create-dialog");
-  const {config, profiles} = await newWorkspaceModelOptions();
+  const [{config, profiles}, resources] = await Promise.all([newWorkspaceModelOptions(), api("/extensions")]);
   if (dialog.open) return;
   renderWorkspaceModelFields($("create-model-rows"), config, profiles, {creating: true});
+  extensionOptions("create-extension-options", resources, resources.selection, {compact: true});
   dialog.showModal();
 }
 function roleDefaultLabel(role) {
