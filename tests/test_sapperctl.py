@@ -33,7 +33,8 @@ class SapperCtlTests(unittest.TestCase):
                                       check=check, capture_output=True, text=True, timeout=40)
 
             try:
-                ctl("start", "--port", str(port), "--root", str(root), "--tmux-socket", name)
+                started = ctl("start", "--port", str(port), "--root", str(root), "--tmux-socket", name)
+                self.assertEqual("--dangerously-skip-permissions" in started.stderr, os.geteuid() == 0)
                 app = Console(root, state, name)
                 project = app.create_project({"name": "fixture", "goal": "lifecycle"})
                 run = app.start(project["id"], {"kind": "custom", "command": "sleep 120"})

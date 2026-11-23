@@ -23,7 +23,7 @@ REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO / "lib"))
 import sapper_models
 from sapper_auth import AuthStore, manage_credentials
-from sapper_web import Console, FINISHED, WebError, private_json, read_json
+from sapper_web import Console, FINISHED, WebError, private_json, read_json, warn_root_startup
 
 
 def default_config():
@@ -136,6 +136,7 @@ def stop_web(state, config):
 
 
 def start(state, config):
+    warn_root_startup()
     found = web_pids(state, config)
     if found:
         if len(found) != 1:
