@@ -406,6 +406,43 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["text"], "original evidence")
         self.assertEqual(self.request(bind, "POST", {"path": str(self.app.state)})[0], 403)
 
+    def test_skill_metadata_reads_manifest_without_saving(self):
+        skill = self.app.root.parent / "different-folder-name"
+        skill.mkdir()
+        manifest = skill / "SKILL.md"
+        manifest.write_text(
+            '---\nname: "declared-name" # "comment"\ndescription: >-\n'
+            '  第一行\n\n  第二行\n---\n正文\n', encoding="utf-8")
+        endpoint = "/api/extensions/skill-metadata?"
+
+        def preview(path):
+            return self.request(endpoint + urllib.parse.urlencode({"path": str(path)}))
+
+        self.assertEqual(preview(skill)[0], 401)
+        self.login()
+        status, _, body = preview(skill)
+        self.assertEqual((status, json.loads(body)), (200, {
+            "name": "declared-name", "description": "第一行 第二行"}))
+        self.assertEqual(self.app.workspaces.extensions.read()["revision"], 0)
+        save = {"action": "save", "expected_revision": 0, "kind": "skills",
+                "name": skill.name, "path": str(skill)}
+        self.assertEqual(self.request("/api/extensions", "POST", save)[0], 400)
+        save["name"] = "declared-name"
+        self.assertEqual(self.request("/api/extensions", "POST", save)[0], 200)
+
+    def test_skill_metadata_rejects_missing_or_private_manifest(self):
+        skill = self.app.root.parent / "empty-skill"
+        skill.mkdir()
+        private_manifest = self.app.state / "SKILL.md"
+        private_manifest.write_text("---\nname: private\ndescription: private\n---\n")
+        self.login()
+        endpoint = "/api/extensions/skill-metadata?"
+        browse = endpoint + urllib.parse.urlencode({"path": str(skill)})
+        self.assertEqual(self.request(browse)[0], 400)
+        self.assertEqual(self.request(endpoint + urllib.parse.urlencode({"path": str(self.app.state)}))[0], 403)
+        (skill / "SKILL.md").symlink_to(private_manifest)
+        self.assertEqual(self.request(browse)[0], 400)
+
     def test_workspace_submission_settings_require_auth_and_csrf_and_persist(self):
         project = self.app.create_project({"name": "submission-policy", "goal": "fixture"})
         other = self.app.create_project({"name": "other-policy", "goal": "fixture"})

@@ -349,14 +349,14 @@
       <header class="resource-editor-header dialog-heading"><h2 id="extensions-skill-title"></h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></header>
       <div class="resource-editor-body">
         <input name="id" type="hidden">
-        <label>名称<input name="name" required maxlength="64" placeholder="例如 code-review" autofocus></label>
-        <label>描述 <span class="muted">选填，显示在资源列表中</span><input name="description" maxlength="512" placeholder="简述 Skill 的用途"></label>
         <div class="skill-path-row">
-          <label>执行机上的 Skill 目录<input name="path" required placeholder="/absolute/path/to/skill"></label>
+          <label>执行机上的 Skill 目录<input name="path" required placeholder="/absolute/path/to/skill" autofocus></label>
           <button type="button" class="button" id="extensions-skill-browse">浏览目录</button>
         </div>
+        <label>名称<input name="name" readonly placeholder="从 SKILL.md 读取"></label>
+        <label>描述 <span class="muted">可编辑，显示在资源列表中</span><input name="description" maxlength="512" placeholder="从 SKILL.md 读取"></label>
         <p id="extensions-skill-error" class="error-text" role="alert"></p>
-        <p class="field-help">选择包含 SKILL.md 的目录，也可直接粘贴绝对路径。角色启动时复制目录内容。</p>
+        <p class="field-help">选择包含 SKILL.md 的目录，或粘贴目录的绝对路径。系统会自动读取名称和描述。</p>
       </div>
       <footer class="dialog-actions resource-editor-footer"><button class="button dialog-close" type="button">取消</button><button type="submit" class="button primary">保存 Skill</button></footer>
     </form>

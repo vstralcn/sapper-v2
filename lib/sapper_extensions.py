@@ -71,6 +71,37 @@ def mcp_config(value):
     return result
 
 
+def skill_metadata(manifest):
+    if manifest.is_symlink() or not manifest.is_file():
+        raise ExtensionError("请选择含 SKILL.md 的 skill 目录")
+    if manifest.stat().st_size > 32 * 1024 * 1024:
+        raise ExtensionError("SKILL.md 超过 32 MiB")
+    body = manifest.read_text(encoding="utf-8-sig")
+    parts = re.split(r"^---[ \t]*$", body, maxsplit=2, flags=re.M)
+    if len(parts) != 3 or parts[0]:
+        raise ExtensionError("SKILL.md 需要 YAML frontmatter 和 description")
+
+    def field(key):
+        match = re.search(rf"^{key}:[ \t]*([^\n]*)((?:\n(?:[ \t][^\n]*|(?=\n)))*)", parts[1], re.M)
+        if not match:
+            return ""
+        value, continuation = match.groups()
+        value = value.strip()
+        quoted = re.fullmatch(r"""(?:"(.*?)"|'(.*?)')(?:[ \t]+#.*)?""", value)
+        if quoted:
+            return (quoted[1] if quoted[1] is not None else quoted[2].replace("''", "'")).strip()
+        value = re.split(r"(?:^|[ \t]+)#", value, maxsplit=1)[0].rstrip()
+        if re.fullmatch(r"[|>][+-]?[1-9]?[+-]?", value):
+            value = ""
+        lines = [line.strip() for line in [value, *continuation.splitlines()]]
+        return " ".join(line for line in lines if line)
+
+    description = field("description")
+    if not description:
+        raise ExtensionError("SKILL.md 需要 YAML frontmatter 和 description")
+    return {"name": field("name"), "description": description}
+
+
 def skill_files(source, expected_name=None):
     source = Path(source).expanduser().resolve()
     if not source.is_dir() or not (source / "SKILL.md").is_file():
@@ -87,12 +118,8 @@ def skill_files(source, expected_name=None):
         size += path.stat().st_size
         if len(files) > 2000 or size > 32 * 1024 * 1024:
             raise ExtensionError("单个 skill 超过 2000 文件或 32 MiB")
-    body = (source / "SKILL.md").read_text(encoding="utf-8")
-    parts = body.split("\n---", 1)
-    if not body.startswith("---\n") or len(parts) != 2 or not re.search(r"^description:[ \t]*\S", parts[0], re.M):
-        raise ExtensionError("SKILL.md 需要 YAML frontmatter 和 description")
-    declared = re.search(r"^name:[ \t]*(.+)$", parts[0], re.M)
-    if declared and expected_name and declared[1].strip().strip("\"'") != expected_name:
+    declared = skill_metadata(source / "SKILL.md")["name"]
+    if declared and expected_name and declared != expected_name:
         raise ExtensionError("资源名称必须与 SKILL.md 的 name 一致，避免加载后名称不符")
     return source, files
 
@@ -200,6 +227,14 @@ class AgentExtensions:
         return {"revision": cfg["revision"], "mcp": cfg["mcp"], "skills": cfg["skills"],
                 "selection": cfg["workspaces"].get(pid, EMPTY), "workspaces": cfg["workspaces"],
                 "claude": self.manager.capabilities()}
+
+    def preview_skill(self, path):
+        source = self.manager.allowed(string(path, "Skill 目录"))
+        metadata = skill_metadata(source / "SKILL.md")
+        if not NAME.fullmatch(metadata["name"]):
+            raise ExtensionError("SKILL.md 的 name 须使用 1–64 位英文字母、数字、下划线或连字符")
+        metadata["description"] = metadata["description"][:512]
+        return metadata
 
     def select(self, cfg, selection):
         if not isinstance(selection, dict) or set(selection) != set(EMPTY):

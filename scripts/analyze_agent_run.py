@@ -107,9 +107,12 @@ class Analyzer:
         self.sessions = {}
         self.sources = []
         self.diagnostics = Counter()
+        self.api_errors = []
         self.tools = {}
         self.steps = {}
         self.blobs = {}
+        self.native_hashes = defaultdict(set)
+        self.blob_tool_types = defaultdict(dict)
         self.shapes = {}
         self.previous = {}
         self.request_lists = {}
@@ -121,7 +124,7 @@ class Analyzer:
 
     def session(self, sid):
         return self.sessions.setdefault(sid, {"session_id": sid, "sources": set(), "times": [], "steps": [],
-                                              "tools": [], "api_retries": 0, "compactions": 0, "snapshots": []})
+                                              "requests": {}, "tools": [], "api_retries": 0, "compactions": 0, "snapshots": []})
 
     def blob_metrics(self, sid, message):
         hook_bytes = read_bytes = 0
@@ -138,6 +141,11 @@ class Analyzer:
                 if call and call.get("graph_read"):
                     read_bytes += sum(len(t.encode()) for t in texts(block.get("content")))
         return hook_bytes, read_bytes
+
+    def native_blob(self, stream, message, metrics):
+        key = digest(canonical(message))
+        self.blobs[(stream, key)] = metrics
+        self.native_hashes[stream[1]].add(key)
 
     def read(self, path):
         path = Path(path).resolve()
@@ -166,7 +174,14 @@ class Analyzer:
         # Request deltas are file-local and must be replayed even for overlapping exports.
         stream = (path, sid)
         if kind == "api-request-blob":
-            self.blobs[(stream, e.get("hash"))] = self.blob_metrics(sid, e.get("message") or {})
+            message = e.get("message") or {}
+            key = e.get("hash")
+            self.blobs[(stream, key)] = self.blob_metrics(sid, message)
+            content = message.get("content")
+            if isinstance(content, (str, list)):
+                blocks = content if isinstance(content, list) else []
+                self.blob_tool_types[sid][key] = {b["type"] for b in blocks if isinstance(b, dict)
+                                                  and b.get("type") in ("tool_use", "tool_result")}
             return
         if kind == "api-request-shape":
             self.shapes[(stream, e.get("shapeHash"))] = self.blob_metrics(sid, {
@@ -177,10 +192,19 @@ class Analyzer:
             previous = (self.request_lists.get((stream, e["base"])) if e.get("base")
                         else self.previous.get(stream, []))
             keep, tail = e.get("keep"), e.get("tail")
+            if keep == 0:
+                previous = []
             valid = previous is not None and isinstance(keep, int) and 0 <= keep <= len(previous) and isinstance(tail, list) and all(isinstance(x, str) for x in tail)
             hashes = previous[:keep] + tail if valid else []
-            self.previous[stream] = hashes
+            self.previous[stream] = hashes if valid else None
             self.request_lists[(stream, e.get("id"))] = hashes if valid else None
+            ref = e.get("id")
+            if ref:
+                session = self.session(sid)
+                session["sources"].add(path)
+                snapshots = session["requests"]
+                if ref not in snapshots or snapshots[ref][2] is None:
+                    snapshots[ref] = (stamp(e.get("timestamp")), path, hashes if valid else None)
             metrics = [self.blobs.get((stream, h)) for h in hashes]
             shape_metrics = self.shapes.get((stream, e.get("shapeHash")))
             complete = valid and all(m is not None for m in metrics) and shape_metrics is not None
@@ -198,7 +222,7 @@ class Analyzer:
         native_message = e.get("message") or {}
         if isinstance(native_message, dict) and kind == "user":
             blob = {k: native_message[k] for k in ("role", "content") if k in native_message}
-            self.blobs[(stream, digest(canonical(blob)))] = self.blob_metrics(sid, blob)
+            self.native_blob(stream, blob, self.blob_metrics(sid, blob))
             content = native_message.get("content", [])
             if isinstance(content, str):
                 content = [{"type": "text", "text": content}]
@@ -206,7 +230,7 @@ class Analyzer:
                 merged = self.user_content.setdefault(stream, [])
                 merged.extend(content)
                 blob = {"role": "user", "content": merged}
-                self.blobs[(stream, digest(canonical(blob)))] = self.blob_metrics(sid, blob)
+                self.native_blob(stream, blob, self.blob_metrics(sid, blob))
         if isinstance(native_message, dict) and kind == "assistant":
             self.user_content[stream] = []
             # Native request logs omit blobs already recoverable from message rows.
@@ -221,7 +245,7 @@ class Analyzer:
                 block_key = e.get("apiBlockIndex") if len(blocks) == 1 and e.get("apiBlockIndex") is not None else digest(canonical(block))
                 parts[block_key] = block
             blob = {"role": "assistant", "content": list(parts.values())}
-            self.blobs[(stream, digest(canonical(blob)))] = (0, 0)
+            self.native_blob(stream, blob, (0, 0))
         uid = e.get("uuid")
         if uid and (sid, uid) in self.seen_events:
             self.diagnostics["duplicate_event_rows"] += 1
@@ -250,7 +274,17 @@ class Analyzer:
             content = []
         step = None
         if kind == "assistant":
-            if message.get("model") == "<synthetic>" or e.get("isApiErrorMessage"):
+            status = e.get("apiErrorStatus")
+            has_status = type(status) is int and 400 <= status <= 599
+            if has_status or e.get("isApiErrorMessage"):
+                error = e.get("error")
+                code = error.get("code") if isinstance(error, dict) else error
+                category = code if code in ("context_length_exceeded", "prompt_too_long",
+                                            "invalid_request_error", "rate_limit_exceeded") else "unknown"
+                self.api_errors.append({"session_id": sid, "timestamp": e.get("timestamp"),
+                                        "source": path, "line": line, "request_ref": e.get("requestRef"),
+                                        "http_status": status if has_status else None, "category": category})
+            if has_status or message.get("model") == "<synthetic>" or e.get("isApiErrorMessage"):
                 self.diagnostics["synthetic_assistant_rows"] += 1
                 return
             mid = message.get("id") or uid or f"{path}:{line}"
@@ -336,10 +370,39 @@ class Analyzer:
                 call["submitted_flag_ids"] = re.findall(r"^(f\d+)\s+submitted:", text, re.M)
                 call["fact_ids"] = call["flag_ids"][:]
 
+    def request_coverage(self, session):
+        snapshots = session["requests"]
+        coverage = {"request_snapshots": len(snapshots), "last_linked_request": None,
+                    "trailing_request_snapshots": None, "tail_blob_tool_use_refs": None,
+                    "tail_blob_tool_result_refs": None}
+        refs = list(snapshots)
+        if len({path for _, path, _ in snapshots.values()}) > 1:
+            # File order alone cannot order separate pieces of the same session.
+            if any(at is None for at, _, _ in snapshots.values()):
+                return coverage
+            refs.sort(key=lambda ref: snapshots[ref][0])
+        linked = {row["request_ref"] for row in session["steps"]}
+        last = next((i for i in reversed(range(len(refs))) if refs[i] in linked), None)
+        if last is None:
+            return coverage
+        coverage.update(last_linked_request=refs[last], trailing_request_snapshots=len(refs) - last - 1)
+        baseline, final = snapshots[refs[last]][2], snapshots[refs[-1]][2]
+        if last == len(refs) - 1:
+            added = set()
+        elif baseline is None or final is None:
+            return coverage
+        else:
+            added = set(final).difference(baseline, self.native_hashes[session["session_id"]])
+        types = self.blob_tool_types[session["session_id"]]
+        if all(key in types for key in added):
+            coverage["tail_blob_tool_use_refs"] = sum("tool_use" in types[key] for key in added)
+            coverage["tail_blob_tool_result_refs"] = sum("tool_result" in types[key] for key in added)
+        return coverage
+
     def finish(self, graph=None):
         all_steps, all_calls, sessions = [], [], []
         for sid, s in self.sessions.items():
-            if not s["steps"]:
+            if not s["steps"] and not s["requests"]:
                 continue
             s["steps"].sort(key=lambda row: (stamp(row["timestamp"]) or float("inf"), row["source"], row["line"]))
             start = min(s["times"]) if s["times"] else None
@@ -384,7 +447,7 @@ class Analyzer:
                 all_steps.append(row)
             all_calls.extend(s["tools"])
             summary = {"session_id": sid, "sources": sorted(s["sources"]), "steps": len(s["steps"]),
-                       "started_at": iso(start), "ended_at": iso(end), "api_retries": s["api_retries"],
+                       **self.request_coverage(s), "started_at": iso(start), "ended_at": iso(end), "api_retries": s["api_retries"],
                        "compactions": s["compactions"], **tool_rates(s["tools"])}
             summary["steps_with_usage"] = sum(r["total_input_tokens"] is not None for r in s["steps"])
             summary["steps_with_graph_request_snapshot"] = sum(r["graph_hook_bytes"] is not None for r in s["steps"])
@@ -409,6 +472,7 @@ class Analyzer:
             public_calls.append(public)
         return {"schema": "sapper-agent-analysis/1", "generated_at": iso(datetime.now(timezone.utc).timestamp()),
                 "definitions": definitions(self), "sources": self.sources, "diagnostics": dict(self.diagnostics),
+                "api_errors": self.api_errors,
                 "graph": graph.summary() if graph else None, "sessions": sessions, "steps": all_steps,
                 "tool_calls": public_calls, "duplicates": duplicates,
                 "tools": [{"name": name, **tool_rates(calls)} for name, calls in sorted(by_tool.items())],
@@ -594,6 +658,7 @@ def find_duplicates(calls, threshold, window):
 def definitions(analyzer):
     return {
         "step": "One distinct assistant message.id per session; split blocks and replayed UUIDs are deduplicated. Internal requests without an assistant response are not steps.",
+        "request_coverage": "Tail snapshots follow the last request linked to a step. Blob-only tool references count distinct added messages in the final snapshot compared with that request. They do not establish execution or usage. Null means unknown.",
         "input_tokens": "Provider usage: input_tokens + cache_creation_input_tokens + cache_read_input_tokens. Missing usage stays null. Max per field across split blocks, never sum.",
         "graph_tokens": f"OFFLINE ESTIMATE ONLY: ceil(UTF-8 bytes / {analyzer.bytes_per_token}). Recognized hook regions in reconstructed request messages. Not a model tokenizer or a billing measure.",
         "graph_read_tokens": "Separate estimate of retained tool outputs from sapper status/graph/dispatch/recall/doc commands (whole result, possibly mixed shell output). Not included in hook share.",
@@ -659,15 +724,19 @@ def render_html(report):
     return '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Sapper 运行分析</title><style>body{font:15px system-ui;margin:32px auto;max-width:1160px;padding:0 20px;background:#f6f7f9;color:#182330}select{max-width:100%;padding:8px}svg{width:100%;background:white;border:1px solid #ddd}pre{white-space:pre-wrap;overflow-wrap:anywhere}li{margin:8px 0}.legend{margin:10px 0}span{margin-right:20px}h2{font-size:19px}</style>
 <h1>Sapper 运行分析</h1><p>步 = 一次模型响应；图 token 为离线估算。共享图曲线不表示单个 Agent 的贡献。数据缺失显示为空，不补零。</p>
-<select id="session" aria-label="会话"></select><pre id="summary"></pre>
+<select id="session" aria-label="会话"></select><p id="coverage"></p><pre id="summary"></pre>
 <h2>输入 token / 图 hook 注入估算</h2><div id="tokens"></div>
 <h2>共享图规模：现存节点时间戳重建</h2><div id="graph"></div>
 <h2>日志中最近一次图规模观测（可能陈旧）</h2><div id="observed"></div>
 <h2>指标定义与限制</h2><ul>''' + notes + '''</ul><script type="application/json" id="data">''' + payload + '''</script><script>
 const data=JSON.parse(document.getElementById('data').textContent),select=document.getElementById('session');
-for(const s of data.sessions){const o=document.createElement('option');o.value=s.session_id;o.textContent=s.session_id+' · '+s.steps+' 步';select.append(o)}
+function showCoverage(s){
+  const value=v=>v??'未知';
+  document.getElementById('coverage').textContent='最后关联请求 '+value(s.last_linked_request)+' · 后续快照 '+value(s.trailing_request_snapshots)+' · 末份上下文新增的仅见于请求记录的引用：工具调用 '+value(s.tail_blob_tool_use_refs)+'，工具结果 '+value(s.tail_blob_tool_result_refs);
+}
+for(const s of data.sessions){const o=document.createElement('option');o.value=s.session_id;o.textContent=s.session_id+' · '+s.steps+' 步 · 后续请求 '+(s.trailing_request_snapshots??'未知');select.append(o)}
 function chart(id,rows,keys){const box=document.getElementById(id);box.replaceChildren();const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');svg.setAttribute('viewBox','0 0 1100 300');const colors=['#2764c6','#cf6335','#218b68','#8a50b6'];const values=rows.flatMap(r=>keys.map(k=>r[k]).filter(v=>v!=null));if(!values.length){box.textContent='无可用数据';return}const max=Math.max(1,...values),n=Math.max(2,rows.length);function label(x,y,t){const e=document.createElementNS(ns,'text');e.setAttribute('x',x);e.setAttribute('y',y);e.setAttribute('font-size','12');e.textContent=t;svg.append(e)}label(5,18,Math.round(max));label(5,270,0);label(50,292,'step 1');label(1000,292,'step '+rows.length);keys.forEach((k,j)=>{let d='',pen=false;rows.forEach((r,i)=>{if(r[k]==null){pen=false;return}const x=50+i*1020/(n-1),y=265-r[k]*240/max;d+=(pen?'L':'M')+x.toFixed(2)+','+y.toFixed(2);pen=true});const p=document.createElementNS(ns,'path');p.setAttribute('d',d);p.setAttribute('fill','none');p.setAttribute('stroke',colors[j]);p.setAttribute('stroke-width','2');svg.append(p)});box.append(svg);const legend=document.createElement('div');legend.className='legend';keys.forEach((k,i)=>{const s=document.createElement('span');s.style.color=colors[i];s.textContent=k;legend.append(s)});box.append(legend)}
-function draw(){const s=data.sessions.find(s=>s.session_id===select.value);if(!s)return;const rows=data.steps.filter(r=>r.session_id===s.session_id);document.getElementById('summary').textContent=JSON.stringify(s,null,2);chart('tokens',rows,['total_input_tokens','graph_hook_tokens_estimate']);chart('graph',rows,['facts','hints','open','done']);chart('observed',rows,['observed_facts','observed_hints','observed_open','observed_done'])}select.onchange=draw;draw();
+function draw(){const s=data.sessions.find(s=>s.session_id===select.value);if(!s)return;showCoverage(s);const rows=data.steps.filter(r=>r.session_id===s.session_id);document.getElementById('summary').textContent=JSON.stringify(s,null,2);chart('tokens',rows,['total_input_tokens','graph_hook_tokens_estimate']);chart('graph',rows,['facts','hints','open','done']);chart('observed',rows,['observed_facts','observed_hints','observed_open','observed_done'])}select.onchange=draw;draw();
 </script></html>'''
 
 
@@ -709,8 +778,8 @@ def main(argv=None):
                 print(f"Reading {file.name} ({file.stat().st_size:,} bytes)", file=sys.stderr)
             analyzer.read(file)
         report = analyzer.finish(graph)
-        if not report["steps"]:
-            p.error("No assistant steps found; activity.log/terminal screenshots are not supported transcripts")
+        if not report["sessions"]:
+            p.error("No assistant steps or identified request snapshots found; activity.log/terminal screenshots are not supported transcripts")
         write_report(report, args.out)
         print(json.dumps({"output": str(args.out.resolve()), **report["summary"]}, ensure_ascii=False, indent=2))
         return 0

@@ -79,6 +79,17 @@ class AnalysisTests(unittest.TestCase):
                 (path / kind / (row["id"] + ".json")).write_text(json.dumps(row))
         return analysis.Graph(path)
 
+    def test_api_errors_keep_explicit_status_and_code_without_body_or_usage(self):
+        error = assistant("m1", 1, [{"type": "text", "text": "private error body"}],
+                          apiErrorStatus=400, requestRef="q1", uuid="error1")
+        report = feed([error, error, assistant("m2", 2, isApiErrorMessage=True,
+                                               error={"code": "context_length_exceeded"})]).finish()
+        first, second = report["api_errors"]
+        self.assertEqual((first["http_status"], first["category"], first["request_ref"]), (400, "unknown", "q1"))
+        self.assertEqual((second["http_status"], second["category"]), (None, "context_length_exceeded"))
+        self.assertEqual(report["summary"]["steps"], 0)
+        self.assertNotIn("private error body", json.dumps(report))
+
     def test_message_blocks_cache_usage_and_replayed_rows_count_once(self):
         first = assistant("m1", 10, [tool("t1", "pwd")], {"input_tokens": 100, "cache_read_input_tokens": 700,
                          "cache_creation_input_tokens": 200, "output_tokens": 2}, uuid="a1")
@@ -108,6 +119,60 @@ class AnalysisTests(unittest.TestCase):
         sizes = [s["graph_hook_bytes"] for s in r["steps"]]
         self.assertEqual(sizes, [len(hook.encode()), len(hook.encode()), 0])
         self.assertAlmostEqual(r["steps"][0]["graph_hook_share_estimate"], (len(hook.encode()) + 3) // 4 / 500)
+
+    def test_coverage_counts_distinct_blob_only_refs_at_final_snapshot(self):
+        def request(ref, tail):
+            return {"type": "api-request", "sessionId": "s1", "id": ref, "keep": 0, "tail": tail}
+
+        native = assistant("m", 1, [tool("native", "pwd")], requestRef="linked")
+        native_message = {"role": "assistant", "content": native["message"]["content"]}
+        native_hash = analysis.digest(analysis.canonical(native_message))
+        blobs = {"old": {"role": "assistant", "content": [tool("old", "ls")]},
+                 "new": {"role": "assistant", "content": [tool("a", "ls"), tool("b", "pwd")]},
+                 "result": result("a", 2)["message"], native_hash: native_message}
+        rows = [{"type": "api-request-blob", "sessionId": "s1", "hash": key, "message": msg}
+                for key, msg in blobs.items()]
+        rows += [request("linked", ["old"]), native, request("retry", ["old"]),
+                 request("final", [native_hash, "old", "new", "new", "result"])]
+        report = feed(rows).finish()
+        session = report["sessions"][0]
+        self.assertEqual((session["steps"], session["tool_calls"]), (1, 1))
+        self.assertEqual(session.get("last_linked_request"), "linked")
+        self.assertEqual(session["trailing_request_snapshots"], 2)
+        self.assertEqual(session["tail_blob_tool_use_refs"], 1)
+        self.assertEqual(session["tail_blob_tool_result_refs"], 1)
+
+    def test_coverage_unknown_without_link_or_reconstructible_endpoints(self):
+        first = {"type": "api-request", "sessionId": "s1", "id": "q", "keep": 0, "tail": []}
+        step = assistant("m", 1, requestRef="q")
+        for rows, linked, tail, refs in [
+            ([step], None, None, None), ([first], None, None, None),
+            ([first, step], "q", 0, 0),
+            ([first, step, dict(first, id="end", tail=["missing"])], "q", 1, None),
+            ([first, step, dict(first, id="end", keep=10)], "q", 1, None),
+        ]:
+            with self.subTest(linked=linked, tail=tail, refs=refs):
+                sessions = feed(rows).finish()["sessions"]
+                self.assertEqual(len(sessions), 1)
+                session = sessions[0]
+                self.assertIn("trailing_request_snapshots", session)
+                self.assertEqual((session["last_linked_request"], session["trailing_request_snapshots"],
+                                  session["tail_blob_tool_use_refs"], session["tail_blob_tool_result_refs"]),
+                                 (linked, tail, refs, refs))
+
+    def test_coverage_orders_overlapping_files_by_request_time(self):
+        a = analysis.Analyzer()
+        def snapshot(path, ref, t):
+            a.event({"type": "api-request", "timestamp": at(t), "sessionId": "s1",
+                     "id": ref, "keep": 0, "tail": []}, path, t)
+        snapshot("part-b", "shared", 2)
+        snapshot("part-b", "end", 3)
+        snapshot("part-a", "first", 1)
+        snapshot("part-a", "shared", 2)
+        a.event(assistant("m", 4, requestRef="shared"), "part-a", 5)
+        s = a.finish()["sessions"][0]
+        self.assertEqual((s["request_snapshots"], s["last_linked_request"],
+                          s["trailing_request_snapshots"]), (3, "shared", 1))
 
     def test_missing_request_blob_not_zero_and_hook_boundaries(self):
         rows = [{"type": "api-request", "sessionId": "s1", "id": "r", "keep": 0, "tail": ["missing"]},

@@ -574,7 +574,7 @@ class Console:
             raise WebError("终端已结束，请查看运行日志", 404)
         return {"text": self.redact(proc.stdout), "captured_at": sapper.now_iso()}
 
-    def send(self, pane_id, data):
+    def send(self, pane_id, data, *, target_agent=None, kind="terminal_input", message_id=None):
         pane = self.pane(pane_id)
         if data.get("key") in ("C-c", "Escape"):
             self.workspaces.pause_commander_input(pane)
@@ -592,7 +592,8 @@ class Console:
                 proc = self.tmux("send-keys", "-t", pane_id, "Enter")
         if proc.returncode:
             raise WebError("发送失败，终端可能已结束", 409)
-        self.audit("terminal.sent", pane=pane_id, project=pane["project_id"], key=data.get("key"))
+        self.audit("terminal.sent", pane=pane_id, project=pane["project_id"], key=data.get("key"),
+                   target_agent=target_agent, kind=kind, message_id=message_id or secrets.token_hex(16))
         return {"status": "sent", "message": "已送入终端；是否采用请查看原 agent 回应"}
 
     def run_path(self, rid):
@@ -1385,6 +1386,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(200, app.projects())
                 if method == "POST":
                     return self.reply(201, app.create_project(self.body()))
+            if path == "/api/extensions/skill-metadata" and method == "GET":
+                return self.reply(200, app.workspaces.extensions.preview_skill(q("path")))
             if path == "/api/extensions":
                 if method == "GET":
                     return self.reply(200, app.workspaces.extensions.view())

@@ -550,6 +550,7 @@ submit("bind-form",async form=>{
   if (skillDirectoryInput) {
     skillDirectoryInput.value=form.get("path");
     skillDirectoryInput.dispatchEvent(new Event("input",{bubbles:true}));
+    skillDirectoryInput.dispatchEvent(new Event("change",{bubbles:true}));
     $("bind-dialog").close();
     return;
   }

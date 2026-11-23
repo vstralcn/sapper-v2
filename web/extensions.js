@@ -3,6 +3,7 @@
 let extensionLibrary = null, extensionWorkspace = null, agentExtensionRequest = 0;
 let workspaceModelConfig = null, workspaceSettingsRequest = 0;
 let workspaceResourcesDirty = false, workspaceModelsDirty = false;
+let skillMetadataRequest = null;
 
 function extensionName(value) {
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value)) {
@@ -106,6 +107,7 @@ function editExtension(kind, resource = null) {
   const mcp = kind === "mcp";
   const prefix = mcp ? "extensions-mcp" : "extensions-skill";
   const form = $(`${prefix}-form`);
+  if (!mcp) skillMetadataRequest = null;
   form.reset();
   form.elements.id.value = resource?.id ?? "";
   $(`${prefix}-error`).textContent = "";
@@ -349,9 +351,49 @@ submitExtension("extensions-import", "extensions-mcp-import", data => {
   if (!data.name.trim()) throw new Error("导入单个服务器时，请填写服务器名称。");
   return saveExtensionAction({action: "save", kind: "mcp", name: extensionName(data.name), config});
 });
-$("extensions-skill-browse").onclick = () => guarded(() => openDirectoryPicker($("extensions-skill-form").elements.path));
-submitExtension("extensions-skill", "extensions-skill-add", data => {
-  const name = extensionName(data.name);
-  if (!data.path.startsWith("/")) throw new Error("请填写以 / 开头的 Skill 目录绝对路径。");
-  return saveExtensionAction({...data, name, action: "save", kind: "skills"});
+const skillFields = $("extensions-skill-form").elements;
+
+function loadSkillMetadata(path) {
+  if (skillMetadataRequest) return skillMetadataRequest;
+
+  const response = path.startsWith("/")
+    ? api("/extensions/skill-metadata?path=" + encodeURIComponent(path))
+    : Promise.reject(new Error("请填写以 / 开头的 Skill 目录绝对路径。"));
+  const request = response.then(metadata => {
+    if (skillMetadataRequest !== request || !$("extensions-skill-editor").open) {
+      throw new Error("Skill 目录已变化，请重新保存。");
+    }
+    skillFields.name.value = metadata.name;
+    skillFields.description.value = metadata.description;
+    return metadata;
+  }).catch(error => {
+    if (skillMetadataRequest === request) {
+      skillMetadataRequest = null;
+      $("extensions-skill-error").textContent = error.message;
+    }
+    throw error;
+  });
+  skillMetadataRequest = request;
+  return request;
+}
+
+$("extensions-skill-browse").onclick = () => guarded(() => openDirectoryPicker(skillFields.path));
+skillFields.path.oninput = () => {
+  skillMetadataRequest = null;
+  skillFields.name.value = "";
+  skillFields.description.value = "";
+};
+skillFields.path.onchange = async () => {
+  const path = skillFields.path.value.trim();
+  if (!path || skillFields.name.value) return;
+  try {
+    await loadSkillMetadata(path);
+  } catch {
+    // loadSkillMetadata displays the error next to the directory field.
+  }
+};
+submitExtension("extensions-skill", "extensions-skill-add", async data => {
+  const path = data.path.trim();
+  const {name, description} = data.name ? data : await loadSkillMetadata(path);
+  return saveExtensionAction({id: data.id, path, name, description, action: "save", kind: "skills"});
 });

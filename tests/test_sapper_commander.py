@@ -138,6 +138,45 @@ class CommanderTests(unittest.TestCase):
         self.assertEqual(view["verification"], "board_confirmed")
         self.assertEqual(view["last_board"]["wake_id"], self.wake()["id"])
 
+    def test_wake_audit_links_terminal_delivery(self):
+
+        aid = self.agent["id"]
+        pane = {"id": "%123", "project_id": self.project["id"]}
+        self.idle()
+        with mock.patch.object(self.app, "send", wraps=Console.send.__get__(self.app)), \
+                mock.patch.object(self.app, "pane", return_value=pane), \
+                mock.patch.object(self.app, "tmux", return_value=mock.Mock(returncode=0)):
+            self.app.send("%123", {"text": "private input", "target_agent": "spoofed",
+                                   "kind": "wake", "message_id": "spoofed"})
+            self.tick()
+        log = (self.app.state / "actions.jsonl").read_text()
+        self.assertNotIn("private input", log)
+        events = [json.loads(line) for line in log.splitlines()]
+        raw, sent = [e for e in events if e["action"] == "terminal.sent"]
+        self.assertEqual(raw["kind"], "terminal_input")
+        self.assertIsNone(raw["target_agent"])
+        self.assertNotEqual(raw["message_id"], "spoofed")
+        wake, = [e for e in events if e["action"] == "commander.wake_sent"]
+        for event in (sent, wake):
+            self.assertEqual(event["target_agent"], aid)
+            self.assertEqual(event["kind"], "wake")
+            self.assertEqual(event["message_id"], self.wake()["id"])
+
+    def test_chat_wake_audit_references_actual_queue_item(self):
+        from sapper_chat import ChatJournal
+
+        self.agent["execution_mode"] = "chat"
+        self.manager.save_agent(self.agent)
+        aid = self.agent["id"]
+        journal = ChatJournal(self.app.state, aid)
+        journal.events.write_text(json.dumps({"type": "result", "timestamp": self.iso(1000)}) + "\n")
+        self.tick()
+        with journal.locked() as data:
+            item, = data["messages"]
+        events = [json.loads(line) for line in (self.app.state / "actions.jsonl").read_text().splitlines()]
+        wake, = [e for e in events if e["action"] == "commander.wake_sent"]
+        self.assertEqual((wake["target_agent"], wake["message_id"]), (aid, item["id"]))
+
     def test_two_watchdogs_send_only_one_wake(self):
         self.idle()
         other = Console(self.app.root, self.app.state)

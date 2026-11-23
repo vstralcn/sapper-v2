@@ -332,10 +332,14 @@ class CommanderMonitor:
                     atomic_private(self.path(aid), data)
                     if agent.get("execution_mode") == "chat":
                         from sapper_chat import ChatJournal
-                        ChatJournal(self.app.state, aid).enqueue(self.prompt(token), internal=True)
+                        item = ChatJournal(self.app.state, aid).enqueue(self.prompt(token), internal=True)
+                        message_id = item["id"]
                     else:
-                        self.app.send(row["pane_id"], {"text": self.prompt(token)})
-                    self.app.audit("commander.wake_sent", agent=aid, wake=token, request_id=token)
+                        message_id = token
+                        self.app.send(row["pane_id"], {"text": self.prompt(token)}, target_agent=aid,
+                                      kind="wake", message_id=message_id)
+                    self.app.audit("commander.wake_sent", agent=aid, wake=token, request_id=token,
+                                   target_agent=aid, kind="wake", message_id=message_id)
                     return
             # Crash recovery is separate from healthy-process wakeup.
             resumed = self.manager.resume(aid, {"continuation": self.prompt(token), "request_id": token})

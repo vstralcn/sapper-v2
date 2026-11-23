@@ -53,6 +53,10 @@ python3 scripts/analyze_agent_run.py \
 
 统计信任日志中**供应方或本地协议适配器报告的 usage**，不声称独立核验供应方账单。缺失 usage 保留 `null`。没有 message ID 的旧记录退化为每条 assistant 一步，并在 diagnostics 标记；无时间戳则保留步数、耗时为空。
 
+会话摘要的 `request_snapshots` 按请求 ID 去重。`last_linked_request` 是请求序列里最后一个能关联模型步骤的 ID，`trailing_request_snapshots` 是它之后的快照数。零步但有请求的会话也会列出。缺少关联基准，或跨日志缺少排序所需的时间戳时，尾段指标留空。
+
+`tail_blob_tool_use_refs` 和 `tail_blob_tool_result_refs` 比较末份快照与上述基准，分别统计末份新增且仅见于请求 blob 的工具调用、结果消息引用。每类按消息哈希去重，同一消息里的多个工具块计一个引用。中途出现又移出的引用不计入。无法重建两端的差集或识别新增引用时留空。这些字段用来解释步骤记录的覆盖边界，工具执行次数和 token 仍以直接记录为准。
+
 ### 2. 图注入占比
 
 原生日志若包含 `api-request-shape`、`api-request-blob`、`api-request`，按指定 `base` 请求的 `keep/tail` 重建每一步实际消息集合。日志省略的消息块，用合并后的 assistant 分块或连续 user 工具结果的规范 JSON SHA-256 匹配回填，不能匹配就保留未知。这样不会在上下文压缩后继续累计已经移除的图内容。

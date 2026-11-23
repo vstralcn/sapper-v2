@@ -1150,7 +1150,7 @@ class Workspaces:
             pane = self.external_pane(a)
             if pane:
                 if a.get("stop_phase") != "waiting_confirmation":
-                    self.app.send(pane["id"], {"key": "C-c"})
+                    self.app.send(pane["id"], {"key": "C-c"}, target_agent=aid, kind="command")
                 return self.stop_pending(a)
             return {"status": "not_running", "released_intents": self.release_stopped_intents(a)}
         observed = True
@@ -1204,7 +1204,7 @@ class Workspaces:
         self.app.audit("agent.deleted", agent=aid, workspace=a["workspace_id"], detached_children=detached)
         return {"deleted_agent": aid}
 
-    def message(self, aid, data):
+    def message(self, aid, data, *, kind="command"):
         a = next((a for a in self.agents() if a["id"] == aid), None)
         if a and a.get("execution_mode") == "chat":
             if data.get("sender_id"):
@@ -1220,7 +1220,7 @@ class Workspaces:
             return {"status": "queued", "message": "已保存到该角色的定向收件箱", "id": item["id"]}
         if not a or not a.get("pane_id"):
             raise WorkspaceError("该角色当前没有活动终端，请先恢复会话或保存为 hint", 409)
-        return self.app.send(a["pane_id"], {"text": text(data, "text")})
+        return self.app.send(a["pane_id"], {"text": text(data, "text")}, target_agent=aid, kind=kind)
 
     def pause_commander_input(self, pane):
         """A user's native interrupt is also an explicit exit from auto turns."""
@@ -1411,6 +1411,7 @@ def worker(argv):
     a = manager.agent(args.target) if args.target else None
     if a and a["workspace_id"] not in scope:
         raise WorkspaceError("不能操作其他工作区角色")
+    reporting_up = False
     if a and parent and a["id"] != parent:
         ancestor = a.get("parent_agent_id")
         seen = set()
@@ -1437,7 +1438,9 @@ def worker(argv):
             raise WorkspaceError("本地工作区没有平台实例，不执行 --close 或自动交卷")
         print(json.dumps(manager.stop_agent(a["id"])))
     elif args.action == "msg":
-        print(json.dumps(manager.message(a["id"], {"text": args.body or "", "sender_id": parent}), ensure_ascii=False))
+        result = manager.message(a["id"], {"text": args.body or "", "sender_id": parent},
+                                 kind="report" if reporting_up else "command")
+        print(json.dumps(result, ensure_ascii=False))
     elif args.action == "peek":
         row = next(r for r in manager.agents() if r["id"] == a["id"])
         if a.get("execution_mode") == "print" and a.get("run_id"):
