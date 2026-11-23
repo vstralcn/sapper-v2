@@ -35,7 +35,7 @@ import sapper
 import sapper_context
 import sapper_evidence
 from kb import KnowledgeBase, KBError
-from sapper_workspace import Workspaces, WorkspaceError, ROLES
+from sapper_workspace import Workspaces, WorkspaceError, ROLES, agent_summary, graph_summary
 from sapper_native import NativeSurface, NativeError
 from sapper_permission_audit import FIELDS as PERMISSION_AUDIT_FIELDS
 from sapper_extensions import ExtensionError, clean_environment, api_environment
@@ -112,24 +112,25 @@ def run_lock(directory):
 
 
 class Console:
-    def __init__(self, root: Path, state: Path, tmux_socket=None, *, workspace_roots=None, claude_bin=None):
+    def __init__(self, root: Path, state: Path, tmux_socket=None, *, workspace_roots=None, claude_bin=None, initialize=True):
         self.root = root.resolve()
         self.state = state.resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.state, 0o700)
         self.tmux_socket = tmux_socket
         self._workspace_roots = list(dict.fromkeys([self.root] + [Path(p).expanduser().resolve() for p in (workspace_roots or [])]))
         self.claude_bin = claude_bin or os.environ.get("SAPPER_CLAUDE_BIN", "claude")
         self.config_path = self.state / "config.json"
         self.context_path = self.state / "global-context.json"
         self.lock = threading.RLock()
-        self.auth = AuthStore(self.state)
-        bindir = self.state / "bin"
-        bindir.mkdir(exist_ok=True)
-        shim = bindir / "sapper"
-        shim.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(SAPPER))} \"$@\"\n")
-        shim.chmod(0o700)
+        if initialize:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(self.state, 0o700)
+            self.auth = AuthStore(self.state)
+            bindir = self.state / "bin"
+            bindir.mkdir(exist_ok=True)
+            shim = bindir / "sapper"
+            shim.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(SAPPER))} \"$@\"\n")
+            shim.chmod(0o700)
         self.workspaces = Workspaces(self)
         self.native = NativeSurface(self)
 
@@ -183,17 +184,20 @@ class Console:
 
     def overview(self):
         projects = self.projects()
-        runs = self.runs()
+        runs = self.runs(reconcile=False)
         panes = self.panes()
         agents = [a for a in self.workspaces.agents(run_records=runs, pane_records=panes) if not a["id"].startswith("legacy-")]
         context = self.global_context()
+        by_workspace = {}
+        for agent in agents:
+            by_workspace.setdefault(agent["workspace_id"], []).append(agent)
         for project in projects:
-            project["active_agents"] = sum(bool(a.get("pane_id")) for a in agents
-                                           if project["id"] in a.get("workspace_scope", [a["workspace_id"]]))
+            project["agent_summary"] = agent_summary(by_workspace.get(project["id"], []))
+            project["active_agents"] = project["agent_summary"]["online"]
         recent = [{k: r.get(k) for k in ("id", "project_id", "kind", "native_operation", "role", "profile_name", "status", "exit_code", "created_at")}
                   for r in runs[:8]]
         return {"projects": projects, "agents": agents, "panes": panes, "recent_runs": recent,
-                "summary": {"workspaces": len(projects), "active_agents": sum(bool(a.get("pane_id")) for a in agents),
+                "summary": {"workspaces": len(projects), "active_agents": agent_summary(agents)["online"],
                             "open_intents": sum(p["open_intents"] for p in projects),
                             "facts": sum(p["facts"] for p in projects)},
                 "context": {k: context[k] for k in ("revision", "enabled", "prompt_enabled", "hook_enabled", "updated_at")},
@@ -254,14 +258,13 @@ class Console:
                 store = sapper.Store(resolved)
                 with store.locked():
                     project = store.load_project()
-                    facts, intents = store.list_facts(), store.list_intents()
+                    summary = graph_summary(store)
                 rel = str(here.relative_to(self.root))
                 found.append({"id": hashlib.sha256(rel.encode()).hexdigest()[:16],
                               "name": here.name, "path": str(here), "relative_path": rel,
                               "goal": project["goal"], "status": project["status"],
                               "created_at": project.get("created_at"),
-                              "facts": sum(f["id"] != "goal" for f in facts),
-                              "open_intents": sum(sapper.is_open(i) for i in intents)})
+                              **summary})
             except (WebError, sapper.FGError, OSError):
                 continue
             if len(found) >= 200:
@@ -627,14 +630,14 @@ class Console:
         self.audit("run.extended", run=rid, minutes=minutes, timeout_seconds=total)
         return self.run_info(rid)
 
-    def runs(self, pid=None):
+    def runs(self, pid=None, *, reconcile=True):
         result = []
         keys = self.redaction_keys()
         for path in (self.state / "runs").glob("*/run.json"):
             info = read_json(path)
             if pid and info.get("project_id") != pid:
                 continue
-            if info["status"] not in FINISHED:
+            if reconcile and info["status"] not in FINISHED:
                 alive = self.tmux("has-session", "-t", info["session"]).returncode == 0
                 if not alive:
                     # Do not overwrite a concurrent final result written by the runner.
@@ -648,13 +651,14 @@ class Console:
         return sorted(result, key=lambda r: r["created_at"], reverse=True)[:100]
 
     def workspace_status(self, pid):
-        runs, panes = self.runs(), self.panes()
+        runs, panes = self.runs(reconcile=False), self.panes()
         agents = self.workspaces.agents(pid, run_records=runs, pane_records=panes)
         try:
             primary, error = self.workspaces.main_agent(pid, agents=agents), None
         except WorkspaceError as exc:
             primary, error = None, str(exc)
         return {"agents": agents, "primary_agent": primary, "primary_error": error,
+                "summary": agent_summary(agents), "observed_at": sapper.now_iso(),
                 "services": self.workspaces.services(pid, run_records=runs, pane_records=panes)}
 
     def start(self, pid, data, *, native=None):
@@ -1286,12 +1290,12 @@ class Handler(BaseHTTPRequestHandler):
                 app.auth.logout(session)
                 return self.reply(200, {"ok": True}, headers={"Set-Cookie": self.expired_cookie()})
             if path == "/api/health" and method == "GET":
-                return self.reply(200, {"root": str(app.root), "state": str(app.state),
+                return self.reply(200, {"root": str(app.root), "state": str(app.state), "tmux_socket": app.tmux_socket or "default",
                                        "tmux": bool(shutil.which("tmux")), "claude": bool(shutil.which("claude")),
                                        "sapper": str(SAPPER), "worker_script": str(REPO / "docker/commander/worker.sh"),
                                        "workspace_roots": [str(p) for p in app.workspace_roots]})
             if path == "/api/directories" and method == "GET":
-                return self.reply(200, app.workspaces.directories(q("path")))
+                return self.reply(200, app.workspaces.directories(q("path"), for_skill=q("kind") == "skill"))
             if path == "/api/overview" and method == "GET":
                 return self.reply(200, app.overview())
             if path == "/api/context":
@@ -1424,7 +1428,7 @@ class Handler(BaseHTTPRequestHandler):
                     if parts[4] == "resize" and method == "POST":
                         return self.reply(200, terminal.resize(pane_id, self.body()))
             if path == "/api/runs" and method == "GET":
-                return self.reply(200, app.runs(q("project") or None))
+                return self.reply(200, app.runs(q("project") or None, reconcile=False))
             if path.startswith("/api/runs/"):
                 parts = path.split("/")
                 rid = parts[3]

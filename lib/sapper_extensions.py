@@ -265,6 +265,11 @@ class AgentExtensions:
                         if source.is_relative_to(self.app.state):
                             raise ExtensionError("不能从 Web 私有凭据目录导入 skill", 403)
                         item["path"] = str(source)
+                        description = data.get("description", (previous or {}).get("description", ""))
+                        if not isinstance(description, str) or len(description) > 512 or "\x00" in description:
+                            raise ExtensionError("Skill 描述须为最多 512 字符的文本")
+                        if description.strip():
+                            item["description"] = description.strip()
                     if previous:
                         cfg[kind][cfg[kind].index(previous)] = item
                     else:

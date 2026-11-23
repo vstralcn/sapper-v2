@@ -338,6 +338,8 @@ def main():
                 page.emulate_media(color_scheme="light")
                 check("manual choice takes precedence over system preference", ev("document.documentElement.dataset.theme==='dark'"))
                 page.reload()
+                page.wait_for_selector("#tab-files:visible")
+                page.locator("#home-button").click()
                 page.wait_for_selector("#overview:visible")
                 check("overview retains access to native tools", page.locator("#native-button").is_visible())
                 check("theme persists across reload and on the overview", ev("document.documentElement.dataset.theme==='dark' && localStorage.getItem('sapper-theme')==='dark' && getComputedStyle(document.querySelector('.overview-context')).backgroundColor==='rgb(32, 53, 67)'"))

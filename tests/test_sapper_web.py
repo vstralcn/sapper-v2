@@ -9,6 +9,7 @@ from pathlib import Path
 import shlex
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -211,7 +212,7 @@ class ConsoleTests(unittest.TestCase):
             self.assertEqual(status["agents"][0]["status"], "exited")
             self.assertEqual(status["agents"][0]["exit_code"], 0)
             self.assertEqual(status["services"][0]["status"], "exited")
-            runs.assert_called_once_with()
+            runs.assert_called_once_with(reconcile=False)
             panes.assert_called_once_with()
         with mock.patch.object(self.app, "runs", wraps=self.app.runs) as runs, \
                 mock.patch.object(self.app, "panes", return_value=[]), \
@@ -219,7 +220,7 @@ class ConsoleTests(unittest.TestCase):
             overview = self.app.overview()
             self.assertEqual(overview["agents"][0]["id"], aid)
             self.assertEqual(overview["recent_runs"][0]["id"], rid)
-            runs.assert_called_once_with()
+            runs.assert_called_once_with(reconcile=False)
 
 
 class HttpTests(unittest.TestCase):
@@ -259,6 +260,40 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.cookie = headers["Set-Cookie"].split(";", 1)[0]
         self.csrf = json.loads(body)["csrf"]
+
+    def test_workspace_and_fact_status_agree_between_cli_and_web(self):
+        self.login()
+        project = self.app.create_project({"name": "parity", "goal": "Review a document"})
+        pid, aid, rid = project["id"], "a" * 16, "b" * 16
+        run_path = self.app.run_path(rid) / "run.json"
+        private_json(run_path, {"id": rid, "project_id": pid, "status": "running",
+                                "created_at": sapper.now_iso(), "session": "fixture-missing-pane"})
+        self.app.workspaces.save_agent({"id": aid, "workspace_id": pid, "role": "worker",
+                                       "run_id": rid, "created_at": sapper.now_iso()})
+        self.app.tmux_socket = "fixture-" + uuid.uuid4().hex
+        repo = Path(__file__).resolve().parents[1]
+        cli = [sys.executable, str(repo / "lib/sapper.py"), "--store", str(Path(project["path"]) / ".sapper")]
+        result = subprocess.check_output([*cli, "fact", "Reviewed the draft", "--evidence-source", "Review notes"], text=True)
+        fact_id = result.strip()
+        _, _, body = self.request(f"/api/projects/{pid}/graph")
+        fact = next(f for f in json.loads(body)["facts"] if f["id"] == fact_id)
+        self.assertEqual(fact["evidence"]["source"], "Review notes")
+        _, _, body = self.request(f"/api/projects/{pid}/fact", "POST", {"description": "Approved the outline"})
+        web_fact = json.loads(body)
+        cli_graph = json.loads(subprocess.check_output([*cli, "graph", "--format", "json"], text=True))
+        self.assertIn(web_fact, cli_graph["facts"])
+
+        _, _, body = self.request(f"/api/workspaces/{pid}/agents")
+        web = json.loads(body)
+        cli_view = json.loads(subprocess.check_output([sys.executable, str(repo / "sapperctl"), "workspace-status",
+            "--state", str(self.app.state), "--root", str(self.app.root), "--tmux-socket", self.app.tmux_socket,
+            "--workspace", project["path"], "--json"], text=True))
+        self.assertEqual(cli_view["project"]["id"], pid)
+        self.assertEqual(cli_view["summary"], web["summary"])
+        self.assertEqual(cli_view["agents"][0]["observation"], web["agents"][0]["observation"])
+        self.assertEqual(cli_view["agents"][0]["observation"]["presence"], "unknown")
+        self.assertEqual(json.loads(run_path.read_text())["status"], "running")
+        self.assertFalse((run_path.parent / "control.lock").exists())
 
     def test_password_login_rejects_legacy_token_and_sets_private_cookie(self):
         (self.app.state / "token").write_text("legacy-fixture-token-that-is-no-longer-accepted")

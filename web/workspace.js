@@ -3,7 +3,6 @@
 state.agents = [];
 state.services = [];
 state.workspaceFolder = ".";
-state.roots = [];
 state.nativePane = "";
 state.nativeControl = false;
 state.nativeStream = null;
@@ -12,6 +11,8 @@ let roleInfoRequest = 0;
 let dispatchRequestId;
 let directoryRequest = 0;
 let selectedDirectory = "";
+let skillDirectoryInput = null;
+let listedDirectories = [];
 let agentTopology;
 const flagSettingsRequests = new Set();
 const roleNames = {worker:"执行者",commander:"指挥官",general:"将军",scout:"侦察兵",verifier:"验证者",custom:"自定义职责"};
@@ -20,7 +21,8 @@ const baseSetTab = setTab;
 
 function workspaceApi(action, options = {}) { return api(`/workspaces/${state.project.id}/${action}`, options); }
 function formatAgentStatus(a,panes=state.panes) {
-  return AgentTopologyModel.labels[(a.observation||AgentTopologyModel.observe(a,panes)).status];
+  const observation = a.observation || (typeof AgentTopologyModel !== "undefined" && AgentTopologyModel.observe(a,panes));
+  return agentStatusLabels[observation?.status] || agentStatusLabels.unknown;
 }
 
 refreshTask = async function () {
@@ -30,31 +32,47 @@ refreshTask = async function () {
   const navigation = state.navigation;
   try {
     if (agentTopology) agentTopology.switchWorkspace(pid);
-    const [, roles, inspection] = await Promise.all([
+    const results = await Promise.allSettled([
       baseRefreshTask(), api(`/workspaces/${pid}/agents`), api(`/workspaces/${pid}/inspect`)
     ]);
     if (state.view !== "project" || pid !== state.project?.id || navigation !== state.navigation) return;
-    state.agents = roles.agents;
-    state.services = roles.services;
-    state.inspection = inspection;
-    state.mainAgent = roles.primary_agent;
-    $("workspace-permissions").textContent=AgentTopologyModel.permissionSummary(state.agents,state.panes);
-    if($("agent-dialog").open)refreshDispatchState();
-    if (!flagSettingsRequests.has(pid)) {
-      $("auto-submit-flags").checked = inspection.auto_submit_flags;
-      $("auto-submit-flags").disabled = !inspection.graph;
+    const [, roleResult, inspectionResult] = results;
+    if (roleResult.status === "fulfilled") {
+      const roles = roleResult.value;
+      state.agents = roles.agents;
+      state.services = roles.services;
+      state.mainAgent = roles.primary_agent;
+      state.workspaceObservation = roles.observed_at;
+      if($("agent-dialog").open)refreshDispatchState();
     }
-    const ready = inspection.graph && inspection.instructions && Object.values(inspection.hooks).every(Boolean);
-    $("project-status").textContent = state.graph.project.status === "completed" ? "目标已完成" : ready ? "工作区已接入" : "待启用 sapper";
-    $("enable-workspace").textContent = ready ? "检查／更新接入" : "启用 sapper";
-    $("workspace-readiness").textContent = ready ? "题目原目录 · hooks 与共享图已接入" : "启用后合并项目级 hooks 与说明，保留已有内容";
-    renderAgents();
+    if (inspectionResult.status === "fulfilled") {
+      const inspection = inspectionResult.value;
+      state.inspection = inspection;
+      if (!flagSettingsRequests.has(pid)) {
+        $("auto-submit-flags").checked = inspection.auto_submit_flags;
+        $("auto-submit-flags").disabled = !inspection.graph;
+      }
+      const ready = inspection.graph && inspection.instructions && Object.values(inspection.hooks).every(Boolean);
+      $("project-status").textContent = state.graph.project.status === "completed" ? "目标已完成" : ready ? "工作区已接入" : "待启用 sapper";
+      $("enable-workspace").textContent = ready ? "检查／更新接入" : "启用 sapper";
+      $("workspace-readiness").textContent = ready ? "题目原目录 · hooks 与共享图已接入" : "启用后合并项目级 hooks 与说明，保留已有内容";
+    }
+    if (state.tab === "progress") renderProgress();
     renderNativePanes();
+    if (typeof AgentTopologyModel !== "undefined" && typeof AgentTopologyView !== "undefined") {
+      $("workspace-permissions").textContent=AgentTopologyModel.permissionSummary(state.agents,state.panes);
+      renderAgents();
+    } else {
+      $("agent-topology").replaceChildren(empty("拓扑资源加载失败，请刷新后重试。"));
+      $("agent-list").replaceChildren(button("在进展页查看角色状态", "text-button", () => setTab("progress")));
+    }
     if (state.workspaceFilesPid !== pid && state.tab === "workspace") {
       state.workspaceFolder = ".";
       state.workspaceFilesPid = pid;
       await workspaceFiles();
     }
+    const failed = results.find(result => result.status === "rejected");
+    if (failed) throw failed.reason;
   } catch (error) {
     if (state.view === "project" && pid === state.project?.id && navigation === state.navigation) agentTopology?.setConnection(false);
     throw error;
@@ -63,25 +81,29 @@ refreshTask = async function () {
 
 setTab = function (tab) {
   if(tab==="chat")tab="workspace";
+  if (!workspaceTabs.has(tab)) tab = "progress";
   $("tab-agents").hidden = tab !== "agents";
   if (tab !== "workspace") {
     $("tab-workspace").hidden = true;
     baseSetTab(tab);
-    if (tab === "agents" && agentTopology) requestAnimationFrame(() => {
-      if (agentTopology.current.needsFit) agentTopology.fit();
+    rememberWorkspaceLocation();
+    if (tab === "agents" && agentTopology?.current) requestAnimationFrame(() => {
+      if (agentTopology.current?.needsFit) agentTopology.fit();
       else agentTopology.transform();
     });
     return;
   }
   state.tab = tab;
-  for (const name of ["memory","console","files"]) $("tab-"+name).hidden = true;
+  for (const name of ["progress","memory","console","files"]) $("tab-"+name).hidden = true;
   $("tab-workspace").hidden = false;
   document.querySelectorAll("[data-tab]").forEach(n => {
     n.classList.toggle("active",n.dataset.tab===tab);
     n.setAttribute("aria-selected",String(n.dataset.tab===tab));
   });
   ensureTerminal();
+  rememberWorkspaceLocation();
   if (state.project) {
+    renderNativePanes();
     state.workspaceFilesPid = state.project.id;
     guarded(workspaceFiles);
   }
@@ -89,22 +111,39 @@ setTab = function (tab) {
 };
 
 async function openBind() {
+  await openDirectoryPicker();
+}
+
+async function openDirectoryPicker(skillInput = null) {
   const opening=++directoryRequest;
+  skillDirectoryInput=skillInput;
+  const forSkill=Boolean(skillInput);
+  $("directory-title").textContent=forSkill?"选择 Skill 目录":"选择题目文件夹";
+  $("directory-help").textContent=forSkill?"进入包含 SKILL.md 的文件夹后，点击“使用此目录”。":"打开文件夹后，点击“选择此文件夹”。文件保持原位置。";
+  $("directory-workspace-fields").hidden=forSkill;
+  $("directory-filter").hidden=!forSkill;
+  $("directory-filter").value="";
+  $("directory-select").textContent=forSkill?"使用此目录":"选择此文件夹";
   $("bind-path").value="";
   $("directory-select").disabled=true;
   $("directory-up").disabled=true;
+  listedDirectories=[];
+  $("directory-roots").replaceChildren();
+  $("directory-breadcrumbs").replaceChildren();
+  $("directory-list").replaceChildren();
   $("directory-status").textContent="正在读取文件夹…";
   $("bind-dialog").showModal();
-  const result = await api("/directories");
+  const result = await api(forSkill?"/directories?kind=skill":"/directories");
   if (opening!==directoryRequest || !$("bind-dialog").open) return;
-  state.roots = result.roots;
   $("directory-roots").replaceChildren(...result.roots.map((root,index) => {
-    const label=root==="/"?"文件系统":index===0?"任务文件夹":root.split("/").filter(Boolean).pop()||root;
+    const parts=root.split("/").filter(Boolean);
+    const label=root==="/"?"文件系统":!forSkill&&index===0?"任务文件夹":parts.at(-1)==="skills"?parts.slice(-2).join("/"):parts.at(-1)||root;
     const entry=button(label,"button",()=>guarded(()=>browseDirectory(root)));
     entry.title=root;
     return entry;
   }));
-  await browseDirectory(selectedDirectory||state.roots[0]);
+  const start=forSkill?skillInput.value.trim():selectedDirectory;
+  await browseDirectory(start.startsWith("/")?start:result.roots[0]);
 }
 function directoryBreadcrumbs(path) {
   const parts=path.split("/").filter(Boolean);
@@ -121,28 +160,24 @@ function directoryBreadcrumbs(path) {
 }
 async function browseDirectory(path) {
   const request=++directoryRequest;
+  const forSkill=Boolean(skillDirectoryInput);
   $("bind-path").value="";
   $("directory-select").disabled=true;
   $("directory-status").textContent="正在读取文件夹…";
   $("directory-list").setAttribute("aria-busy","true");
   try {
-    const data = await api("/directories?path="+encodeURIComponent(path));
+    const data = await api("/directories?path="+encodeURIComponent(path)+(forSkill?"&kind=skill":""));
     if (request!==directoryRequest) return;
-    selectedDirectory=data.path;
-    $("bind-path").value=data.path;
+    if (!forSkill) selectedDirectory=data.path;
+    $("bind-path").value=!forSkill||data.has_skill?data.path:"";
     directoryBreadcrumbs(data.path);
     $("directory-up").disabled=!data.parent;
     $("directory-up").onclick=()=>guarded(()=>browseDirectory(data.parent));
-    $("directory-list").replaceChildren(...(data.directories.length?data.directories.map(dir => {
-      const entry=button("","text-button directory-item",()=>guarded(()=>browseDirectory(dir.path)));
-      const icon=element("span","directory-icon","▱");
-      icon.setAttribute("aria-hidden","true");
-      entry.append(icon,element("span","directory-name",dir.name),
-        element("span","directory-meta",dir.has_graph?"已有图 · 打开":"打开"));
-      return entry;
-    }):[empty("此文件夹没有子文件夹，可以直接选择。")]));
-    $("directory-status").textContent="当前选择："+data.path;
-    $("directory-select").disabled=false;
+    listedDirectories=data.directories;
+    $("directory-filter").value="";
+    renderDirectoryEntries();
+    $("directory-status").textContent=(forSkill?"当前目录：":"当前选择：")+data.path+(forSkill?(data.has_skill?" · 含 SKILL.md":" · 未找到 SKILL.md"):"");
+    $("directory-select").disabled=forSkill&&!data.has_skill;
   } catch (error) {
     if (request!==directoryRequest) return;
     $("directory-status").textContent="无法打开此文件夹，请从常用位置或上一级重新选择。";
@@ -150,6 +185,20 @@ async function browseDirectory(path) {
   } finally {
     if (request===directoryRequest) $("directory-list").removeAttribute("aria-busy");
   }
+}
+
+function renderDirectoryEntries() {
+  const forSkill=Boolean(skillDirectoryInput);
+  const query=forSkill?$("directory-filter").value.trim().toLowerCase():"";
+  const rows=listedDirectories.filter(dir=>dir.name.toLowerCase().includes(query)).map(dir => {
+    const entry=button("","text-button directory-item",()=>guarded(()=>browseDirectory(dir.path)));
+    const icon=element("span","directory-icon","▱");
+    icon.setAttribute("aria-hidden","true");
+    entry.append(icon,element("span","directory-name",dir.name),
+      element("span","directory-meta",dir.has_skill?"含 SKILL.md":dir.has_graph?"已有图 · 打开":"打开"));
+    return entry;
+  });
+  $("directory-list").replaceChildren(...(rows.length?rows:[empty(query?"未找到匹配的子目录。":"此文件夹没有子文件夹。")]));
 }
 async function workspaceFiles() {
   const pid=state.project.id, folder=state.workspaceFolder, navigation=state.navigation;
@@ -381,7 +430,8 @@ async function flushTerminalInput(){
   if(data&&pane){inputQueue=inputQueue.then(()=>guarded(()=>api(`/panes/${encodeURIComponent(pane)}/input`,{method:"POST",body:{data}})));await inputQueue;}
 }
 function agentOptionLabel(a){
-  return `${a.name||a.role_label} · ${AgentTopologyModel.shortGoal(a)} · ${a.id.slice(0,6)}`;
+  const goal = typeof AgentTopologyModel !== "undefined" ? AgentTopologyModel.shortGoal(a) : (a.task_label || a.mission || "目标未记录").slice(0,18);
+  return `${a.name||a.role_label} · ${goal} · ${a.id.slice(0,6)}`;
 }
 function renderNativePanes(){
   const rolePanes=new Set(state.agents.map(a=>a.pane_id));
@@ -437,7 +487,9 @@ function disconnectNative(){
 }
 
 $("bind-workspace").onclick=()=>guarded(openBind);
-$("bind-dialog").addEventListener("close",()=>{++directoryRequest;});
+$("bind-dialog").addEventListener("close",()=>{++directoryRequest;skillDirectoryInput=null;listedDirectories=[];});
+$("directory-filter").oninput=renderDirectoryEntries;
+$("directory-filter").onkeydown=event=>{if(event.key==="Enter")event.preventDefault();};
 const projectTools=$("project-tools");
 function closeProjectTools(restoreFocus=false){
   if(!projectTools.open)return;
@@ -495,10 +547,16 @@ document.querySelectorAll(".dialog-close").forEach(node=>{node.onclick=()=>node.
 
 submit("bind-form",async form=>{
   if (!form.get("path")) throw new Error("请先选择一个可访问的文件夹");
+  if (skillDirectoryInput) {
+    skillDirectoryInput.value=form.get("path");
+    skillDirectoryInput.dispatchEvent(new Event("input",{bubbles:true}));
+    $("bind-dialog").close();
+    return;
+  }
   const p=await api("/workspaces/bind",{method:"POST",body:Object.fromEntries(form)});
-  state.project=p;localStorage.setItem("sapper-project",p.id);state.workspaceFilesPid=null;
-  state.view="project";
-  $("bind-dialog").close();await refreshProjects();setTab("workspace");openAgent("commander");toast("已打开工作区，请确认初步配置");
+  $("bind-dialog").close();
+  state.projects = [...state.projects.filter(project => project.id !== p.id), p];
+  await openProject(p,"workspace");openAgent("commander");toast("已打开工作区，请确认初步配置");
 });
 submit("agent-form",async form=>{
   const data=Object.fromEntries(form);data.minutes=Number(data.minutes);

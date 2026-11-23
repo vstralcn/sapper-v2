@@ -24,7 +24,7 @@ import sapper_roles
 from sapper_permission_audit import permission_audit
 from sapper_processes import RunProcesses
 from sapper_extensions import AgentExtensions, ExtensionError, REQUIRED_FLAGS
-from sapper_commander import CommanderMonitor, WatchdogLog
+from sapper_commander import CommanderMonitor, WatchdogLog, timestamp
 from sapper_chat import ChatJournal, NativeConversation
 
 REPO = Path(__file__).resolve().parent.parent
@@ -32,6 +32,71 @@ ROLES = sapper_roles.ROLES
 START_MARK = "<!-- sapper-workspace:start -->"
 END_MARK = "<!-- sapper-workspace:end -->"
 TERMINAL_STATES = {"exited", "failed", "stopped", "interrupted", "timed_out"}
+
+
+def agent_observation(agent, pane):
+    """Describe the observed state of a role without modifying its run."""
+    status = agent.get("status")
+    dead = pane.get("dead") if pane else None
+    presence = "unknown"
+    if status in TERMINAL_STATES or dead is True:
+        presence = "offline"
+    elif dead is False:
+        presence = "online"
+
+    activity = agent.get("activity") or {}
+    monitor = agent.get("commander_monitor") or {}
+    current = agent.get("execution_observation")
+    if not current:
+        current = activity if activity.get("phase") not in (None, "unknown") else monitor
+    def stamp(value):
+        return value if type(value) in (int, float) else timestamp(value) or 0
+
+    event = stamp(current.get("last_event_at"))
+    started = max(stamp(agent.get(k)) for k in ("created_at", "updated_at"))
+    phase = current.get("phase") if event and event >= started else None
+    exit_code = agent.get("exit_code")
+    failed = (status in ("failed", "timed_out") or
+              (status in TERMINAL_STATES and type(exit_code) is int and exit_code != 0) or
+              activity.get("result_is_error") is True)
+    execution, evidence = "unknown", "只有运行／进程记录，尚无可确认的执行阶段"
+    if failed:
+        execution = "error"
+        evidence = agent.get("stop_reason") or ("运行预算耗尽" if status == "timed_out" else "运行失败、非零退出码或明确的结果错误")
+    elif phase == "waiting_user" or monitor.get("control") == "waiting_user":
+        execution, evidence = "waiting", monitor.get("reason") or "原生会话或显式调度控制：等待用户输入"
+    elif phase in ("responding", "tool_running"):
+        execution = "running"
+        evidence = "原生会话记录：工具执行中" if phase == "tool_running" else "原生会话记录：模型处理中"
+    elif phase == "idle":
+        execution, evidence = "idle", "原生会话记录：本轮已结束；在线性另行观测"
+    elif activity.get("result_received") is True:
+        execution, evidence = "idle", "已收到本轮结果；不代表整个任务完成"
+    elif status == "stopping":
+        execution, evidence = "waiting", "已请求停止，正在等待进程退出"
+
+    return {"presence": presence, "execution": execution,
+            "status": execution if presence == "online" else presence,
+            "evidence": evidence, "last": max(event, stamp(activity.get("last_event_at"))) * 1000,
+            "attention": presence != "offline" and (failed or bool(monitor.get("attention"))),
+            "attentionReason": monitor.get("attention") or (evidence if failed else "")}
+
+
+def agent_summary(agents):
+    rows = [a["observation"] for a in agents if not a.get("legacy")]
+    return {"registered": len(rows), "online": sum(a["presence"] == "online" for a in rows),
+            "waiting": sum(a["status"] == "waiting" for a in rows),
+            "attention": sum(a["status"] != "waiting" and a["attention"] for a in rows),
+            "offline": sum(a["presence"] == "offline" for a in rows),
+            "unknown": sum(a["presence"] == "unknown" for a in rows)}
+
+
+def graph_summary(store):
+    facts = [f for f in store.list_facts() if f["id"] != "goal"]
+    intents = [i for i in store.list_intents() if sapper.is_open(i)]
+    return {"facts": len(facts), "open_intents": len(intents),
+            "pending_confirmation": sum(bool(i.get("requires_confirmation") and not i.get("confirmed_at")) for i in intents),
+            "last_evidence_at": max((f.get("created_at") or "" for f in facts if f.get("evidence")), default="")}
 
 
 class WorkspaceError(sapper.FGError):
@@ -103,24 +168,25 @@ class Workspaces:
                 store = sapper.Store(path / ".sapper")
                 item = {**binding, "name": binding.get("name") or path.name,
                         "relative_path": str(path), "status": "not_enabled", "facts": 0,
-                        "open_intents": 0, "enabled": False, "mode": "workspace"}
+                        "open_intents": 0, "pending_confirmation": 0, "last_evidence_at": "",
+                        "enabled": False, "mode": "workspace"}
                 if store.exists():
                     self.app.inside(store.root, path)
                     with store.locked():
                         project = store.load_project()
-                        item.update(goal=project["goal"], status=project["status"], enabled=True,
-                                    facts=sum(f["id"] != "goal" for f in store.list_facts()),
-                                    open_intents=sum(sapper.is_open(i) for i in store.list_intents()))
+                        item.update(goal=project["goal"], status=project["status"], enabled=True, **graph_summary(store))
                 projects.append(item)
             except (WorkspaceError, sapper.FGError, OSError):
                 continue
         return projects
 
-    def directories(self, path=""):
+    def directories(self, path="", *, for_skill=False):
         if not path:
             # Starting points for the picker, not an allowlist. Binding an
             # existing directory is an authenticated Web action.
-            roots = dict.fromkeys([self.app.root, Path.home().resolve(),
+            home = Path.home().resolve()
+            skill_roots = [home / ".agents/skills", home / ".claude/skills"] if for_skill else []
+            roots = dict.fromkeys([*skill_roots, self.app.root, home,
                                    Path(self.app.root.anchor), *self.app.workspace_roots])
             available = []
             for root in roots:
@@ -128,7 +194,12 @@ class Workspaces:
                     available.append(str(self.allowed(root)))
                 except (WorkspaceError, OSError):
                     continue
-            return {"roots": available}
+            return {"roots": list(dict.fromkeys(available))}
+
+        def contains_manifest(folder):
+            manifest = folder / "SKILL.md"
+            return not manifest.is_symlink() and manifest.is_file()
+
         directory = self.allowed(path)
         children = []
         for p in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
@@ -136,15 +207,22 @@ class Workspaces:
                 continue
             try:
                 resolved = self.allowed(p)
-                children.append({"name": p.name, "path": str(resolved),
-                                 "has_graph": (resolved / ".sapper/project.json").exists()})
+                entry = {"name": p.name, "path": str(resolved)}
+                if for_skill:
+                    entry["has_skill"] = contains_manifest(resolved)
+                else:
+                    entry["has_graph"] = (resolved / ".sapper/project.json").exists()
+                children.append(entry)
             except (WorkspaceError, OSError):
                 continue
             if len(children) >= 200:
                 break
-        return {"path": str(directory),
-                "parent": str(directory.parent) if directory.parent != directory else None,
-                "directories": children}
+        result = {"path": str(directory),
+                  "parent": str(directory.parent) if directory.parent != directory else None,
+                  "directories": children}
+        if for_skill:
+            result["has_skill"] = contains_manifest(directory)
+        return result
 
     def bind(self, data):
         value = text(data, "path")
@@ -506,6 +584,9 @@ class Workspaces:
                             "cwd": pane["path"], "pane_id": pane["id"], "mission": "已有终端，未推断其职责或父子关系",
                             "claude_session_id": None, "created_at": "", "legacy": True, "can_resume": False,
                             "status": "exited" if pane["dead"] else "running"})
+        by_id = {pane["id"]: pane for pane in all_panes}
+        for agent in results:
+            agent["observation"] = agent_observation(agent, by_id.get(agent.get("pane_id")))
         return sorted(results, key=lambda a: a["created_at"])
 
     @serialized

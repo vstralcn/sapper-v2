@@ -25,11 +25,13 @@ function time(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"});
 }
 function toast(message, error = false) {
-  $("toast").textContent = message;
-  $("toast").classList.toggle("error", error);
-  $("toast").hidden = false;
+  const notice = $("toast");
+  notice.textContent = message;
+  notice.classList.toggle("error", error);
+  notice.hidePopover();
+  notice.showPopover();
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { $("toast").hidden = true; }, error ? 6500 : 3800);
+  toastTimer = setTimeout(() => notice.hidePopover(), error ? 6500 : 3800);
 }
 function confirmAction(message) {
   $("confirm-message").textContent = message;
@@ -79,28 +81,36 @@ async function showWorkspace() {
   $("login").hidden = true;
   $("workspace").hidden = false;
   $("account-username").value = state.username;
-  const [health, profiles] = await Promise.all([api("/health"), api("/profiles")]);
-  state.profiles = profiles;
-  $("root-path").textContent = health.root;
-  $("environment-status").textContent = health.tmux ? "tmux 可用 · 本地执行" : "未安装 tmux";
-  $("environment-status").title = health.root;
-  refreshProfiles();
-  await loadRoleModels();
-  await refreshProjects();
+  await Promise.all([
+    refreshProjects({restore:true}),
+    guarded(async () => {
+      const health = await api("/health");
+      state.instance = health;
+      $("root-path").textContent = health.root;
+      $("environment-status").textContent = health.tmux ? "tmux 可用 · 本地执行" : "未安装 tmux";
+      $("environment-status").title = health.root;
+      if (state.project && state.tab === "progress") renderProgress();
+    }),
+    guarded(async () => {
+      state.profiles = await api("/profiles");
+      refreshProfiles();
+      await loadRoleModels();
+    }),
+  ]);
 }
 
-async function refreshProjects() {
+async function refreshProjects({restore = false} = {}) {
+  const navigation = state.navigation;
   const projects = await api("/projects");
+  if (navigation !== state.navigation) return;
   state.projects = projects;
   const previous = state.project?.id;
-  state.project = state.view === "project" ? projects.find(p => p.id === previous) || projects[0] || null : null;
   renderProjects();
-  $("empty-state").hidden = true;
-  $("overview").hidden = !!state.project;
-  $("project-workspace").hidden = !state.project;
-  $("home-button").classList.toggle("active", !state.project);
-  if (state.project) await refreshTask();
-  else {state.view = "overview"; await refreshOverview();}
+  if (restore) return restoreWorkspaceLocation();
+  if (state.view !== "project") return refreshOverview();
+  state.project = projects.find(p => p.id === previous);
+  if (!state.project) return showOverview();
+  await refreshTask();
 }
 function renderProjects() {
   const signature = JSON.stringify([state.project?.id, state.projects]);
@@ -119,27 +129,30 @@ function renderProjects() {
   }
 }
 async function refreshTask() {
-  if (state.view === "overview") return refreshOverview();
+  if (state.view !== "project") return refreshOverview();
   const pid = state.project?.id;
   if (!pid) return;
   const navigation = state.navigation;
-  const [graph, panes, runs] = await Promise.all([taskApi("graph"), api("/panes"), api(`/runs?project=${pid}`)]);
+  const results = await Promise.allSettled([taskApi("graph"), api("/panes"), api(`/runs?project=${pid}`)]);
   if (pid !== state.project?.id || navigation !== state.navigation) return;
-  state.graph = graph;
+  const [graphResult, panesResult, runsResult] = results;
+  state.graphLoad = graphResult.status === "fulfilled" ? "ready" : "error";
+  if (graphResult.status === "fulfilled") state.graph = graphResult.value;
+  if (panesResult.status === "fulfilled") state.panes = panesResult.value.filter(p => p.project_id === pid);
+  if (runsResult.status === "fulfilled") state.runs = runsResult.value;
+  const graph = state.graph;
   const project = state.projects.find(p => p.id === pid);
-  if (project) {
+  if (project && graphResult.status === "fulfilled") {
     const count = graph.facts.filter(f => f.id !== "goal").length;
     if (project.facts !== count) {project.facts = count; renderProjects();}
   }
-  state.panes = panes.filter(p => p.project_id === pid);
-  state.runs = runs;
   $("breadcrumb").textContent = state.project.name;
   $("project-name").textContent = state.project.name;
   $("project-goal").textContent = graph.project.goal;
   $("project-path").textContent = state.project.path;
   $("project-status").textContent = graph.project.status === "completed" ? "目标已完成" : "进行中";
-  $("fact-count").textContent = graph.facts.filter(f => f.id !== "goal").length;
-  $("intent-count").textContent = graph.open_intents.length;
+  $("fact-count").textContent = graphResult.status === "fulfilled" ? graph.facts.filter(f => f.id !== "goal").length : state.project.facts;
+  $("intent-count").textContent = graphResult.status === "fulfilled" ? graph.open_intents.length : state.project.open_intents;
   $("hint-count").textContent = graph.hints.length;
   $("pane-count").textContent = state.panes.filter(p => !p.dead).length;
   const memorySignature = pid + JSON.stringify(graph);
@@ -149,6 +162,8 @@ async function refreshTask() {
   }
   renderPanes();
   renderRuns();
+  const failed = results.find(result => result.status === "rejected");
+  if (failed) throw failed.reason;
 }
 function renderMemory() {
   const {facts, intents, hints} = state.graph;
@@ -202,11 +217,23 @@ function evidenceText(evidence) {
 function openDetail(record) {
   state.detail = record;
   $("detail-title").textContent = record.title || record.id;
-  $("detail-meta").textContent = `${record.id} · ${record.creator} · ${time(record.created_at)}`;
+  $("detail-meta").textContent = [record.id, record.creator, time(record.created_at), record.source_intent && `来源意图 ${record.source_intent}`].filter(Boolean).join(" · ");
   $("detail-description").textContent = record.description;
   const evidence = evidenceText(record.evidence);
   $("detail-evidence").textContent = evidence;
   $("detail-evidence").hidden = !evidence;
+  const artifacts = (record.evidence?.artifacts || []).filter(item =>
+    typeof item.sha256 === "string" && /^[a-f0-9]{64}$/.test(item.sha256) &&
+    item.path === `artifacts/${item.sha256}` && item.size <= 16 * 1024 * 1024);
+  $("detail-artifacts").hidden = !artifacts.length;
+  $("detail-artifacts").replaceChildren(...artifacts.map(item => {
+    const row = element("li"), link = element("a", "text-button", `下载工件 · ${item.sha256.slice(0,16)}`);
+    link.href = `api/projects/${state.project.id}/file?path=${encodeURIComponent(".sapper/" + item.path)}&download=1`;
+    row.append(link);
+    return row;
+  }));
+  const kind = state.graph.facts.some(f => f.id === record.id) ? "fact" : "intent";
+  $("detail-cli-command").textContent = `sapper --store ${shellArg(state.project.path + "/.sapper")} show ${kind} ${shellArg(record.id)}`;
   $("detail-doc").value = record.doc || "";
   $("detail-dialog").showModal();
 }
@@ -232,7 +259,8 @@ function setTab(tab) {
     node.classList.toggle("active", active);
     node.setAttribute("aria-selected", String(active));
   });
-  for (const name of ["memory", "console", "files"]) $("tab-" + name).hidden = name !== tab;
+  for (const name of ["progress", "memory", "console", "files"]) $("tab-" + name).hidden = name !== tab;
+  if (tab === "progress") renderProgress();
   if (tab === "console") guarded(refreshTerminal);
   if (tab === "files") guarded(loadFiles);
 }
@@ -471,7 +499,7 @@ submit("login-form", async () => {
   state.username = result.username;
   $("login-password").value = "";
   $("login-error").textContent = "";
-  await showWorkspace();
+  await guarded(showWorkspace);
 });
 submit("password-form", async data => {
   if (data.get("new_password") !== data.get("confirm_password")) throw new Error("两次输入的新密码不一致");
@@ -486,13 +514,10 @@ $("profiles-dialog").addEventListener("close", () => {
 });
 submit("create-form", async data => {
   const result = await api("/projects", {method: "POST", body: Object.fromEntries(data)});
-  localStorage.setItem("sapper-project", result.id);
-  state.project = result;
-  state.view = "project";
+  state.projects = [...state.projects.filter(project => project.id !== result.id), result];
   $("create-dialog").close();
   $("create-form").reset();
-  await refreshProjects();
-  setTab("workspace");
+  await openProject(result,"workspace");
   openAgent("commander");
   toast("工作区已创建，请确认初步配置");
 });
@@ -545,7 +570,7 @@ submit("profile-form", async data => {
 submit("knowledge-form", loadKnowledge);
 
 $("new-project").onclick = $("empty-create").onclick = () => $("create-dialog").showModal();
-$("refresh-projects").onclick = () => guarded(refreshProjects);
+$("refresh-projects").onclick = () => guarded(() => refreshProjects());
 $("open-shell").onclick = () => openRun("shell");
 $("run-kind").onchange = updateRunOptions;
 $("run-form").addEventListener("input",updateRunOptions);
@@ -618,14 +643,19 @@ setInterval(async () => {
 }, 2000);
 
 document.addEventListener("DOMContentLoaded", async () => {
-  try { const session = await api("/session"); state.csrf = session.csrf; state.username = session.username; await showWorkspace(); }
-  catch {
+  try {
+    const session = await api("/session");
+    state.csrf = session.csrf;
+    state.username = session.username;
+  } catch {
     showLogin();
     try {
       const auth = await api("/auth");
       if (!auth.configured) $("login-help").textContent = "请先在服务器本机执行 ./sapperctl auth-init 初始化管理员；独立实例请指定对应的 --state 目录。";
     } catch (error) { $("login-error").textContent = error.message; }
+    return;
   }
+  await guarded(showWorkspace);
 }, {once:true});
 
 const profileProtocolNames={anthropic:'Anthropic Messages',responses:'Responses',chat_completions:'Chat Completions'};

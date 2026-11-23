@@ -55,6 +55,7 @@
   }
 
   function observe(agent, panes = []) {
+    if (agent.observation) return agent.observation;
     const pane = panes.find(p => p.id === agent.pane_id);
     // A terminal run is evidence that the agent exited, even if its tmux shell remains.
     const presence = terminal.has(agent.status) || pane?.dead === true ? "offline"

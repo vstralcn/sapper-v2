@@ -22,7 +22,7 @@ def main():
         first = app.create_project({"name": "first", "goal": "First workspace goal"})
         second = app.create_project({"name": "second", "goal": "Second workspace goal"})
         (Path(second["path"]) / "nested").mkdir()
-        app.graph_action(second["id"], "fact", {"description": "Second workspace evidence"})
+        app.graph_action(second["id"], "fact", {"description": "Second workspace evidence", "evidence_source": "Review notes"})
         app.panes = lambda: []
         app.workspaces.capabilities = lambda: {"available": False}
         blocked, release, roles_requested = threading.Event(), threading.Event(), threading.Event()
@@ -85,8 +85,30 @@ def main():
                     assert page.evaluate("state.graph.project.goal") == "First workspace goal"
                     page.evaluate("showOverview()")
                     expect(page.locator("#overview")).to_be_visible()
+                    page.locator("#workspaces-button").click()
+                    expect(page.locator("#workspaces-page")).to_be_visible()
+                    page.locator("#workspaces-search").fill("second")
+                    expect(page.locator("#workspaces-rows tr")).to_have_count(1)
+                    page.locator("#workspaces-rows").get_by_role("button", name="second").click()
+                    expect(page.locator("#tab-progress")).to_be_visible()
+                    page.locator("#progress-evidence").get_by_role("button", name="Second workspace evidence").click()
+                    expect(page.locator("#detail-evidence")).to_contain_text("Review notes")
+                    expect(page.locator("#detail-cli-command")).to_contain_text("show fact")
+                    page.locator("#detail-dialog").get_by_role("button", name="关闭", exact=True).last.click()
+                    page.reload()
+                    expect(page.locator("#project-name")).to_have_text("second")
+                    expect(page.locator("#tab-memory")).to_be_visible()
                     assert not errors, errors
-                    print("PASS: immediate tabs, parallel requests, cleared old data, stale-response rejection, overview, no browser errors")
+                    page.route("**/agent-topology-model.js", lambda route: route.fulfill(status=503, body="Unavailable"))
+                    page.reload()
+                    expect(page.locator("#login")).to_be_hidden()
+                    page.get_by_role("tab", name="角色与协作").click()
+                    expect(page.locator("#agent-topology")).to_contain_text("拓扑资源加载失败")
+                    page.get_by_role("tab", name="进展", exact=True).click()
+                    expect(page.locator("#progress-evidence")).to_contain_text("Second workspace evidence")
+                    assert all(error.startswith("script: agent-topology-model.js ") for error in errors), errors
+                    errors.clear()  # The only failure was the deliberately unavailable asset.
+                    print("PASS: parallel and stale requests, workspace filtering, default progress, CLI links, refresh restoration and missing topology asset")
                 finally:
                     if errors:
                         print("Browser errors:", errors)

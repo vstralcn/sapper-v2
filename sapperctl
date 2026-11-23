@@ -2,6 +2,7 @@
 """Manage this checkout's local Sapper Web instance."""
 import argparse
 import contextlib
+import json
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,33 @@ def web_args(config, state):
     return [str(REPO / "lib/sapper_web.py"), "--state", str(state),
             "--root", config["root"], "--port", str(config["port"]),
             "--tmux-socket", config["socket"]]
+
+
+def workspace_status(args, state):
+    settings = state / "sapperctl.json"
+    config = read_json(settings, default_config())
+    root = args.root.expanduser().resolve() if args.root else Path(config["root"])
+    tmux_socket = args.tmux_socket or config["socket"]
+    if settings.exists() and (root != Path(config["root"]) or tmux_socket != config["socket"]):
+        raise WebError("请使用该实例记录的任务根目录和 tmux socket")
+    app = Console(root, state, tmux_socket, initialize=False)
+    path = Path(args.workspace or ".").expanduser().resolve()
+    project = next((p for p in app.projects() if p["id"] == args.workspace or Path(p["path"]) == path), None)
+    if project is None:
+        raise WebError("工作区不在该实例中，请核对 --state、--root 和 --workspace")
+    snapshot = app.workspace_status(project["id"])
+    fields = ("id", "role_label", "name", "run_id", "claude_session_id", "profile_name", "observation")
+    agents = [{key: a.get(key) for key in fields} for a in snapshot["agents"]]
+    if args.json:
+        print(json.dumps({"project": project, "agents": agents, "summary": snapshot["summary"],
+                          "observed_at": snapshot["observed_at"]}, ensure_ascii=False, indent=2))
+        return
+    print(f"{project['name']} · {project['id']} · {project['status']}\n{project['path']}")
+    print(f"{project['goal']}\n事实 {project['facts']} · 待办 {project['open_intents']} · 待确认 {project['pending_confirmation']}")
+    print(f"观测于 {snapshot['observed_at']}")
+    for agent in agents:
+        observation = agent["observation"]
+        print(f"{agent['name'] or agent['role_label']} · {agent['id']} · {observation['status']} · {observation['evidence']}")
 
 
 def cwd_of(pid):
@@ -187,17 +215,24 @@ def stop_managed(state, config):
 
 def main():
     parser = argparse.ArgumentParser(description="Sapper 本地服务管理（macOS / Linux / WSL2）")
-    parser.add_argument("action", choices=["start", "stop", "status", "restart", "stop-web", "claude-status", "stop-claude", "auth-init", "password-reset"],
+    parser.add_argument("action", choices=["start", "stop", "status", "restart", "stop-web", "claude-status", "stop-claude", "auth-init", "password-reset", "workspace-status"],
                         help="stop 关闭整套受管服务；restart 和 stop-web 只操作网页")
     parser.add_argument("--state", type=Path, default=REPO / ".sapper-web", help="实例状态目录")
     parser.add_argument("--port", type=int, help="首次 start 的本地端口，默认 8766")
     parser.add_argument("--root", type=Path, help="首次 start 的任务根目录")
     parser.add_argument("--tmux-socket", help="首次 start 的 tmux -L 名称，默认 default")
     parser.add_argument("--username", help="auth-init 或 password-reset 的管理员用户名")
+    parser.add_argument("--workspace", help="workspace-status 的工作区 ID 或目录，默认当前目录")
+    parser.add_argument("--json", action="store_true", help="workspace-status 输出 JSON")
     args = parser.parse_args()
     if args.username and args.action not in ("auth-init", "password-reset"):
         parser.error("--username 只能用于 auth-init 或 password-reset")
     state = args.state.expanduser().resolve()
+    if args.action == "workspace-status":
+        workspace_status(args, state)
+        return
+    if args.workspace is not None or args.json:
+        parser.error("--workspace 和 --json 只能用于 workspace-status")
     os.umask(0o077)
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (state / "sapperctl.lock").open("a") as lock:

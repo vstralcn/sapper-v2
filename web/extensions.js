@@ -4,38 +4,53 @@ let extensionLibrary = null, extensionWorkspace = null, agentExtensionRequest = 
 let workspaceModelConfig = null, workspaceSettingsRequest = 0;
 let workspaceResourcesDirty = false, workspaceModelsDirty = false;
 
-function resetExtensionForm(id) { $(id).reset(); $(id).elements.id.value = ""; }
-
-function readMcpConfig(importAll = false) {
-  const input = $("extensions-mcp-form").elements.config;
-  const source = input.value.trim();
-  let config;
-  if (!source) throw new Error(importAll ? "请先在 Server JSON 中粘贴完整的 mcpServers JSON，再点击导入。" : "请先填写 Server JSON。");
-  try { config = JSON.parse(source); }
-  catch { throw new Error("JSON 格式不正确或内容不完整，请检查双引号、逗号和括号后重试。"); }
-  if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("MCP 配置必须是 JSON 对象。");
-  if (importAll) {
-    const servers = config.mcpServers;
-    if (!servers || typeof servers !== "object" || Array.isArray(servers) || !Object.keys(servers).length || Object.keys(servers).length > 100) {
-      throw new Error('批量导入需要包含 1–100 个服务器的 mcpServers 对象，例如 {"mcpServers":{"example":{"command":"your-server"}}}。');
-    }
-  } else if (Object.hasOwn(config, "mcpServers")) {
-    throw new Error('这是批量配置，请点击“从 JSON 导入”；“保存 server”只保存单个服务器配置。');
+function extensionName(value) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value)) {
+    throw new Error("名称须以英文字母或数字开头，最多 64 个字符，可使用下划线和连字符。");
   }
-  return config;
+  return value;
 }
 
-async function saveMcpConfig(importAll = false, form = null) {
-  $("extensions-mcp-error").textContent = "";
-  try {
-    const config = readMcpConfig(importAll);
-    await saveExtensionAction(importAll ? {action: "import_mcp", config} : {...Object.fromEntries(form), action: "save", kind: "mcp", config});
-  } catch (error) {
-    $("extensions-mcp-error").textContent = error.message;
-    $("extensions-mcp-form").elements.config.focus();
-    throw error;
+function parseExtensionJson(source, label, array = false) {
+  let value;
+  try { value = JSON.parse(source); }
+  catch { throw new Error(`${label}的 JSON 格式不正确，请检查双引号、逗号和括号。`); }
+  if (array ? !Array.isArray(value) : !value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} 必须是 JSON ${array ? "数组" : "对象"}。`);
   }
-  resetExtensionForm("extensions-mcp-form"); $("extensions-mcp-editor").open = false;
+  return value;
+}
+
+function switchMcpTransport() {
+  const stdio = $("extensions-mcp-form").elements.type.value === "stdio";
+  for (const [id, active] of [["extensions-mcp-stdio", stdio], ["extensions-mcp-remote", !stdio]]) {
+    $(id).hidden = $(id).disabled = !active;
+  }
+}
+
+function submitExtension(prefix, fallback, action) {
+  const dialog = $(`${prefix}-editor`);
+  const form = $(`${prefix}-form`);
+  const message = $(`${prefix}-error`);
+  const closeButtons = dialog.querySelectorAll(".dialog-close");
+  const save = form.querySelector('button[type="submit"]');
+  form.addEventListener("input", () => { message.textContent = ""; });
+  dialog.addEventListener("cancel", event => { if (save.disabled) event.preventDefault(); });
+  submit(`${prefix}-form`, async data => {
+    message.textContent = "";
+    closeButtons.forEach(button => { button.disabled = true; });
+    try {
+      await action(Object.fromEntries(data));
+      dialog.close();
+      $(fallback).focus();
+    } catch (error) {
+      message.textContent = error.message;
+      message.scrollIntoView({block: "nearest"});
+      throw error;
+    } finally {
+      closeButtons.forEach(button => { button.disabled = false; });
+    }
+  });
 }
 
 function extensionOptions(target, library, selection, disabled = false) {
@@ -88,29 +103,54 @@ function resourceDetail(kind, resource) {
   return config.type === "http" || config.type === "sse" ? config.url : [config.command, ...(config.args || [])].join(" ");
 }
 function editExtension(kind, resource = null) {
-  const prefix = kind === "mcp" ? "extensions-mcp" : "extensions-skill";
-  resetExtensionForm(`${prefix}-form`);
-  if (kind === "mcp") $("extensions-mcp-error").textContent = "";
+  const mcp = kind === "mcp";
+  const prefix = mcp ? "extensions-mcp" : "extensions-skill";
   const form = $(`${prefix}-form`);
+  form.reset();
+  form.elements.id.value = resource?.id ?? "";
+  $(`${prefix}-error`).textContent = "";
+  const name = resource?.name;
+  $(`${prefix}-title`).textContent = name ? `编辑 ${name}` : mcp ? "添加 MCP 服务器" : "添加 Skill";
   if (resource) {
-    form.elements.id.value = resource.id; form.elements.name.value = resource.name;
-    if (kind === "mcp") form.elements.config.value = JSON.stringify(resource.config, null, 2);
-    else form.elements.path.value = resource.path;
+    form.elements.name.value = name;
+    if (mcp) {
+      const {type = "stdio", command, args, env, url, headers} = resource.config;
+      form.elements.type.value = type;
+      form.elements.command.value = command ?? "";
+      form.elements.args.value = args?.length ? JSON.stringify(args) : "";
+      form.elements.env.value = env ? JSON.stringify(env, null, 2) : "";
+      form.elements.url.value = url ?? "";
+      form.elements.headers.value = headers ? JSON.stringify(headers, null, 2) : "";
+    } else {
+      form.elements.path.value = resource.path;
+      form.elements.description.value = resource.description ?? "";
+    }
   }
-  $(`${prefix}-editor`).open = true;
-  form.elements.name.focus();
+  if (mcp) switchMcpTransport();
+  $(`${prefix}-editor`).showModal();
 }
 function renderResourceLists() {
   if (!extensionLibrary) return;
   for (const [kind, prefix] of [["mcp", "extensions-mcp"], ["skills", "extensions-skill"]]) {
     const query = $(`${prefix}-search`).value.trim().toLowerCase();
-    const resources = extensionLibrary[kind].filter(r => `${r.name} ${resourceDetail(kind, r)}`.toLowerCase().includes(query))
+    const resources = extensionLibrary[kind].filter(r => `${r.name} ${r.description ?? ""} ${resourceDetail(kind, r)}`.toLowerCase().includes(query))
       .sort((a, b) => a.name.localeCompare(b.name));
     const rows = resources.map(resource => {
       const row = element("div", "resource-row");
       const icon = element("span", "resource-icon", kind === "mcp" ? "⌘" : "▤"); icon.setAttribute("aria-hidden", "true");
       const info = element("div", "resource-info");
-      info.append(element("strong", "", resource.name), element("p", "resource-detail", resourceDetail(kind, resource)));
+      const title = element("div", "resource-name");
+      title.append(element("strong", "", resource.name));
+      if (kind === "mcp") {
+        const type = resource.config.type || "stdio";
+        title.append(element("span", "resource-transport-badge", type === "stdio" ? type : type.toUpperCase()));
+      }
+      info.append(title);
+      if (kind === "skills" && resource.description) info.append(element("p", "resource-description", resource.description));
+      const detail = resourceDetail(kind, resource);
+      const detailNode = element("p", "resource-detail", detail);
+      detailNode.title = detail;
+      info.append(detailNode);
       const field = kind === "mcp" ? "mcp_ids" : "skill_ids";
       const users = state.projects.filter(p => extensionLibrary.workspaces[p.id]?.[field].includes(resource.id));
       const scope = button(users.length ? `${users.length} 个工作区使用` : "尚未启用", "resource-scope", () => guarded(() => openSettings("workspaces")));
@@ -119,11 +159,23 @@ function renderResourceLists() {
       actions.append(button("编辑", "text-button", () => editExtension(kind, resource)), button("移除", "text-button danger", () => guarded(async () => {
         if (!await confirmAction(`从全局资源库移除 ${resource.name}？已有会话快照会保留。`)) return;
         await saveExtensionAction({action: "delete", kind, id: resource.id});
-        if ($(`${prefix}-form`).elements.id.value === resource.id) { resetExtensionForm(`${prefix}-form`); $(`${prefix}-editor`).open = false; }
       })));
       row.append(icon, info, scope, actions); return row;
     });
-    $(`${prefix}-list`).replaceChildren(...(rows.length ? rows : [empty(query ? "没有匹配的资源。" : kind === "mcp" ? "还没有 MCP 服务器。添加一次，即可供多个工作区使用。" : "还没有 Skills。添加包含 SKILL.md 的本地目录即可开始。")]));
+    const list = $(`${prefix}-list`);
+    if (rows.length) {
+      list.replaceChildren(...rows);
+    } else if (query) {
+      list.replaceChildren(empty("没有匹配的资源。"));
+    } else {
+      const isMcp = kind === "mcp";
+      const placeholder = element("div", "resource-empty");
+      const icon = element("span", "resource-icon", isMcp ? "⌘" : "▤");
+      icon.setAttribute("aria-hidden", "true");
+      placeholder.append(icon, element("p", "", isMcp ? "还没有 MCP 服务器。" : "还没有 Skills。"),
+        button(isMcp ? "添加服务器" : "添加 Skill", "button", () => editExtension(kind)));
+      list.replaceChildren(placeholder);
+    }
   }
 }
 function renderExtensionLibrary(data, preserve = true) {
@@ -250,15 +302,16 @@ for (const [id, checked] of [["extensions-select-all", true], ["extensions-selec
 }
 for (const [kind, prefix] of [["mcp", "extensions-mcp"], ["skills", "extensions-skill"]]) {
   $(`${prefix}-search`).oninput = renderResourceLists;
-  $(`${prefix}-add`).onclick = $(`${prefix}-reset`).onclick = () => editExtension(kind);
+  $(`${prefix}-add`).onclick = () => editExtension(kind);
 }
-$("extensions-mcp-import").onclick = () => guarded(async () => {
-  const button = $("extensions-mcp-import");
-  button.disabled = true;
-  try { await saveMcpConfig(true); }
-  finally { button.disabled = false; }
+$("extensions-mcp-form").addEventListener("change", event => {
+  if (event.target.name === "type") switchMcpTransport();
 });
-$("extensions-mcp-form").elements.config.addEventListener("input", () => { $("extensions-mcp-error").textContent = ""; });
+$("extensions-mcp-import").onclick = () => {
+  $("extensions-import-form").reset();
+  $("extensions-import-error").textContent = "";
+  $("extensions-import-editor").showModal();
+};
 submit("extensions-defaults-form", async () => {
   const pid = extensionWorkspace;
   if (!pid || !extensionLibrary) throw new Error("请先选择工作区并等待读取完成");
@@ -278,10 +331,27 @@ submit("workspace-model-form", async form => {
   await loadRoleModels(true);
   toast("工作区模型已保存，将用于新启动的角色");
 });
-submit("extensions-mcp-form", async form => {
-  await saveMcpConfig(false, form);
+submitExtension("extensions-mcp", "extensions-mcp-add", data => {
+  const {id, type, command, args, env, url, headers} = data;
+  const name = extensionName(data.name);
+  const config = type === "stdio" ? {type, command} : {type, url};
+  if (args?.trim()) config.args = parseExtensionJson(args, "参数", true);
+  if (env?.trim()) config.env = parseExtensionJson(env, "环境变量");
+  if (headers?.trim()) config.headers = parseExtensionJson(headers, "请求头");
+  return saveExtensionAction({action: "save", kind: "mcp", id, name, config});
 });
-submit("extensions-skill-form", async form => {
-  await saveExtensionAction({...Object.fromEntries(form), action: "save", kind: "skills"});
-  resetExtensionForm("extensions-skill-form"); $("extensions-skill-editor").open = false;
+submitExtension("extensions-import", "extensions-mcp-import", data => {
+  if (!data.config.trim()) throw new Error("请先粘贴 MCP 配置 JSON。");
+  const config = parseExtensionJson(data.config, "MCP 配置");
+  if (Object.hasOwn(config, "mcpServers")) {
+    return saveExtensionAction({action: "import_mcp", config});
+  }
+  if (!data.name.trim()) throw new Error("导入单个服务器时，请填写服务器名称。");
+  return saveExtensionAction({action: "save", kind: "mcp", name: extensionName(data.name), config});
+});
+$("extensions-skill-browse").onclick = () => guarded(() => openDirectoryPicker($("extensions-skill-form").elements.path));
+submitExtension("extensions-skill", "extensions-skill-add", data => {
+  const name = extensionName(data.name);
+  if (!data.path.startsWith("/")) throw new Error("请填写以 / 开头的 Skill 目录绝对路径。");
+  return saveExtensionAction({...data, name, action: "save", kind: "skills"});
 });

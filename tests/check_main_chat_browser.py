@@ -42,7 +42,7 @@ def main():
                 page.locator("#login-form button[type=submit]").click()
                 expect(page.locator(".project-item")).to_have_count(2)
                 page.wait_for_load_state("networkidle")
-                page.evaluate("id => openProject(id)", fixture.pid)
+                page.evaluate("id => openProject(id, 'workspace')", fixture.pid)
                 expect(page.locator("#tab-workspace")).to_be_visible()
                 expect(page.locator('[data-tab="chat"]')).to_have_count(0)
                 expect(page.locator("#tab-chat")).to_have_count(0)
@@ -100,7 +100,7 @@ def main():
                 page.wait_for_function("state.nativePane === state.mainAgent.pane_id")
                 page.reload()
                 page.wait_for_load_state("networkidle")
-                page.evaluate("id => openProject(id)", fixture.pid)
+                page.evaluate("id => openProject(id, 'workspace')", fixture.pid)
                 expect(page.locator(".agent-preview-row")).to_have_count(6)
                 app.workspaces.stop_agent(main["id"])
                 page.evaluate("refreshTask()")
@@ -113,12 +113,12 @@ def main():
                 assert resumed["claude_session_id"] == main["claude_session_id"]
                 assert resumed["execution_mode"] == "tui"
                 assert app.run_info(children[1]["run_id"])["status"] == "running"
-                page.evaluate("id => openProject(id)", other["id"])
+                page.evaluate("id => openProject(id, 'workspace')", other["id"])
                 expect(page.locator(".agent-preview-row")).to_have_count(0)
                 expect(page.locator("#native-pane")).to_have_value("")
                 assert page.evaluate("terminal.options.disableStdin")
                 assert not page.evaluate("Array.from({length:terminal.buffer.active.length},(_,i)=>terminal.buffer.active.getLine(i)?.translateToString()).join('\\n').includes('NATIVE_READY')")
-                page.evaluate("id => openProject(id)", fixture.pid)
+                page.evaluate("id => openProject(id, 'workspace')", fixture.pid)
                 expect(page.locator(".agent-preview-row")).to_have_count(6)
                 page.set_viewport_size({"width":390,"height":844})
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Mobile page overflows"
@@ -132,7 +132,7 @@ def main():
                     os.environ.pop(key, None)
                 page.set_viewport_size({"width":1280,"height":960})
                 page.reload();page.wait_for_load_state("networkidle")
-                page.evaluate("id => openProject(id)", fixture.pid)
+                page.evaluate("id => openProject(id, 'workspace')", fixture.pid)
                 page.locator("#dispatch-role").click()
                 expect(page.locator("#dispatch-session-mode")).to_have_value("resume")
                 expect(page.locator("#dispatch-model-summary")).to_contain_text("恢复使用：继承原环境")

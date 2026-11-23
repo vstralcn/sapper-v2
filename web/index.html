@@ -29,7 +29,7 @@
   <section id="login" class="login-screen">
     <div class="login-brand"><span class="brand-mark">s</span><span>Sapper <small>Web console</small></span></div>
     <div class="theme-switch login-theme" role="group" aria-label="全局主题"><button type="button" data-theme-choice="light" aria-pressed="false">浅色</button><button type="button" data-theme-choice="dark" aria-pressed="false">深色</button></div>
-    <form id="login-form" class="login-box">
+    <form id="login-form" class="login-box" method="post" action="./">
       <span class="section-label">连接你的 agent</span>
       <h1>原来的能力，<br>更顺手的工作台。</h1>
       <p>在浏览器查看任务、操作会话、补充信息。你的 agent 继续按原来的方式工作。</p>
@@ -46,6 +46,7 @@
     <aside class="sidebar">
       <a class="brand" href="./"><span class="brand-mark">s</span><span>Sapper<small>任务工作台</small></span></a>
       <button id="home-button" class="sidebar-link home-link active">▦ 总体概览</button>
+      <button id="workspaces-button" class="sidebar-link workspaces-link" type="button">▱ 工作区</button>
       <button id="new-project" class="button new-project">＋ 新建任务</button>
       <button id="bind-workspace" class="button bind-workspace">▱ 打开题目目录</button>
       <div class="sidebar-heading"><span>工作目录中的任务</span><button id="refresh-projects" class="icon-button" aria-label="刷新任务">↻</button></div>
@@ -72,6 +73,23 @@
           <section class="overview-context"><div class="panel-heading"><h2>共享环境</h2><button id="overview-context-edit" class="text-button">配置</button></div><p id="overview-context-state"></p><p id="overview-context-description" class="field-help"></p><p class="field-help">服务器、本机工具、远端目录等信息，统一提供给各角色。</p></section>
           <section class="overview-machine"><h2>执行机</h2><dl id="overview-machine"></dl><p class="field-help">此处是运行 Web 服务的机器，远端资源由共享环境声明。</p></section>
         </aside></div>
+      </section>
+      <section id="workspaces-page" class="overview-page" hidden>
+        <div class="overview-heading">
+          <h1>工作区</h1>
+          <button class="button primary" type="button" id="workspaces-bind">打开已有目录</button>
+        </div>
+        <div class="workspaces-filters">
+          <input id="workspaces-search" type="search" placeholder="搜索名称、目标或 ID" aria-label="搜索工作区">
+          <select id="workspaces-filter" aria-label="筛选工作区状态">
+            <option value="all">全部状态</option><option value="attention">需要关注</option>
+            <option value="active">进行中</option><option value="completed">已完成</option><option value="not_enabled">待接入</option>
+          </select>
+        </div>
+        <div class="workspaces-table" tabindex="0" role="region" aria-label="工作区列表">
+          <table><thead><tr><th scope="col">工作区与目标</th><th scope="col">目标状态</th><th scope="col">待处理</th><th scope="col">最近带证据的事实</th></tr></thead>
+            <tbody id="workspaces-rows"></tbody></table>
+        </div>
       </section>
       <section id="empty-state" class="empty-state" hidden>
         <div class="empty-symbol" aria-hidden="true">⌘</div>
@@ -109,7 +127,15 @@
           </div>
         </div>
         <div class="metrics"><div><strong id="fact-count">0</strong><span>事实记录</span></div><div><strong id="intent-count">0</strong><span>待办意图</span></div><div><strong id="pane-count">0</strong><span>活动终端</span></div><div><strong id="hint-count">0</strong><span>人工补充</span></div><span class="original-note">使用原 CLI 与 .sapper 数据</span></div>
-        <div class="tabs" role="tablist" aria-label="任务视图"><button data-tab="workspace" class="active" role="tab" aria-selected="true">终端与文件</button><button data-tab="agents" role="tab" aria-selected="false">角色与协作</button><button data-tab="memory" role="tab" aria-selected="false">事实与意图</button><button data-tab="console" role="tab" aria-selected="false">运行记录</button><button data-tab="files" role="tab" aria-selected="false">文件与附件</button></div>
+        <div class="tabs" role="tablist" aria-label="任务视图"><button data-tab="progress" class="active" role="tab" aria-selected="true">进展</button><button data-tab="workspace" role="tab" aria-selected="false">终端与文件</button><button data-tab="agents" role="tab" aria-selected="false">角色与协作</button><button data-tab="memory" role="tab" aria-selected="false">事实与意图</button><button data-tab="console" role="tab" aria-selected="false">运行记录</button><button data-tab="files" role="tab" aria-selected="false">文件与附件</button></div>
+        <section id="tab-progress" class="tab-panel" hidden>
+          <div class="progress-grid">
+            <section class="progress-panel"><h2>需要关注</h2><div id="progress-attention"></div></section>
+            <section class="progress-panel"><h2>近期证据</h2><div id="progress-evidence"></div></section>
+            <section class="progress-panel"><h2>登记角色</h2><p id="progress-observed" class="field-help"></p><div id="progress-agents"></div></section>
+          </div>
+          <details class="progress-cli"><summary>在 CLI 中查看同一工作区</summary><code id="progress-cli-command"></code></details>
+        </section>
         <section id="tab-workspace" class="tab-panel" hidden><div class="workspace-grid"><aside class="workspace-files"><div class="panel-heading"><h2>题目文件</h2><button id="workspace-file-up" class="text-button">上层</button></div><p id="workspace-file-path" class="field-help">工作区根目录</p><div id="workspace-file-list"></div></aside><div class="workspace-terminal"><div class="native-toolbar"><select id="native-pane" aria-label="选择角色终端"></select><button id="terminal-control" class="button">接管输入</button></div><div id="native-terminal" aria-label="Claude Code 原生终端"></div><div class="native-footer"><span id="native-mode">选择或启动角色会话</span><span>原 tmux PTY · 会话独立于网页</span></div></div><aside class="workspace-agents"><div class="panel-heading"><h2>Agent 状态 <span id="workspace-agent-count"></span></h2></div><div id="agent-list" class="agent-preview"></div><div id="service-list"></div></aside></div></section>
 
         <section id="tab-agents" class="tab-panel" hidden><div id="agent-topology" class="agent-topology"></div></section>
@@ -134,7 +160,7 @@
     </main>
   </div>
 
-  <div id="toast" class="toast" role="status" hidden></div>
+  <div id="toast" class="toast" role="status" popover="manual"></div>
   <dialog id="native-dialog" class="native-dialog"><div class="dialog-heading"><h2>原生功能</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">使用表单调用原 sapper CLI。保留原参数、工具和调度循环；本轮不提供 TSecBench 平台操作。命令在所选工作区运行，输出进入原运行记录。</p>
     <form id="native-form"><div class="native-selection"><label>执行工作区<select id="native-project" required></select></label><label>原生命令<select id="native-operation" required></select></label><label>模型配置<select id="native-profile"></select></label></div><p id="native-command-help" class="field-help"></p><p id="native-permission-warning" class="field-help" role="status" hidden></p><div id="native-fields" class="native-fields"></div><div class="native-form-actions"><button id="native-preview-button" class="button" type="button">预览原命令</button><button id="native-execute" class="button primary" type="submit" disabled>执行原命令</button></div></form>
     <section id="native-preview" hidden><h3>实际执行内容</h3><p id="native-preview-cwd" class="field-help"></p><pre id="native-preview-command"></pre><pre id="native-preview-fleet" hidden></pre><p id="native-preview-note" class="field-help"></p></section>
@@ -157,17 +183,18 @@
     <div class="dialog-actions"><button id="context-reload" class="button" type="button">重新读取</button><button class="button primary" type="submit">保存全局配置</button></div>
   </form></dialog>
   <dialog id="confirm-dialog"><div class="dialog-heading"><h2>确认操作</h2></div><p id="confirm-message" class="dialog-intro"></p><div class="dialog-actions"><button id="confirm-cancel" class="button" type="button">取消</button><button id="confirm-accept" class="button primary" type="button">确认操作</button></div></dialog>
-  <dialog id="bind-dialog" class="wide-dialog"><form id="bind-form">
-    <div class="dialog-heading"><h2>选择题目文件夹</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div>
-    <p class="dialog-intro">打开文件夹后，点击“选择此文件夹”。文件保持原位置。</p>
+  <dialog id="bind-dialog" class="wide-dialog" aria-labelledby="directory-title"><form id="bind-form">
+    <div class="dialog-heading"><h2 id="directory-title">选择题目文件夹</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div>
+    <p id="directory-help" class="dialog-intro">打开文件夹后，点击“选择此文件夹”。文件保持原位置。</p>
     <input name="path" id="bind-path" type="hidden">
     <div id="directory-roots" class="directory-roots" role="group" aria-label="常用位置"></div>
+    <input id="directory-filter" type="search" aria-label="筛选当前文件夹的子目录" placeholder="筛选当前文件夹的子目录" hidden>
     <div class="directory-picker">
       <div class="directory-toolbar"><button id="directory-up" class="button" type="button" disabled>↑ 上一级</button><nav id="directory-breadcrumbs" aria-label="当前位置"></nav></div>
       <div id="directory-list" role="group" aria-label="子文件夹"></div>
     </div>
     <p id="directory-status" class="field-help" role="status" aria-live="polite"></p>
-    <div class="form-row"><label>显示名称 <span class="muted">选填</span><input name="name"></label><label>任务目标 <span class="muted">选填</span><input name="goal"></label></div>
+    <div id="directory-workspace-fields" class="form-row"><label>显示名称 <span class="muted">选填</span><input name="name"></label><label>任务目标 <span class="muted">选填</span><input name="goal"></label></div>
     <p class="field-help">这里显示运行 sapper 的机器上的文件夹。</p>
     <div class="dialog-actions"><button class="button dialog-close" type="button">取消</button><button id="directory-select" class="button primary" type="submit" disabled>选择此文件夹</button></div>
   </form></dialog>
@@ -199,7 +226,7 @@
 
   <dialog id="record-dialog"><form id="record-form"><div class="dialog-heading"><h2 id="record-heading">添加记录</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><input type="hidden" name="action"><label id="record-from-label" hidden>来源事实<select name="from" id="record-from" multiple size="4"></select><span class="field-help">按住 Ctrl／Command 可选择多个事实，goal 不能作为来源。</span></label><label>短标题 <span class="muted">选填</span><input name="title"></label><label>说明<textarea name="description" rows="3" required></textarea></label><label id="record-kind-label">事实类型<select name="kind"><option value="">不指定类型</option><option>note</option><option>host</option><option>service</option><option>cred</option><option>vuln</option><option>loot</option><option>flag</option></select></label><label id="record-evidence-source-label" hidden>证据来源 <span class="muted">选填</span><input name="evidence_source" placeholder="例如 授权本地靶场、附件说明"><span class="field-help">与短标题、说明一起写入原图，不会执行任何内容。</span></label><label id="record-repro-label" hidden>复现命令 <span class="muted">选填，每行一条</span><textarea name="repro_commands" rows="2" placeholder="curl -i http://127.0.0.1/"></textarea><span class="field-help">仅作为文本记录，服务端不会执行；输入框内容会原样存入图。</span></label><label id="record-artifact-label" hidden>工件路径 <span class="muted">选填，每行一个，须在本题目录内</span><textarea name="artifacts" rows="2" placeholder="evidence/response.txt"></textarea><span class="field-help">复制到 .sapper/artifacts/&lt;sha256&gt;，单文件上限 64 MiB；拒绝符号链接和目录外文件。</span></label><label>详细文档 <span class="muted">选填</span><textarea name="doc" rows="4"></textarea></label><label id="record-confirm-label" class="inline-check" hidden><input type="checkbox" name="requires_confirmation"> 该意图需要确认后执行</label><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">保存记录</button></div></form></dialog>
 
-  <dialog id="detail-dialog" class="wide-dialog"><div class="dialog-heading"><h2 id="detail-title">记录详情</h2><button class="dialog-close icon-button" aria-label="关闭">×</button></div><div id="detail-meta" class="muted"></div><p id="detail-description"></p><div id="detail-evidence" class="muted" style="white-space:pre-wrap" hidden></div><label>详细文档<textarea id="detail-doc" rows="12"></textarea></label><div class="dialog-actions"><button class="button dialog-close">关闭</button><button class="button primary" id="save-doc">保存文档</button></div></dialog>
+  <dialog id="detail-dialog" class="wide-dialog"><div class="dialog-heading"><h2 id="detail-title">记录详情</h2><button class="dialog-close icon-button" aria-label="关闭">×</button></div><div id="detail-meta" class="muted"></div><p id="detail-description"></p><div id="detail-evidence" class="muted" style="white-space:pre-wrap" hidden></div><ul id="detail-artifacts" class="detail-artifacts" hidden></ul><details class="progress-cli"><summary>在 CLI 中查看记录</summary><code id="detail-cli-command"></code></details><label>详细文档<textarea id="detail-doc" rows="12"></textarea></label><div class="dialog-actions"><button class="button dialog-close">关闭</button><button class="button primary" id="save-doc">保存文档</button></div></dialog>
 
   <dialog id="profiles-dialog" class="models-dialog" aria-labelledby="models-title">
     <div class="settings-heading"><div><h2 id="models-title">全局设置</h2><p>统一管理资源，再为工作区选择使用。</p></div><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div>
@@ -238,16 +265,14 @@
     </section>
     </section>
     <section id="settings-mcp-panel" class="settings-panel" aria-label="全局 MCP 服务器" hidden>
-      <div class="settings-section-heading"><div><h3>MCP 服务器</h3><p>添加到全局资源库，再为需要的工作区启用。</p></div><button type="button" id="extensions-mcp-add" class="button primary">＋ 添加服务器</button></div>
-      <div class="resource-toolbar"><label class="resource-search">搜索服务器<input id="extensions-mcp-search" type="search" placeholder="搜索名称或命令"></label><button type="button" class="text-button" data-resource-reload>↻ 刷新</button></div>
+      <div class="settings-section-heading"><div><h3>MCP 服务器</h3><p>添加到全局资源库，再为需要的工作区启用。</p></div><div class="resource-header-actions"><button type="button" id="extensions-mcp-import" class="button">从 JSON 导入</button><button type="button" id="extensions-mcp-add" class="button primary">＋ 添加服务器</button></div></div>
+      <div class="resource-toolbar"><label class="resource-search">搜索服务器<input id="extensions-mcp-search" type="search" placeholder="搜索名称、命令或地址"></label><button type="button" class="text-button" data-resource-reload>↻ 刷新</button></div>
       <div id="extensions-mcp-list" class="resource-list"></div>
-      <details id="extensions-mcp-editor" class="resource-editor"><summary>服务器配置</summary><form id="extensions-mcp-form"><input name="id" type="hidden"><label>名称<input name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" placeholder="例如 filesystem"></label><label>Server JSON<textarea name="config" rows="6" required spellcheck="false" aria-describedby="extensions-mcp-import-help extensions-mcp-error" placeholder='{"command":"npx","args":["-y","your-mcp-server"],"env":{"API_KEY":"${MY_MCP_KEY}"}}'></textarea></label><p class="field-help">支持 stdio / http / sse。env 和 headers 使用 Web 服务环境变量引用，如 ${MY_MCP_KEY} 或 Bearer ${MY_MCP_KEY}，不在配置中粘贴密钥。stdio 命令使用 Agent 的工作目录；文件路径建议写绝对路径。</p><p id="extensions-mcp-import-help" class="field-help">批量导入：先在上方粘贴完整 JSON，再点击“从 JSON 导入”，无需填写名称。例如 <code>{"mcpServers":{"example":{"command":"your-server","args":[]}}}</code>。</p><p id="extensions-mcp-error" class="error-text" role="alert"></p><div class="dialog-actions"><button id="extensions-mcp-reset" type="button" class="button">新建</button><button id="extensions-mcp-import" type="button" class="button">从 JSON 导入</button><button type="submit" class="button primary">保存 server</button></div></form></details>
     </section>
     <section id="settings-skills-panel" class="settings-panel" aria-label="全局 Skills" hidden>
       <div class="settings-section-heading"><div><h3>Skills</h3><p>登记执行机上的技能目录，供各工作区重复使用。</p></div><button type="button" id="extensions-skill-add" class="button primary">＋ 添加 Skill</button></div>
-      <div class="resource-toolbar"><label class="resource-search">搜索技能<input id="extensions-skill-search" type="search" placeholder="搜索名称或目录"></label><button type="button" class="text-button" data-resource-reload>↻ 刷新</button></div>
+      <div class="resource-toolbar"><label class="resource-search">搜索技能<input id="extensions-skill-search" type="search" placeholder="搜索名称、描述或目录"></label><button type="button" class="text-button" data-resource-reload>↻ 刷新</button></div>
       <div id="extensions-skill-list" class="resource-list"></div>
-      <details id="extensions-skill-editor" class="resource-editor"><summary>Skill 配置</summary><form id="extensions-skill-form"><input name="id" type="hidden"><label>名称<input name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" placeholder="例如 code-review"></label><label>执行机上的 Skill 目录<input name="path" required placeholder="/absolute/path/to/skill"></label><p class="field-help">选择包含 SKILL.md 的目录。启动时复制正文、脚本和参考文件；之后修改源目录不影响已有会话。加载后使用 /sapper:技能名。</p><div class="dialog-actions"><button id="extensions-skill-reset" type="button" class="button">新建</button><button type="submit" class="button primary">保存 skill</button></div></form></details>
     </section>
     <section id="settings-workspaces-panel" class="settings-panel" aria-label="工作区使用配置" hidden>
       <div class="settings-section-heading"><div><h3>工作区配置</h3><p>选择全局资源，配置此工作区新角色使用的模型、MCP 与 Skills。</p></div></div>
@@ -275,6 +300,66 @@
     </section>
     <p id="extensions-status" class="settings-status field-help" role="status"></p>
     </div></div>
+  </dialog>
+
+  <dialog id="extensions-mcp-editor" class="resource-editor" aria-labelledby="extensions-mcp-title">
+    <form id="extensions-mcp-form">
+      <header class="resource-editor-header dialog-heading"><h2 id="extensions-mcp-title"></h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></header>
+      <div class="resource-editor-body">
+        <input name="id" type="hidden">
+        <label>名称<input name="name" required maxlength="64" placeholder="例如 filesystem" autofocus></label>
+        <fieldset class="resource-transport">
+          <legend>传输方式</legend>
+          <label><input name="type" type="radio" value="stdio" checked>stdio</label>
+          <label><input name="type" type="radio" value="http">HTTP</label>
+          <label><input name="type" type="radio" value="sse">SSE</label>
+        </fieldset>
+        <fieldset id="extensions-mcp-stdio" class="resource-fields" aria-label="stdio 配置">
+          <label>命令<input name="command" required placeholder="例如 npx"></label>
+          <label>参数 <span class="muted">选填，JSON 字符串数组</span><textarea name="args" rows="3" spellcheck="false" placeholder='["-y","your-mcp-server"]'></textarea></label>
+          <label>环境变量 <span class="muted">选填，JSON 对象</span><textarea name="env" rows="3" spellcheck="false" placeholder='{"API_KEY":"${MY_MCP_KEY}"}'></textarea></label>
+          <p class="field-help">命令在 Agent 的工作目录运行。环境变量值使用 ${MY_MCP_KEY} 这样的引用。</p>
+        </fieldset>
+        <fieldset id="extensions-mcp-remote" class="resource-fields" aria-label="远程配置" hidden disabled>
+          <label>服务地址<input name="url" type="url" required placeholder="https://example.com/mcp"></label>
+          <label>请求头 <span class="muted">选填，JSON 对象</span><textarea name="headers" rows="3" spellcheck="false" placeholder='{"Authorization":"Bearer ${MY_MCP_KEY}"}'></textarea></label>
+          <p class="field-help">认证信息通过请求头引用环境变量。地址中无需填写凭据、查询参数或片段。</p>
+        </fieldset>
+        <p id="extensions-mcp-error" class="error-text" role="alert"></p>
+      </div>
+      <footer class="dialog-actions resource-editor-footer"><button class="button dialog-close" type="button">取消</button><button type="submit" class="button primary">保存服务器</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="extensions-import-editor" class="resource-editor" aria-labelledby="extensions-import-title">
+    <form id="extensions-import-form">
+      <header class="resource-editor-header dialog-heading"><h2 id="extensions-import-title">导入 MCP 配置</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></header>
+      <div class="resource-editor-body">
+        <label>服务器名称 <span class="muted">导入单个服务器时填写</span><input name="name" maxlength="64" placeholder="例如 filesystem"></label>
+        <label>配置 JSON<textarea name="config" rows="9" spellcheck="false" aria-describedby="extensions-import-help extensions-import-error" placeholder='{"mcpServers":{"example":{"command":"your-server","args":[]}}}' autofocus></textarea></label>
+        <p id="extensions-import-error" class="error-text" role="alert"></p>
+        <p id="extensions-import-help" class="field-help">支持单个服务器配置，或带有 <code>mcpServers</code> 的完整配置。批量导入会更新同名服务器。认证信息使用执行机环境变量引用。</p>
+      </div>
+      <footer class="dialog-actions resource-editor-footer"><button class="button dialog-close" type="button">取消</button><button type="submit" class="button primary">导入配置</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="extensions-skill-editor" class="resource-editor" aria-labelledby="extensions-skill-title">
+    <form id="extensions-skill-form">
+      <header class="resource-editor-header dialog-heading"><h2 id="extensions-skill-title"></h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></header>
+      <div class="resource-editor-body">
+        <input name="id" type="hidden">
+        <label>名称<input name="name" required maxlength="64" placeholder="例如 code-review" autofocus></label>
+        <label>描述 <span class="muted">选填，显示在资源列表中</span><input name="description" maxlength="512" placeholder="简述 Skill 的用途"></label>
+        <div class="skill-path-row">
+          <label>执行机上的 Skill 目录<input name="path" required placeholder="/absolute/path/to/skill"></label>
+          <button type="button" class="button" id="extensions-skill-browse">浏览目录</button>
+        </div>
+        <p id="extensions-skill-error" class="error-text" role="alert"></p>
+        <p class="field-help">选择包含 SKILL.md 的目录，也可直接粘贴绝对路径。角色启动时复制目录内容。</p>
+      </div>
+      <footer class="dialog-actions resource-editor-footer"><button class="button dialog-close" type="button">取消</button><button type="submit" class="button primary">保存 Skill</button></footer>
+    </form>
   </dialog>
 
   <dialog id="worker-dialog"><form id="worker-form"><div class="dialog-heading"><h2>原 worker 管理</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">直接调用原 worker.sh，保留 sapper-cmd 会话、平台环境和原有行为；不会新建另一套指挥官。</p><label>操作<select name="worker_action"><option value="list">查看 workers</option><option value="board">查看原看板</option><option value="spawn">派发 worker</option><option value="kill">停止 worker</option></select></label><label>题目／任务代号或 pane 名称<input name="worker_target" placeholder="spawn 填 code，kill 填 code 或 pane"></label><label>任务说明 <span class="muted">派发时选填</span><textarea name="mission" rows="3"></textarea></label><label class="inline-check"><input name="close_instance" type="checkbox"> 停止后同时交卷并关闭平台实例（原 --close）</label><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">执行原操作</button></div></form></dialog>
