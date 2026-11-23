@@ -1,5 +1,7 @@
 """Local lifecycle regression using an isolated Web state, bridge and tmux socket."""
+from contextlib import ExitStack
 import gc
+import json
 import os
 from pathlib import Path
 import shutil
@@ -19,6 +21,59 @@ from sapper_web import Console
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("tmux"), "requires local tmux")
 class SapperCtlTests(unittest.TestCase):
+    def test_start_and_restart_move_past_occupied_ports(self):
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as sockets:
+            state, root = Path(tmp) / "state", Path(tmp) / "tasks"
+            for _ in range(20):
+                with ExitStack() as attempt:
+                    listeners = [attempt.enter_context(socket.socket()) for _ in range(4)]
+                    listeners[0].bind(("127.0.0.1", 0))
+                    port = listeners[0].getsockname()[1]
+                    if port + 3 > 65535:
+                        continue
+                    try:
+                        for offset, listener in enumerate(listeners[1:], 1):
+                            listener.bind(("127.0.0.1", port + offset))
+                    except OSError:
+                        continue
+                    sockets.enter_context(attempt.pop_all())
+                    break
+            else:
+                self.fail("could not reserve four consecutive ports")
+            for listener in listeners[:2]:
+                listener.listen()
+            for listener in listeners[2:]:
+                listener.close()
+
+            def ctl(action, *args):
+                return subprocess.run([sys.executable, str(REPO / "sapperctl"), action, "--state", str(state), *args],
+                                      capture_output=True, text=True, timeout=40)
+
+            settings = state / "sapperctl.json"
+            try:
+                started = ctl("start", "--port", str(port), "--root", str(root))
+                self.assertEqual(started.returncode, 0, started.stderr)
+                self.assertIn(f"http://127.0.0.1:{port + 2}/", started.stdout)
+                self.assertEqual(json.loads(settings.read_text())["port"], port + 2)
+                self.assertIn("已在运行", ctl("start", "--port", str(port)).stdout)
+                self.assertIn("Web 已停止", ctl("stop-web").stdout)
+
+                with socket.socket() as blocker:
+                    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    blocker.bind(("127.0.0.1", port + 2))
+                    blocker.listen()
+                    restarted = ctl("restart")
+                    self.assertEqual(restarted.returncode, 0, restarted.stderr)
+                    self.assertIn(f"http://127.0.0.1:{port + 3}/", restarted.stdout)
+                    self.assertEqual(json.loads(settings.read_text())["port"], port + 3)
+                    status = ctl("status").stdout
+                    self.assertNotIn("未发现匹配进程", status)
+                    self.assertIn(f"http://127.0.0.1:{port + 3}/", status)
+                    self.assertIn("Web 已停止", ctl("stop-web").stdout)
+                    self.assertIn("未发现匹配进程", ctl("status").stdout)
+            finally:
+                ctl("stop-web")
+
     def test_restart_preserves_jobs_and_full_stop_only_closes_owned_resources(self):
         with tempfile.TemporaryDirectory(prefix="sapper ctl ") as tmp:
             state, root = Path(tmp) / "state", Path(tmp) / "tasks"
@@ -62,7 +117,6 @@ class SapperCtlTests(unittest.TestCase):
                 with socket.socket() as other:
                     other.bind(("127.0.0.1", port))
                     other.listen()
-                    self.assertNotEqual(ctl("start", check=False).returncode, 0)
                     self.assertNotEqual(ctl("stop", check=False).returncode, 0)
             finally:
                 ctl("stop", check=False)

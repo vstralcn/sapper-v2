@@ -25,6 +25,7 @@ ACK_SECONDS = 120
 MAX_ATTEMPTS = 2
 CONTROLS = {"active", "paused", "waiting_user", "completed"}
 WAKE = re.compile(r"\[Sapper wake:([a-f0-9]{32})\]")
+TRANSCRIPT_UNAVAILABLE = "未找到唯一的原生会话记录，无法确认空闲"
 
 
 class WatchdogLog:
@@ -120,7 +121,7 @@ class CommanderMonitor:
         path = self.transcript(agent)
         if path is None:
             data.update(phase="unknown", caught_up=False, verification="transcript_unavailable",
-                        attention="未找到唯一的原生会话记录，无法确认空闲；未自动发送或重启")
+                        attention=TRANSCRIPT_UNAVAILABLE)
             return
         stat = path.stat()
         source = [str(path), stat.st_dev, stat.st_ino, agent.get("run_id"), 1]
@@ -148,6 +149,11 @@ class CommanderMonitor:
                     continue
                 self.event(agent, data, event)
             data["caught_up"] = file.tell() == path.stat().st_size
+        if data["caught_up"]:
+            if data.get("verification") == "transcript_unavailable":
+                data["verification"] = "not_observed"
+            if (data.get("attention") or "").startswith(TRANSCRIPT_UNAVAILABLE):
+                data.pop("attention", None)
 
     def event(self, agent, data, event):
         if not isinstance(event, dict) or event.get("isSidechain"):

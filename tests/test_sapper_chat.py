@@ -251,6 +251,7 @@ class ChatLifecycleTests(unittest.TestCase):
         self.until(lambda: any(m["role"] == "assistant" and "回答已接收" in m["text"] and "路径 B" in m["text"] for m in self.app.workspaces.chat_view(self.pid)["messages"]))
         self.assertEqual(self.app.run_info(child["id"])["status"], "running")
         self.app.workspaces.stop_agent(main)
+        self.assertNotIn("stop_source", self.app.run_info(run["id"]))
         self.assertTrue(all(s["status"] == "stopped" for s in self.app.workspaces.services(self.pid)))
         resumed = self.app.workspaces.dispatch(self.pid, {"role":"commander", "execution_mode":"chat"})
         self.assertEqual(resumed["claude_session_id"], run["claude_session_id"])
@@ -274,6 +275,9 @@ class ChatLifecycleTests(unittest.TestCase):
         self.app._stop(service["run_id"])  # Simulate losing only the companion.
         self.until(lambda: self.app.run_info(run["id"])["status"] == "stopped", timeout=16)
         self.assertEqual(self.app.workspaces.agent(run["agent_id"])["desired_state"], "stopped")
+        stopped = self.app.run_info(run["id"])
+        self.assertEqual(stopped.get("stop_source"), "watchdog_lost")
+        self.assertEqual(stopped.get("watchdog_run_id"), service["run_id"])
 
     def test_terminal_dispatch_reuses_identity_and_keeps_children_running(self):
         previous = self.start_chat()

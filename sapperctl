@@ -2,6 +2,7 @@
 """Manage this checkout's local Sapper Web instance."""
 import argparse
 import contextlib
+import errno
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,10 @@ REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO / "lib"))
 import sapper_models
 from sapper_auth import AuthStore, manage_credentials
-from sapper_web import Console, FINISHED, WebError, private_json, read_json, warn_root_startup
+from sapper_web import (
+    CLAUDE_STARTUP_WARNING, Console, FINISHED, PORT_IN_USE_EXIT, WebError,
+    private_json, read_json, warn_root_startup,
+)
 
 
 def default_config():
@@ -113,10 +117,13 @@ def port_available(port):
         try:
             probe.bind(("127.0.0.1", port))
         except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                return False
             raise RuntimeError(f"端口 {port} 不可用，未确认服务归属：{exc}") from exc
+    return True
 
 
-def stop_web(state, config):
+def stop_web(state, config, *, require_free_port=True):
     pids = web_pids(state, config)
     if len(pids) > 1:
         raise RuntimeError("发现多个匹配的 Web 服务，请先核对启动参数。")
@@ -131,43 +138,85 @@ def stop_web(state, config):
             time.sleep(0.1)
         else:
             raise RuntimeError("Web 尚未退出。")
-    port_available(config["port"])
+    if require_free_port and not port_available(config["port"]):
+        raise RuntimeError(f"端口 {config['port']} 仍被占用，未确认服务归属。")
     print("Web 已停止。")
 
 
 def start(state, config):
     warn_root_startup()
+    settings = state / "sapperctl.json"
+    saved = read_json(settings)
     found = web_pids(state, config)
     if found:
         if len(found) != 1:
             raise RuntimeError("发现多个匹配的 Web 服务。")
+        if saved is None:
+            private_json(settings, config)
         print(f"Web 已在运行（PID {found[0]}）。")
         return
-    port_available(config["port"])
+
+    first_port = config["port"]
+    written = None
+    try:
+        for port in range(first_port, 65536):
+            if not port_available(port):
+                continue
+            candidate = dict(config, port=port)
+            if port != first_port:
+                candidate.setdefault("requested_port", first_port)
+            if candidate != saved:
+                # Record the arguments before spawning so an interrupted controller can find the child.
+                private_json(settings, candidate)
+                written = candidate
+            child = launch_web(state, candidate)
+            if child is None:
+                continue  # Another process bound the port between the probe and startup.
+            if port != first_port:
+                print(f"端口 {first_port} 已被占用，改用 {port}。")
+            print(f"Web 已启动（PID {child}）：http://127.0.0.1:{port}/")
+            return
+        raise RuntimeError(f"端口 {first_port}–65535 均被占用。")
+    except Exception:
+        if written is not None and not web_pids(state, written):
+            if saved is None:
+                settings.unlink(missing_ok=True)
+            else:
+                private_json(settings, saved)
+        raise
+
+
+def launch_web(state, config):
     path = state / "web-server.log"
     actions = [
         (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
         (os.POSIX_SPAWN_OPEN, 1, str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600),
         (os.POSIX_SPAWN_DUP2, 1, 2),
     ]
-    child = os.posix_spawn(sys.executable, [sys.executable, *web_args(config, state)],
-                           os.environ.copy(), file_actions=actions, setsid=True)
-    # Confirm both the matching invocation and a local listener before returning.
-    for _ in range(100):
-        try:
-            os.kill(child, 0)
-        except ProcessLookupError:
-            break
-        if child in web_pids(state, config):
-            try:
-                with socket.create_connection(("127.0.0.1", config["port"]), timeout=0.2):
-                    print(f"Web 已启动（PID {child}）：http://127.0.0.1:{config['port']}/")
-                    return
-            except OSError:
-                pass
-        time.sleep(0.1)
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(child, signal.SIGTERM)
+    with path.open("a+b") as log:
+        log.seek(0, os.SEEK_END)
+        ready = f"Sapper Web: http://127.0.0.1:{config['port']}/\n".encode()
+        child = os.posix_spawn(sys.executable, [sys.executable, *web_args(config, state)],
+                               os.environ.copy(), file_actions=actions, setsid=True)
+        warning_prefix = CLAUDE_STARTUP_WARNING.encode()
+        startup_warnings = []
+        for _ in range(100):
+            pid, status = os.waitpid(child, os.WNOHANG)
+            if pid:
+                if os.waitstatus_to_exitcode(status) == PORT_IN_USE_EXIT:
+                    return None
+                break
+            # The child logs this only after binding the socket. An unrelated listener can't satisfy it.
+            lines = log.readlines()
+            startup_warnings.extend(line for line in lines if line.startswith(warning_prefix))
+            if ready in lines:
+                for warning in startup_warnings:
+                    print(warning.decode(errors="replace"), end="", file=sys.stderr)
+                return child
+            time.sleep(0.1)
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child, signal.SIGTERM)
     raise RuntimeError(f"Web 未就绪，请检查 {path}")
 
 
@@ -219,7 +268,7 @@ def main():
     parser.add_argument("action", choices=["start", "stop", "status", "restart", "stop-web", "claude-status", "stop-claude", "auth-init", "password-reset", "workspace-status"],
                         help="stop 关闭整套受管服务；restart 和 stop-web 只操作网页")
     parser.add_argument("--state", type=Path, default=REPO / ".sapper-web", help="实例状态目录")
-    parser.add_argument("--port", type=int, help="首次 start 的本地端口，默认 8766")
+    parser.add_argument("--port", type=int, help="首次 start 的起始端口，默认 8766，占用时逐一递增")
     parser.add_argument("--root", type=Path, help="首次 start 的任务根目录")
     parser.add_argument("--tmux-socket", help="首次 start 的 tmux -L 名称，默认 default")
     parser.add_argument("--username", help="auth-init 或 password-reset 的管理员用户名")
@@ -247,7 +296,8 @@ def main():
         if args.port is not None:
             if not 1 <= args.port <= 65535:
                 parser.error("--port 需要 1–65535")
-            requested["port"] = args.port
+            if args.port != config.get("requested_port"):
+                requested["port"] = args.port
         if args.root:
             requested["root"] = str(args.root.expanduser().resolve())
         if args.tmux_socket:
@@ -272,23 +322,13 @@ def main():
             print(f"在线模型桥：{len(sapper_models.bridge_operation(state))}")
             return
         if args.action in ("restart", "stop", "stop-web"):
-            stop_web(state, config)
+            stop_web(state, config, require_free_port=args.action != "restart")
         if args.action == "stop":
             stop_managed(state, config)
         if args.action in ("start", "restart"):
-            fresh = not settings.exists()
-            if fresh:
-                # Record the launch arguments before spawning, so an interrupted
-                # controller can rediscover a server with a non-default port.
-                private_json(settings, requested)
-            try:
-                start(state, requested)
-                if not AuthStore(state).configured():
-                    print("请在本机初始化管理员：" + shlex.join(["./sapperctl", "auth-init", "--state", str(state)]))
-            except Exception:
-                if fresh and not web_pids(state, requested):
-                    settings.unlink(missing_ok=True)
-                raise
+            start(state, requested)
+            if not AuthStore(state).configured():
+                print("请在本机初始化管理员：" + shlex.join(["./sapperctl", "auth-init", "--state", str(state)]))
 
 
 if __name__ == "__main__":

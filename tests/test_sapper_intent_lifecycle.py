@@ -102,7 +102,7 @@ class IntentLifecycleTests(unittest.TestCase):
              mock.patch.object(self.app, "send") as send:
             self.assertEqual(self.manager.stop_agent(self.source["id"])["message"], "等待确认停止")
             self.assertEqual(self.manager.delete_agent(self.source["id"])["status"], "stop_pending")
-            send.assert_called_once_with("%1", {"key": "C-c"})
+            send.assert_called_once_with("%1", {"key": "C-c"}, target_agent=self.source["id"], kind="command")
             self.assertEqual(self.store.get_intent(intent["id"])["worker"], self.source["id"])
             with self.assertRaisesRegex(WorkspaceError, "等待确认停止"):
                 self.manager.resume(self.source["id"], {})

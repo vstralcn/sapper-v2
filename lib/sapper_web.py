@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -48,6 +49,8 @@ STATIC = REPO / "web"
 MAX_BODY = 16 * 1024 * 1024
 STAGING_TTL = 24 * 60 * 60
 FINISHED = {"exited", "stopped", "failed", "interrupted", "timed_out"}
+PORT_IN_USE_EXIT = 3
+CLAUDE_STARTUP_WARNING = "警告：Claude Code "
 INTERRUPT_GRACE = 10
 TERMINATE_GRACE = 3
 MAX_RUN_SECONDS = 1440 * 60
@@ -628,15 +631,28 @@ class Console:
             return subprocess.run(prefix + list(args), capture_output=True, text=True, timeout=timeout)
         except FileNotFoundError as exc:
             raise WebError("未安装 tmux，请先安装后使用运行与终端功能", 503) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise WebError("tmux 响应超时", 503) from exc
+        except subprocess.TimeoutExpired:
+            socket = self.tmux_socket or "default"
+            raise WebError(f"tmux 响应超时（{args[0]}，socket={socket!r}，等待 {timeout:g} 秒）", 503) from None
+
+    def query_tmux(self, operation, *args):
+        proc = self.tmux(operation, *args)
+        if not proc.returncode:
+            return proc
+        error = proc.stderr.strip()
+        if (error.startswith("no server running on ")
+                or error.startswith("error connecting to ") and error.endswith(" (No such file or directory)")
+                or operation == "has-session" and error.startswith("can't find session: ")
+                or operation == "list-panes" and error == "no sessions"):
+            return None
+        raise WebError(f"tmux 无法确认状态（{operation}，退出码 {proc.returncode}）", 503)
 
     def panes(self):
         if not shutil.which("tmux"):
             return []
         fmt = "#{pane_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}\t#{pane_dead}\t#{pane_current_command}"
-        proc = self.tmux("list-panes", "-a", "-F", fmt)
-        if proc.returncode:
+        proc = self.query_tmux("list-panes", "-a", "-F", fmt)
+        if proc is None:
             return []
         projects = sorted(self.projects(), key=lambda p: len(p["path"]), reverse=True)
         managed = {r["session"]: r["project_id"] for f in (self.state / "runs").glob("*/run.json")
@@ -750,8 +766,7 @@ class Console:
             if pid and info.get("project_id") != pid:
                 continue
             if reconcile and info["status"] not in FINISHED:
-                alive = self.tmux("has-session", "-t", info["session"]).returncode == 0
-                if not alive:
+                if self.query_tmux("has-session", "-t", info["session"]) is None:
                     # Do not overwrite a concurrent final result written by the runner.
                     with run_lock(path.parent):
                         current = read_json(path)
@@ -1199,16 +1214,21 @@ def run_child(directory):
         warned_budget = None
         companion_checked = 0
         companion_missing = None
+        latest_companion = ("", "")
         while child.poll() is None:
             now = time.monotonic()
-            if info.get("companion_required") and now - companion_checked >= 1:
+            watchdog_lost = False
+            if reason is None and info.get("companion_required") and now - companion_checked >= 1:
                 companion_checked = now
                 alive = False
                 for path in (Path(env["SAPPER_WEB_STATE"]) / "services").glob("*.json"):
                     service = read_json(path, {})
                     if service.get("workspace_id") != info["project_id"]:
                         continue
-                    run = read_json(Path(env["SAPPER_WEB_STATE"]) / "runs" / service["run_id"] / "run.json", {})
+                    companion_id = service["run_id"]
+                    run = read_json(Path(env["SAPPER_WEB_STATE"]) / "runs" / companion_id / "run.json", {})
+                    if run:
+                        latest_companion = max(latest_companion, (run.get("created_at") or "", companion_id))
                     if run.get("status") == "starting" and now - started < 10:
                         alive = True
                     elif run.get("status") == "running" and run.get("wrapper_pid"):
@@ -1218,15 +1238,8 @@ def run_child(directory):
                         except ProcessLookupError:
                             pass
                 companion_missing = None if alive else companion_missing or now
-                if companion_missing and now - started > 10 and now - companion_missing >= 2:
-                    reason = "stopped"
-                    note("[sapper-web] watchdog 已退出，主 agent 同步停止。")
-                    agent_path = Path(env["SAPPER_WEB_STATE"]) / "agents" / f"{info['agent_id']}.json"
-                    agent = read_json(agent_path, {})
-                    if agent.get("run_id") == info["id"]:
-                        agent["desired_state"] = "stopped"
-                        private_json(agent_path, agent)
-            if journal and reason is None:
+                watchdog_lost = companion_missing is not None and now - started > 10 and now - companion_missing >= 2
+            if journal and reason is None and not watchdog_lost:
                 if init_error:
                     raise OSError("Claude Code 聊天初始化失败：" + init_error[0])
                 if not initialized.is_set() and now - started > 60:
@@ -1249,11 +1262,22 @@ def run_child(directory):
                         reason = "interrupted"
                     elif budget is not None and now - started >= budget:
                         reason = "timed_out"
+                    elif watchdog_lost:
+                        reason = "stopped"
+                        info.update(stop_source="watchdog_lost", watchdog_run_id=latest_companion[1] or None)
                     if reason:
                         info.update(status="stopping", stop_reason=reason, stopping_at=sapper.now_iso())
                         private_json(directory / "run.json", info)
             if reason and stage is None:
-                note("[sapper-web] " + ("预算耗尽" if reason == "timed_out" else "收到停止请求") + "，正在中断并等待本轮退出。")
+                if info.get("stop_source") == "watchdog_lost":
+                    note("[sapper-web] watchdog 已退出，主 agent 同步停止。")
+                    agent_path = Path(env["SAPPER_WEB_STATE"]) / "agents" / f"{info['agent_id']}.json"
+                    agent = read_json(agent_path, {})
+                    if agent.get("run_id") == info["id"]:
+                        agent["desired_state"] = "stopped"
+                        private_json(agent_path, agent)
+                else:
+                    note("[sapper-web] " + ("预算耗尽" if reason == "timed_out" else "收到停止请求") + "，正在中断并等待本轮退出。")
                 child_signal(signal.SIGINT if managed_print else signal.SIGTERM)
                 stage = "interrupt"
                 phase_end = now + (INTERRUPT_GRACE if managed_print else TERMINATE_GRACE)
@@ -1689,6 +1713,25 @@ def warn_root_startup():
               "请关闭「跳过逐次审批」，或使用普通用户启动 Sapper Web。", file=sys.stderr, flush=True)
 
 
+def warn_claude_startup(binary):
+    try:
+        version = subprocess.run([binary, "--version"], stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, errors="replace", timeout=5)
+    except FileNotFoundError:
+        reason = "找不到可执行文件"
+    except subprocess.TimeoutExpired:
+        reason = "--version 执行超时（5 秒）"
+    except OSError as exc:
+        reason = f"无法执行（{exc.strerror}）"
+    else:
+        if version.returncode == 0 and re.search(r"\b\d+\.\d+\.\d+\b", version.stdout):
+            return
+        reason = f"--version 退出码 {version.returncode}" if version.returncode else "未返回有效版本号"
+    print(f"{CLAUDE_STARTUP_WARNING}检测失败（{binary!r}）：{reason}。"
+          "请确认运行 Sapper Web 的用户已安装 Claude Code，且可通过服务的 PATH 找到，"
+          "或用 SAPPER_CLAUDE_BIN 指定可执行文件的绝对路径。", file=sys.stderr, flush=True)
+
+
 def main(argv=None):
     if argv is None and len(sys.argv) >= 3 and sys.argv[1] == "_runner":
         return run_child(sys.argv[2])
@@ -1723,7 +1766,14 @@ def main(argv=None):
             parser.error("--public-url 必须是 HTTP(S) 地址")
     warn_root_startup()
     app = Console(args.root, args.state, args.tmux_socket, workspace_roots=args.workspace_root, claude_bin=args.claude_bin)
-    server = WebServer((args.host, args.port), app, args.public_url, args.url_prefix)
+    try:
+        server = WebServer((args.host, args.port), app, args.public_url, args.url_prefix)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        print(f"无法监听 {args.host}:{args.port}：{exc}", file=sys.stderr)
+        return PORT_IN_USE_EXIT
+    warn_claude_startup(app.claude_bin)
     print(f"Sapper Web: http://{args.host}:{server.server_port}{args.url_prefix}/", flush=True)
     print(f"任务目录: {app.root}", flush=True)
     print(f"认证数据库: {app.auth.path}", flush=True)

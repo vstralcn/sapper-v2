@@ -28,6 +28,27 @@ from sapper_web import Console, WebError, WebServer, main, private_json
 
 
 class WebStartupTests(unittest.TestCase):
+    def test_startup_checks_configured_claude_version(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            binary = base / "custom claude"
+            args = ["--root", str(base / "tasks"), "--state", str(base / "state"),
+                    "--port", "0", "--claude-bin", str(binary)]
+
+            def start():
+                stderr = io.StringIO()
+                with mock.patch.object(WebServer, "serve_forever"), \
+                        redirect_stderr(stderr), redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(args), 0)
+                return stderr.getvalue()
+
+            self.assertIn("找不到可执行文件", start())
+            binary.write_text("#!/bin/sh\nexit 42\n")
+            binary.chmod(0o700)
+            self.assertIn("退出码 42", start())
+            binary.write_text('#!/bin/sh\n[ "$1" = --version ] || exit 42\necho "2.1.318 (Claude Code)"\n')
+            self.assertNotIn("Claude Code 检测失败", start())
+
     def test_only_root_startup_warns_about_claude_permission_bypass(self):
         for uid in (0, 1000):
             with self.subTest(uid=uid), tempfile.TemporaryDirectory() as temp:
@@ -51,6 +72,35 @@ class ConsoleTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_tmux_timeout_reports_operation_without_showing_command_payload(self):
+        self.app.tmux_socket = "fixture-socket"
+        with mock.patch("sapper_web.subprocess.run", side_effect=subprocess.TimeoutExpired("private", 2)):
+            with self.assertRaisesRegex(WebError, "tmux 响应超时.*send-keys.*fixture-socket.*2") as caught:
+                self.app.tmux("send-keys", "private", timeout=2)
+        self.assertEqual(caught.exception.status, 503)
+        self.assertNotIn("private", str(caught.exception))
+
+    def test_tmux_query_failure_is_distinct_from_confirmed_absence(self):
+        rid = "a" * 16
+        path = self.app.run_path(rid) / "run.json"
+        private_json(path, {"id": rid, "project_id": self.pid, "status": "running",
+                            "session": "fixture", "created_at": sapper.now_iso()})
+        failure = subprocess.CompletedProcess([], 1, "", "error connecting to /tmp/fixture (Permission denied)")
+        with mock.patch.object(self.app, "tmux", return_value=failure), \
+                mock.patch("sapper_web.shutil.which", return_value="/fixture/tmux"):
+            with self.assertRaisesRegex(WebError, "list-panes"):
+                self.app.panes()
+            with self.assertRaisesRegex(WebError, "has-session"):
+                self.app.runs()
+        self.assertEqual(self.app.run_info(rid)["status"], "running")
+        no_session = subprocess.CompletedProcess([], 1, "", "can't find session: fixture")
+        with mock.patch.object(self.app, "tmux", return_value=no_session):
+            self.assertEqual(self.app.runs()[0]["status"], "interrupted")
+        no_server = subprocess.CompletedProcess([], 1, "", "no server running on /tmp/fixture")
+        with mock.patch.object(self.app, "tmux", return_value=no_server), \
+                mock.patch("sapper_web.shutil.which", return_value="/fixture/tmux"):
+            self.assertEqual(self.app.panes(), [])
 
     def test_create_project_uses_workspace_name_as_title(self):
         named = self.app.create_project({"title": "登录绕过分析", "goal": "Find the bypass"})

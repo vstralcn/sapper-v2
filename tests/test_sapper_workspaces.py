@@ -130,6 +130,27 @@ class WorkspaceBindingTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_root_rejects_effective_permission_bypass_before_launch(self):
+        manager = self.app.workspaces
+        pid = manager.bind({"path": str(self.question)})["id"]
+        manager.enable(pid, {})
+        manager._capabilities = dict(available=True, session_id=True, resume=True, append_system=True,
+                                     mcp_config=True, strict_mcp_config=True, plugin_dir=True,
+                                     setting_sources=True, settings=True, skill_isolation=True)
+        saved = {"id": "a" * 16, "role": "commander", "workspace_id": pid,
+                 "claude_session_id": str(uuid.uuid4()), "cwd": str(self.question),
+                 "skip_permissions": True, "mission": "fixture", "run_ids": []}
+        for data, existing in (({"role": "commander", "skip_permissions": True}, None),
+                               ({"role": "worker", "skip_permissions": False}, None),
+                               ({}, saved)):
+            with self.subTest(data=data, existing=bool(existing)), \
+                    mock.patch("sapper_workspace.os.geteuid", return_value=0), \
+                    mock.patch.object(self.app, "panes", return_value=[]), \
+                    mock.patch.object(self.app, "start", side_effect=WorkspaceError("fixture reached start")) as start:
+                with self.assertRaisesRegex(WorkspaceError, "root.*跳过逐次审批"):
+                    manager.create_session(pid, data, existing=existing)
+                start.assert_not_called()
+
     def test_assignment_launch_failure_releases_same_intent_for_retry(self):
         manager = self.app.workspaces
         pid = manager.bind({"path": str(self.question)})["id"]

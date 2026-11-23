@@ -755,7 +755,9 @@ class Workspaces:
                 if run.get("request_id") == data["request_id"] and run.get("agent_id"):
                     return run
         cap = self.capabilities()
-        if not cap.get("available") or not cap.get("session_id") or not cap.get("resume"):
+        if not cap.get("available"):
+            raise WorkspaceError("Sapper Web 无法运行已配置的 Claude Code CLI。请检查服务用户的安装和 PATH，或查看 Web 启动日志", 409)
+        if not cap.get("session_id") or not cap.get("resume"):
             raise WorkspaceError("当前 Claude CLI 缺少明确会话 ID／恢复能力，请选择支持这些参数的原 CLI；不会自动升级", 409)
         if not cap.get("append_system"):
             raise WorkspaceError("该 Claude CLI 不支持 --append-system-prompt，无法可靠加载角色基础职责；请使用支持该参数的原 CLI", 409)
@@ -775,6 +777,8 @@ class Workspaces:
             raise WorkspaceError("skip_permissions 必须为布尔值")
         if role == "worker":
             skip_permissions = True
+        if skip_permissions and os.geteuid() == 0:
+            raise WorkspaceError("Sapper Web 正以 root 运行，Claude Code 拒绝跳过逐次审批", 409)
         permissions = permission_audit(data, existing, skip_permissions,
                                        inherited_source=inherited_permission_source)
         if role == "worker":

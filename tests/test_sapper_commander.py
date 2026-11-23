@@ -227,6 +227,18 @@ class CommanderTests(unittest.TestCase):
         self.tick(1100)
         self.send.assert_not_called()
 
+    def test_successful_transcript_read_clears_the_previous_availability_warning(self):
+        with self.monitor.locked(self.agent["id"]) as data:
+            self.monitor.observe(self.agent, data)
+        self.assertEqual(self.monitor.view(self.agent["id"])["verification"], "transcript_unavailable")
+        self.event("user", 1020, "fixture")
+        with self.monitor.locked(self.agent["id"]) as data:
+            self.monitor.observe(self.agent, data)
+        view = self.monitor.view(self.agent["id"])
+        self.assertEqual(view["phase"], "responding")
+        self.assertEqual(view["verification"], "not_observed")
+        self.assertNotIn("attention", view)
+
     def test_api_error_turn_is_idle_and_cannot_be_mistaken_for_recovery(self):
         self.event("assistant", 1000, [{"type": "text", "text": "API Error: upstream HTTP 502"}],
                    "stop_sequence", isApiErrorMessage=True)
