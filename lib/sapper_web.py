@@ -1639,6 +1639,9 @@ def main(argv=None):
         parsed = urllib.parse.urlsplit(args.public_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             parser.error("--public-url 必须是 HTTP(S) 地址")
+    if os.geteuid() == 0:
+        print("警告：Sapper Web 正以 root 身份启动。Claude CLI 会拒绝 --dangerously-skip-permissions。"
+              "请关闭「跳过逐次审批」，或使用普通用户启动 Sapper Web。", file=sys.stderr, flush=True)
     app = Console(args.root, args.state, args.tmux_socket, workspace_roots=args.workspace_root, claude_bin=args.claude_bin)
     server = WebServer((args.host, args.port), app, args.public_url, args.url_prefix)
     print(f"Sapper Web: http://{args.host}:{server.server_port}{args.url_prefix}/", flush=True)

@@ -54,22 +54,29 @@ function submitExtension(prefix, fallback, action) {
   });
 }
 
-function extensionOptions(target, library, selection, disabled = false) {
+function extensionOptions(target, library, selection, disabled = false, {compact = false} = {}) {
   const groups = [];
   for (const [key, field, title] of [["mcp", "mcp_ids", "MCP 服务器"], ["skills", "skill_ids", "Skills"]]) {
-    const group = element("div", "extension-group", "");
+    const group = element("div", "extension-group" + (compact ? " extension-list" : ""), "");
     group.dataset.extensionGroup = field;
     group.dataset.title = title;
     group.dataset.total = library[key].length;
     group.append(element("p", "field-help", `${title} · ${selection[field].length} / ${library[key].length}`));
     for (const resource of library[key]) {
-      const label = element("label", "inline-check extension-choice", "");
+      const label = element("label", compact ? "extension-row" : "inline-check extension-choice", "");
       const input = document.createElement("input");
       input.type = "checkbox"; input.dataset.extensionField = field; input.value = resource.id;
       input.checked = selection[field].includes(resource.id); input.disabled = disabled;
-      label.append(input, document.createTextNode(resource.name)); group.append(label);
+      if (compact) {
+        const name = element("span", "extension-row-name", resource.name);
+        name.title = resource.name;
+        label.append(input, name);
+      } else {
+        label.append(input, document.createTextNode(resource.name));
+      }
+      group.append(label);
     }
-    if (!library[key].length) group.append(element("p", "field-help", "资源库中还没有此类资源，请先在全局资源库添加。"));
+    if (!library[key].length) group.append(element("p", "field-help extension-empty", "资源库中还没有此类资源，请先在全局资源库添加。"));
     groups.push(group);
   }
   $(target).replaceChildren(...groups);
@@ -91,7 +98,7 @@ async function loadAgentExtensions() {
   if (request !== agentExtensionRequest || pid !== state.project?.id || !$("agent-dialog").open) return;
   agentWorkspaceModels = {pid, ...models};
   refreshAgentModelOptions();
-  extensionOptions("agent-extension-options", data, data.selection, true);
+  extensionOptions("agent-extension-options", data, data.selection, true, {compact: true});
   $("agent-extensions-default").disabled = false;
   $("agent-extension-status").textContent = data.claude.skill_isolation
     ? "会话保存到本工作区 .sapper/sessions/；认证使用 API Key。"
@@ -255,6 +262,11 @@ async function saveExtensionAction(data) {
   toast("全局资源库已保存");
 }
 
+$("agent-extension-options").onchange = () => {
+  $("agent-extension-options").querySelectorAll(".extension-group").forEach(group => {
+    group.firstChild.textContent = `${group.dataset.title} · ${group.querySelectorAll("input:checked").length} / ${group.dataset.total}`;
+  });
+};
 $("agent-extensions-default").onchange = () => {
   $("agent-extension-options").querySelectorAll("input").forEach(input => input.disabled = $("agent-extensions-default").checked);
 };

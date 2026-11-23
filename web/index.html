@@ -219,7 +219,15 @@
     <label>任务说明<textarea name="mission" id="agent-mission" rows="4" required></textarea></label>
     <details id="dispatch-settings"><summary>主 agent 运行配置</summary>
       <label>模型<select name="profile_id" id="agent-profile"></select><span id="agent-model-hint" class="field-help"></span><button type="button" id="agent-model-settings" class="text-button">配置工作区模型</button></label>
-      <fieldset id="agent-extensions"><legend>MCP 与 Skills</legend><label class="inline-check"><input id="agent-extensions-default" type="checkbox" checked>使用工作区配置</label><div id="agent-extension-options"></div><p id="agent-extension-status" class="field-help" role="status"></p><button id="agent-extension-settings" type="button" class="text-button">配置工作区资源</button></fieldset>
+      <fieldset id="agent-extensions">
+        <legend>MCP 与 Skills</legend>
+        <div class="agent-extensions-head">
+          <label class="inline-check"><input id="agent-extensions-default" type="checkbox" checked>使用工作区配置</label>
+          <button id="agent-extension-settings" type="button" class="text-button">配置工作区资源</button>
+        </div>
+        <div id="agent-extension-options"></div>
+        <p id="agent-extension-status" class="field-help" role="status"></p>
+      </fieldset>
       <section id="agent-role-info" class="agent-role-info"><p id="agent-role-summary"></p><p id="agent-role-source" class="field-help"></p><details><summary>查看角色职责</summary><pre id="agent-role-prompt"></pre></details></section>
     </details>
     <label id="agent-permissions" class="inline-check"><input name="skip_permissions" type="checkbox">允许角色执行命令、修改文件等操作时跳过逐次审批</label>

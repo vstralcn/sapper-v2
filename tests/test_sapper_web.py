@@ -1,8 +1,10 @@
 """Web adapter tests. Real CLI/tmux tests use an isolated socket and fake model CLI."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -22,7 +24,21 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import sapper
-from sapper_web import Console, WebError, WebServer, private_json
+from sapper_web import Console, WebError, WebServer, main, private_json
+
+
+class WebStartupTests(unittest.TestCase):
+    def test_only_root_startup_warns_about_claude_permission_bypass(self):
+        for uid in (0, 1000):
+            with self.subTest(uid=uid), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp)
+                stderr = io.StringIO()
+                with mock.patch("sapper_web.os.geteuid", return_value=uid), \
+                        mock.patch.object(WebServer, "serve_forever"), \
+                        redirect_stderr(stderr), redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(["--root", str(base / "tasks"),
+                                           "--state", str(base / "state"), "--port", "0"]), 0)
+                self.assertEqual("--dangerously-skip-permissions" in stderr.getvalue(), uid == 0)
 
 
 class ConsoleTests(unittest.TestCase):

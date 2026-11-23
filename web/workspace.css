@@ -48,6 +48,23 @@
 #dispatch-settings{margin:16px 0}#dispatch-settings>label,#dispatch-settings>fieldset{margin-top:16px}
 .extension-group .inline-check { display: inline-flex; margin-right: 16px; overflow-wrap: anywhere; }
 #extensions-dialog details { margin-top: 20px; }
+/* MCP / Skills picker in the agent dialog: one compact row per resource. */
+#agent-extensions{border:1px solid var(--line);border-radius:8px;padding:10px 14px 12px;margin:16px 0 0;min-width:0}
+#agent-extensions legend{padding:0 6px;font-size:13px;font-weight:600}
+.agent-extensions-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:4px 12px}
+.agent-extensions-head .inline-check{flex-direction:row;margin:0;font-size:13px}
+#agent-extension-options{display:grid;gap:8px;margin-top:8px}
+#agent-extension-options .extension-group{margin:0}
+#agent-extension-options .field-help{margin:0;padding:0 4px;font-size:11px}
+.extension-list+.extension-list{padding-top:8px;border-top:1px solid var(--line)}
+.extension-row{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:8px;padding:6px 4px;font-size:13px;font-weight:500}
+.extension-row+.extension-row{border-top:1px solid var(--line)}
+.extension-row input{width:auto;margin:0}
+.extension-row:has(input:not(:checked)){color:var(--muted)}
+.extension-row:has(input:enabled){cursor:pointer}
+.extension-row:has(input:enabled):hover{background:var(--surface-hover)}
+.extension-row-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#agent-extension-status{margin-top:8px}
 #extensions-dialog form { margin-top: 12px; }
 #extensions-dialog textarea { font-family: monospace; }
 
