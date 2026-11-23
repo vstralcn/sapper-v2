@@ -46,6 +46,7 @@ REPO = Path(__file__).resolve().parent.parent
 SAPPER = REPO / "lib" / "sapper.py"
 STATIC = REPO / "web"
 MAX_BODY = 16 * 1024 * 1024
+STAGING_TTL = 24 * 60 * 60
 FINISHED = {"exited", "stopped", "failed", "interrupted", "timed_out"}
 INTERRUPT_GRACE = 10
 TERMINATE_GRACE = 3
@@ -75,6 +76,15 @@ def number(data, key, default, low, high):
     if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
         raise WebError(f"{key} 必须在 {low}–{high} 之间")
     return value
+
+
+def attachment_name(name):
+    name = Path(name.replace("\\", "/")).name
+    if not name or name in (".", "..") or "\x00" in name or len(name) > 180 or len(name.encode()) > 246:
+        raise WebError("文件名不正确")
+    if name.endswith(".env"):
+        raise WebError("环境凭据文件不通过普通文件接口提供", 403)
+    return secrets.token_hex(4) + "_" + name
 
 
 def private_json(path: Path, data):
@@ -333,7 +343,7 @@ class Console:
             raise WebError(str(exc)) from exc
         return sapper_evidence.provenance(source, commands, items, cwd)
 
-    def create_project(self, data):
+    def create_project(self, data, *, session_hash=None):
         # `title` is the workspace name shown in the UI; `name` is the directory.
         # Either may be omitted: the title falls back to the directory name and
         # the directory is derived from the title when left empty.
@@ -352,12 +362,30 @@ class Console:
         goal = require_text(data, "goal")
         path = self.inside(self.root / name)
         context = require_text(data, "context") if data.get("context") else ""
-        with self.config_lock():
+        with self.config_lock(), contextlib.ExitStack() as rollback:
             if path.exists():
                 raise WebError("目录已存在；已有图会自动出现在任务列表，请勿重复初始化", 409)
             cfg = self.config()
             assignments = self.new_workspace_models(cfg, data)
+            ids = data.get("attachment_ids", [])
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids) or len(ids) != len(set(ids)):
+                raise WebError("暂存附件列表不正确")
+            staged = [self.staged_file(session_hash, token) for token in ids]
             path.mkdir()
+            rollback.callback(shutil.rmtree, path)
+            claimed = []
+            if staged:
+                target = path / "attachments"
+                target.mkdir()
+                for source in staged:
+                    destination = target / source.name
+                    if destination.exists():
+                        raise WebError("附件名称冲突，请重新选择文件", 409)
+                    shutil.copy2(source, destination)
+                    directory = source.parent
+                    consumed = directory.rename(directory.with_suffix(".claimed"))
+                    rollback.callback(consumed.rename, directory)
+                    claimed.append(consumed)
             store = sapper.Store(path / ".sapper")
             store.init("web", goal)
             if title != name:
@@ -371,6 +399,9 @@ class Console:
             if assignments is not None:
                 self.set_workspace_models(cfg, project["id"], assignments)
                 private_json(self.config_path, cfg)
+            rollback.pop_all()
+            for directory in claimed:
+                shutil.rmtree(directory, ignore_errors=True)
         self.audit("project.created", name=name, title=title)
         return project
 
@@ -1002,11 +1033,39 @@ class Console:
                 break
         return result
 
+    def stage_attachment(self, session_hash, name, body):
+        filename = attachment_name(name)
+        root = self.state / "staged-attachments"
+        with self.config_lock():
+            root.mkdir(mode=0o700, exist_ok=True)
+            cutoff = time.time() - STAGING_TTL
+            for entry in root.iterdir():
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry)
+            token = secrets.token_hex(16)
+            directory = root / (session_hash + "-" + token)
+            directory.mkdir(mode=0o700)
+            try:
+                fd = os.open(directory / filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(body)
+            except OSError:
+                shutil.rmtree(directory)
+                raise
+        return {"id": token}
+
+    def staged_file(self, session_hash, token):
+        if not session_hash or not re.fullmatch(r"[0-9a-f]{32}", token):
+            raise WebError("暂存附件编号不正确")
+        directory = self.state / "staged-attachments" / (session_hash + "-" + token)
+        if directory.is_dir() and directory.stat().st_mtime >= time.time() - STAGING_TTL:
+            files = list(directory.iterdir())
+            if len(files) == 1 and files[0].is_file():
+                return files[0]
+        raise WebError("暂存附件不存在或已过期，请重新上传", 404)
+
     def upload(self, pid, name, body):
-        name = Path(name.replace("\\", "/")).name
-        if not name or name in (".", "..") or len(name) > 180 or "\x00" in name:
-            raise WebError("文件名不正确")
-        relative = "attachments/" + secrets.token_hex(4) + "_" + name
+        relative = "attachments/" + attachment_name(name)
         path = self.file(pid, relative)
         path.parent.mkdir(exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1291,6 +1350,8 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 <= size <= MAX_BODY:
             raise WebError("请求过大，单次最多 16 MiB", 413)
         data = self.rfile.read(size)
+        if len(data) != size:
+            raise WebError("请求内容不完整，请重试")
         if raw:
             return data
         if self.headers.get_content_type() != "application/json":
@@ -1459,7 +1520,14 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return self.reply(200, app.projects())
                 if method == "POST":
-                    return self.reply(201, app.create_project(self.body()))
+                    return self.reply(201, app.create_project(self.body(), session_hash=session["token_hash"]))
+            if path == "/api/staged-attachments" and method == "POST":
+                return self.reply(201, app.stage_attachment(session["token_hash"], q("name"), self.body(raw=True)))
+            if re.fullmatch(r"/api/staged-attachments/[0-9a-f]{32}", path) and method == "DELETE":
+                with app.config_lock():
+                    staged = app.staged_file(session["token_hash"], path.rsplit("/", 1)[1])
+                    shutil.rmtree(staged.parent)
+                return self.reply(200, {"ok": True})
             if path == "/api/extensions/skill-metadata" and method == "GET":
                 return self.reply(200, app.workspaces.extensions.preview_skill(q("path")))
             if path == "/api/extensions":

@@ -247,6 +247,8 @@
     <label>目录名 <span class="muted">选填</span><input name="name" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" placeholder="留空则按工作区名称自动生成"><span class="field-help">仅限英文字母、数字、点、横线或下划线。</span></label>
     <label>任务目标<textarea name="goal" required rows="3" placeholder="描述要解决的问题与期望结果"></textarea></label>
     <label>已有资料与约束 <span class="muted">选填</span><textarea name="context" rows="3" placeholder="将保存为原 hint"></textarea></label>
+    <label>任务附件 <span class="muted">选填</span><input id="create-files" type="file" multiple><span class="field-help">可选择多个文件，每个最多 16 MiB。选择后立即暂存，创建成功后可在工作区的 attachments/ 目录查看。</span></label>
+    <ul id="create-file-list" aria-live="polite" hidden></ul>
     <div id="create-model-rows" class="workspace-model-fields"></div>
     <div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">创建任务</button></div>
   </form></dialog>

@@ -513,11 +513,84 @@ $("profiles-dialog").addEventListener("close", () => {
   $("account-username").value = state.username || "";
   $("password-error").textContent = "";
 });
+const createAttachments = new Set();
+let creatingWorkspace = false;
+
+function refreshCreateFiles() {
+  const list = $("create-file-list");
+  list.replaceChildren();
+  for (const item of createAttachments) {
+    const row = element("li", "", `${item.name} · ${item.status} `);
+    const remove = button("移除", "text-button", () => {
+      createAttachments.delete(item);
+      refreshCreateFiles();
+      if (item.id) guarded(() => discardCreateFile(item.id));
+    });
+    remove.disabled = creatingWorkspace;
+    row.append(remove);
+    list.append(row);
+  }
+  list.hidden = !createAttachments.size;
+  $("create-files").disabled = creatingWorkspace;
+  $("create-form").querySelectorAll(".dialog-close").forEach(node => { node.disabled = creatingWorkspace; });
+  $("create-form").querySelector("[type=submit]").disabled = creatingWorkspace || [...createAttachments].some(item => !item.id);
+}
+
+function discardCreateFile(id) {
+  return api("/staged-attachments/" + id, {method: "DELETE"});
+}
+
+$("create-files").onchange = async event => {
+  const files = Array.from(event.target.files, file => ({file, item: {name: file.name, status: "等待上传"}}));
+  event.target.value = "";
+  for (const {item} of files) createAttachments.add(item);
+  refreshCreateFiles();
+  for (const {file, item} of files) {
+    if (!createAttachments.has(item)) continue;
+    try {
+      if (file.size > 16 * 1024 * 1024) throw new Error("单个附件最多 16 MiB");
+      item.status = "上传中";
+      refreshCreateFiles();
+      const result = await api("/staged-attachments?name=" + encodeURIComponent(file.name), {
+        method: "POST", headers: {"Content-Type": "application/octet-stream"}, body: await file.arrayBuffer(),
+      });
+      if (!createAttachments.has(item)) {
+        await discardCreateFile(result.id);
+        continue;
+      }
+      item.id = result.id;
+      item.status = "已暂存";
+    } catch (error) {
+      item.status = "上传失败：" + error.message;
+    }
+    refreshCreateFiles();
+  }
+};
+$("create-dialog").addEventListener("cancel", event => { if (creatingWorkspace) event.preventDefault(); });
+$("create-dialog").addEventListener("close", () => {
+  for (const item of createAttachments) {
+    if (item.id && state.csrf) guarded(() => discardCreateFile(item.id));
+  }
+  createAttachments.clear();
+  refreshCreateFiles();
+});
+
 submit("create-form", async data => {
-  const result = await api("/projects", {method: "POST", body: {
-    title: data.get("title").trim(), name: data.get("name").trim(), goal: data.get("goal"), context: data.get("context"),
-    model_assignments: readWorkspaceModelFields($("create-model-rows")),
-  }});
+  if (creatingWorkspace || [...createAttachments].some(item => !item.id)) return;
+  creatingWorkspace = true;
+  refreshCreateFiles();
+  let result;
+  try {
+    result = await api("/projects", {method: "POST", body: {
+      title: data.get("title").trim(), name: data.get("name").trim(), goal: data.get("goal"), context: data.get("context"),
+      model_assignments: readWorkspaceModelFields($("create-model-rows")),
+      attachment_ids: [...createAttachments].map(item => item.id),
+    }});
+    createAttachments.clear();
+  } finally {
+    creatingWorkspace = false;
+    refreshCreateFiles();
+  }
   state.projects = [...state.projects.filter(project => project.id !== result.id), result];
   $("create-dialog").close();
   $("create-form").reset();

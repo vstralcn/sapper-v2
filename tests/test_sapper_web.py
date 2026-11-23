@@ -311,7 +311,10 @@ class HttpTests(unittest.TestCase):
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
         combined = {"Cookie": self.cookie, "X-Sapper-CSRF": self.csrf, **(headers or {})}
         body = None
-        if data is not None:
+        if isinstance(data, bytes):
+            body = data
+            combined["Content-Type"] = "application/octet-stream"
+        elif data is not None:
             body = json.dumps(data)
             combined["Content-Type"] = "application/json"
         conn.request(method, "/sapper" + path, body=body, headers=combined)
@@ -326,6 +329,44 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.cookie = headers["Set-Cookie"].split(";", 1)[0]
         self.csrf = json.loads(body)["csrf"]
+
+    def test_staged_uploads_follow_only_the_creating_workspace(self):
+        self.login()
+        endpoint = "/api/staged-attachments?name=" + urllib.parse.quote("../资料.bin")
+        tokens = []
+        for content in (b"first", b"second\x00"):
+            status, _, body = self.request(endpoint, "POST", content)
+            self.assertEqual(status, 201, body)
+            tokens.append(json.loads(body)["id"])
+        self.assertEqual(self.app.projects(), [])
+        payload = {"name": "draft", "goal": "Review files", "attachment_ids": tokens}
+        original = self.cookie, self.csrf
+        self.login()
+        self.assertEqual(self.request("/api/projects", "POST", payload)[0], 404)
+        self.cookie, self.csrf = original
+        self.assertEqual(self.request("/api/projects", "POST", {**payload, "goal": ""})[0], 400)
+        status, _, body = self.request("/api/projects", "POST", payload)
+        self.assertEqual(status, 201, body)
+        pid = json.loads(body)["id"]
+        files = self.app.files(pid, "attachments")
+        self.assertEqual(len(files), 2)
+        self.assertEqual({self.app.file(pid, f["path"]).read_bytes() for f in files}, {b"first", b"second\x00"})
+        self.assertTrue(all(f["name"].endswith("资料.bin") for f in files))
+        self.assertTrue(all(stat.S_IMODE(self.app.file(pid, f["path"]).stat().st_mode) == 0o600 for f in files))
+        self.assertEqual(self.request("/api/projects", "POST", {**payload, "name": "other"})[0], 404)
+        self.assertFalse((self.app.root / "other").exists())
+
+    def test_discarded_attachment_cannot_be_claimed(self):
+        self.login()
+        status, _, body = self.request("/api/staged-attachments?name=note.txt", "POST", b"note")
+        self.assertEqual(status, 201, body)
+        token = json.loads(body)["id"]
+        self.assertEqual(self.request("/api/staged-attachments/" + token, "DELETE")[0], 200)
+        status, _, _ = self.request("/api/projects", "POST", {
+            "name": "draft", "goal": "Review", "attachment_ids": [token],
+        })
+        self.assertEqual(status, 404)
+        self.assertEqual(self.app.projects(), [])
 
     def test_workspace_and_fact_status_agree_between_cli_and_web(self):
         self.login()
