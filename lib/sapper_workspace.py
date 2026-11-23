@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -167,7 +168,7 @@ class Workspaces:
                 path = self.allowed(binding["path"])
                 store = sapper.Store(path / ".sapper")
                 item = {**binding, "name": binding.get("name") or path.name,
-                        "relative_path": str(path), "status": "not_enabled", "facts": 0,
+                        "directory": path.name, "relative_path": str(path), "status": "not_enabled", "facts": 0,
                         "open_intents": 0, "pending_confirmation": 0, "last_evidence_at": "",
                         "enabled": False, "mode": "workspace"}
                 if store.exists():
@@ -235,11 +236,24 @@ class Workspaces:
             if existing:
                 return existing
             discovered = next((p for p in self.app._scan_projects() if p["path"] == str(path)), None)
+            assignments = self.app.new_workspace_models(cfg, data) if not discovered else None
+            default_name = discovered["name"] if discovered else path.name
+            if not discovered:
+                try:
+                    saved = sapper.Store(path / ".sapper").load_project().get("name")
+                    if isinstance(saved, str) and saved.strip():
+                        default_name = saved.strip()
+                except (sapper.FGError, OSError):
+                    pass
             record = {"id": discovered["id"] if discovered else uuid.uuid4().hex[:16],
-                      "path": str(path), "name": text(data, "name", path.name, 100) or path.name,
+                      "path": str(path), "name": text(data, "name", default_name, 100) or default_name,
                       "goal": text(data, "goal", path.name) or path.name,
                       "created_at": sapper.now_iso()}
             cfg.setdefault("workspaces", []).append(record)
+            if str(path) in cfg.get("hidden_workspaces", []):
+                cfg["hidden_workspaces"] = [h for h in cfg["hidden_workspaces"] if h != str(path)]
+            if assignments is not None:
+                self.app.set_workspace_models(cfg, record["id"], assignments)
             sapper.atomic_write_json(self.app.config_path, cfg)
         self.app.audit("workspace.bound", workspace=record["id"], path=str(path))
         return record
@@ -379,8 +393,7 @@ class Workspaces:
         config = self.app.config() if config is None else config
         profiles = {p["id"]: p for p in config["profiles"]}
         original_id = agent.get("profile_id", "")
-        defaults = {**config.get("role_profiles", {}),
-                    **config.get("workspace_role_profiles", {}).get(agent["workspace_id"], {})}
+        defaults = self.app.role_model_defaults(config, agent["workspace_id"])
         current_id = defaults.get(agent["role"], "")
 
         def label(pid, snapshot=None):
@@ -1287,6 +1300,61 @@ class Workspaces:
             stopped.append(a["id"])
         return {"stopped_agents": stopped}
 
+    @serialized
+    def delete_workspace(self, pid, data):
+        """Remove a workspace from the console, optionally with its directory.
+
+        Registered roles are stopped and deleted first; nothing else changes
+        unless every role has actually stopped. Files are removed only for a
+        directory strictly inside the work root and only after the user typed
+        the workspace name. External bound directories are only unbound.
+        """
+        project = self.app.project(pid)
+        remove_files = data.get("delete_files", False)
+        if type(remove_files) is not bool:
+            raise WorkspaceError("delete_files 必须为布尔值")
+        root = Path(project["path"])
+        inside = self.app.inside_root(root)
+        if remove_files:
+            if not inside:
+                raise WorkspaceError("只能删除工作根目录内的工作区目录；外部目录只会从列表中移除", 403)
+            if text(data, "confirm_name") != project["name"]:
+                raise WorkspaceError("请输入完整的工作区名称以确认删除目录")
+        for service in self.services(pid):
+            if service["status"] not in TERMINAL_STATES:
+                self.app._stop(service["run_id"])
+        deleted, pending = [], []
+        for a in self.agents(pid):
+            if not re.fullmatch(r"[a-f0-9]{16}", a["id"]):
+                continue
+            result = self.delete_agent(a["id"])
+            (pending if result.get("status") == "stop_pending" else deleted).append(a["id"])
+        if pending:
+            raise WorkspaceError(f"{len(pending)} 个角色仍在停止中，请稍后再删除工作区", 409)
+        if remove_files:
+            try:
+                shutil.rmtree(root.resolve())
+            except OSError as exc:
+                raise WorkspaceError(f"删除目录失败：{exc}") from exc
+        # lifecycle() already holds the config lock; write directly.
+        cfg = self.app.config()
+        cfg["workspaces"] = [w for w in cfg.get("workspaces", [])
+                             if w.get("id") != pid and w.get("path") != project["path"]]
+        if cfg.get("workspace_role_profiles", {}).pop(pid, None) is not None:
+            cfg["role_profiles_revision"] = cfg.get("role_profiles_revision", 0) + 1
+        hidden = [h for h in cfg.get("hidden_workspaces", []) if h != project["path"]]
+        if inside and not remove_files:
+            hidden.append(project["path"])
+        cfg["hidden_workspaces"] = hidden
+        sapper_context.atomic_private(self.app.config_path, cfg)
+        extensions = self.extensions.read()
+        if extensions["workspaces"].pop(pid, None) is not None:
+            extensions["revision"] += 1
+            sapper_context.atomic_private(self.extensions.path, extensions)
+        self.app.audit("workspace.deleted", workspace=pid, path=project["path"],
+                       files_deleted=remove_files, deleted_agents=deleted)
+        return {"deleted_workspace": pid, "deleted_agents": deleted, "files_deleted": remove_files}
+
 
 def console_from_environment():
     from sapper_web import Console
@@ -1365,7 +1433,7 @@ def worker(argv):
     if args.action == "spawn":
         if args.engine != "claude" or args.gw:
             raise WorkspaceError("本地工作区请用角色模型配置；原 --gw/其他引擎分支仍可在原比赛模式使用")
-        candidates = [p for p in app.projects() if p["id"] in scope and args.target in (p["id"], p["name"])]
+        candidates = [p for p in app.projects() if p["id"] in scope and args.target in (p["id"], p["name"], p.get("directory"))]
         if len(candidates) != 1:
             raise WorkspaceError("派发目标不在当前指挥官的明确工作区范围内")
         if not (args.from_ids or args.intent):

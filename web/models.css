@@ -26,6 +26,8 @@
 .model-priority{display:flex;align-items:center;flex-wrap:wrap;gap:10px;font-size:12px;padding:12px 15px;background:var(--surface);border-radius:6px;margin-bottom:16px;color:var(--muted-strong)}
 .model-priority span{color:var(--muted)}
 .role-model-row{display:grid;grid-template-columns:minmax(120px,1fr) minmax(0,2fr);align-items:center;gap:22px;padding:16px 0;border-bottom:1px solid var(--line)}
+.workspace-model-fields{min-width:0;margin:0;padding:0;border:0}
+.workspace-model-overrides>summary{cursor:pointer;color:var(--accent)}
 .role-model-name{display:flex;gap:12px;align-items:baseline}
 .role-model-name label{font-size:13px}.role-model-name span{font-size:11px}
 .model-settings-link{align-self:flex-start;font-size:11px;padding:0;text-align:left}

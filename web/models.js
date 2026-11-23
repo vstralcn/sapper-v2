@@ -1,12 +1,14 @@
 "use strict";
 
 const ROLE_RULE = "__inherit_rule__";
+const WORKSPACE_MODEL_ENV = "__workspace_env__";
 let roleModelConfig = null;
 let agentWorkspaceModels = null;
 let roleModelsDirty = false;
 
 function effectiveRoleAssignments() {
   const local = agentWorkspaceModels?.pid === state.project?.id ? agentWorkspaceModels : null;
+  if (local && Object.hasOwn(local.assignments, "main")) return local.effective_assignments;
   return {...(roleModelConfig?.assignments || {}), ...(local?.assignments || {})};
 }
 
@@ -17,6 +19,82 @@ function profileOption(value, label) {
 }
 function modelConnectionLabel(profile) {
   return `${profile.name} · ${profile.model}`;
+}
+
+function renderWorkspaceModelFields(container, config, profiles, {creating = false, preserve = false} = {}) {
+  const prefix = container.id.replace(/-rows$/, "");
+  const prior = preserve ? readWorkspaceModelFields(container) : config.assignments;
+  const noMain = creating ? "" : ROLE_RULE;
+  const choices = profiles.filter(profile => !profile.engine_prefix);
+  const appendChoices = (select, value) => {
+    for (const profile of choices) select.append(profileOption(profile.id, modelConnectionLabel(profile)));
+    if (![...select.options].some(option => option.value === value)) {
+      select.append(profileOption(value, "连接已失效，请重新选择"));
+    }
+    select.value = value;
+  };
+
+  const label = element("label", "", "主模型");
+  const main = document.createElement("select");
+  main.name = "main";
+  main.id = `${prefix}-main`;
+  main.required = creating;
+  main.append(profileOption(noMain, creating ? "请选择主模型" : "沿用全局角色模型"),
+    profileOption(WORKSPACE_MODEL_ENV, "使用执行机环境"));
+  appendChoices(main, prior.main === "" ? WORKSPACE_MODEL_ENV : prior.main ?? noMain);
+  label.append(main);
+
+  const overrides = element("details", "workspace-model-overrides");
+  overrides.id = `${prefix}-overrides`;
+  overrides.open = !creating && Boolean(container.querySelector("details")?.open);
+  overrides.append(element("summary", "", "单独设置角色模型"));
+  const inheritedOptions = [];
+  for (const role of config.roles) {
+    const row = element("div", "role-model-row");
+    const roleLabel = element("label", "", role.label);
+    const select = document.createElement("select");
+    select.id = `${prefix}-${role.id}`;
+    select.name = role.id;
+    roleLabel.htmlFor = select.id;
+    const globalId = config.global_assignments[role.id];
+    const globalProfile = profiles.find(profile => profile.id === globalId);
+    const globalLabel = globalId === undefined ? "原有继承规则"
+      : globalId === "" ? "原环境" : globalProfile ? modelConnectionLabel(globalProfile) : "连接已失效";
+    const option = profileOption(ROLE_RULE, "");
+    inheritedOptions.push({option, globalLabel});
+    select.append(option, profileOption("", "使用执行机环境"));
+    appendChoices(select, prior[role.id] ?? ROLE_RULE);
+    row.append(roleLabel, select);
+    overrides.append(row);
+  }
+  const updateInheritance = () => {
+    overrides.hidden = creating && main.value === "";
+    for (const {option, globalLabel} of inheritedOptions) {
+      option.textContent = main.value === ROLE_RULE ? `继承全局：${globalLabel}` : "继承主模型";
+    }
+  };
+  main.addEventListener("change", updateInheritance);
+  updateInheritance();
+  container.replaceChildren(label, overrides);
+}
+
+function readWorkspaceModelFields(container) {
+  return Object.fromEntries([...container.querySelectorAll("select")].filter(select =>
+    select.value !== ROLE_RULE && (select.name !== "main" || select.value !== "")
+  ).map(select => [select.name, select.value === WORKSPACE_MODEL_ENV ? "" : select.value]));
+}
+
+async function newWorkspaceModelOptions() {
+  const [config, profiles] = await Promise.all([api("/role-models"), api("/profiles")]);
+  return {config: {...config, assignments: {}}, profiles};
+}
+
+async function openCreateWorkspace() {
+  const dialog = $("create-dialog");
+  const {config, profiles} = await newWorkspaceModelOptions();
+  if (dialog.open) return;
+  renderWorkspaceModelFields($("create-model-rows"), config, profiles, {creating: true});
+  dialog.showModal();
 }
 function roleDefaultLabel(role) {
   const assignments = effectiveRoleAssignments();

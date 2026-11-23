@@ -95,11 +95,15 @@ function renderWorkspaceTable(projects) {
     const pending = [p.pending_confirmation && `${p.pending_confirmation} 项待确认`, agents.waiting && `${agents.waiting} 个角色等待`, agents.attention && `${agents.attention} 个角色需检查`].filter(Boolean);
     row.append(title, element("td","",projectStatus(p)), element("td","",pending.join(" · ") || "—"),
       element("td","",p.last_evidence_at ? time(p.last_evidence_at) : "—"));
+    const actions = element("td");
+    const remove = button("删除","text-button danger",()=>openDeleteWorkspace(p));
+    remove.setAttribute("aria-label",`删除工作区 ${p.name}`);
+    actions.append(remove);row.append(actions);
     return row;
   });
   if (!rows.length) {
     const row = element("tr"), cell = element("td","muted",projects.length ? "没有符合筛选条件的工作区。" : "还没有工作区。");
-    cell.colSpan = 4;
+    cell.colSpan = 5;
     row.append(cell);
     rows.push(row);
   }
@@ -200,7 +204,7 @@ $("workspaces-button").onclick=()=>guarded(()=>showOverview("workspaces"));
 $("workspaces-bind").onclick=()=>guarded(openBind);
 $("workspaces-search").oninput=$("workspaces-filter").onchange=()=>renderWorkspaceTable(state.overview?.projects||state.projects);
 $("overview-bind").onclick=()=>guarded(openBind);
-$("overview-create").onclick=()=>$("create-dialog").showModal();
+$("overview-create").onclick=()=>guarded(openCreateWorkspace);
 $("context-button").onclick=$("overview-context-edit").onclick=()=>guarded(openContext);
 $("context-reload").onclick=()=>guarded(loadContextEditor);
 submit("context-form",async()=>{

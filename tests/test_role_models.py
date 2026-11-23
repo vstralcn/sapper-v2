@@ -174,6 +174,43 @@ class RoleModelTests(unittest.TestCase):
             chosen = next(p for p in self.app.profiles() if p["id"] == self.start.call_args.args[1]["profile_id"])
             self.assertEqual(chosen["protocol"], "chat_completions")
 
+    def test_workspace_creation_persists_main_model_and_inherits_it_at_launch(self):
+        self.assign({"general": self.ds["id"]})
+        project = self.app.create_project({
+            "name": "with-model", "goal": "model setup",
+            "model_assignments": {"main": self.glm["id"], "scout": self.ds["id"]},
+        })
+        self.pid = project["id"]
+        self.app.workspaces.enable(self.pid, {})
+        self.assertEqual(self.launch(role="commander")["profile_id"], self.glm["id"])
+        self.assertEqual(self.launch(role="general")["profile_id"], self.glm["id"])
+        self.assertEqual(self.launch(role="scout")["profile_id"], self.ds["id"])
+        config = Console(self.app.root, self.app.state).role_models(self.pid)
+        self.assertEqual(config["assignments"], {"main": self.glm["id"], "scout": self.ds["id"]})
+        self.assertEqual(config["effective_assignments"]["worker"], self.glm["id"])
+        self.app.save_role_models({
+            "assignments": {"main": self.ds["id"], "scout": self.glm["id"]},
+            "expected_revision": config["revision"],
+        }, self.pid)
+        self.assertEqual(self.launch(role="verifier")["profile_id"], self.ds["id"])
+        self.assertEqual(self.launch(role="scout", profile_id="")["profile_id"], "")
+        with self.assertRaisesRegex(WebError, "工作区主模型"):
+            self.app.delete_profile(self.ds["id"])
+
+    def test_binding_reuses_existing_model_configuration(self):
+        folder = self.base / "external"
+        folder.mkdir()
+        bound = self.app.workspaces.bind({"path": str(folder), "model_assignments": {"main": self.glm["id"]}})
+        repeated = self.app.workspaces.bind({"path": str(folder), "model_assignments": {"main": self.ds["id"]}})
+        self.assertEqual(repeated["id"], bound["id"])
+        self.assertEqual(self.app.role_profile_id("worker", {}, workspace_id=bound["id"]), self.glm["id"])
+
+    def test_creation_rejects_invalid_model_before_creating_workspace(self):
+        with self.assertRaises(WebError):
+            self.app.create_project({"name": "invalid-model", "goal": "invalid",
+                                     "model_assignments": {"main": "missing"}})
+        self.assertFalse((self.app.root / "invalid-model").exists())
+
     def test_worker_cli_uses_target_role_and_preserves_explicit_flags(self):
         parent = self.launch(role="commander", profile_id=self.glm["id"])
         self.assign({"scout": self.ds["id"], "general": self.ds["id"]})

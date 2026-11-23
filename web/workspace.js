@@ -116,11 +116,13 @@ async function openBind() {
 
 async function openDirectoryPicker(skillInput = null) {
   const opening=++directoryRequest;
+  const modelFields=$("bind-model-rows");
   skillDirectoryInput=skillInput;
   const forSkill=Boolean(skillInput);
   $("directory-title").textContent=forSkill?"选择 Skill 目录":"选择题目文件夹";
   $("directory-help").textContent=forSkill?"进入包含 SKILL.md 的文件夹后，点击“使用此目录”。":"打开文件夹后，点击“选择此文件夹”。文件保持原位置。";
   $("directory-workspace-fields").hidden=forSkill;
+  modelFields.hidden=modelFields.disabled=true;
   $("directory-filter").hidden=!forSkill;
   $("directory-filter").value="";
   $("directory-select").textContent=forSkill?"使用此目录":"选择此文件夹";
@@ -133,8 +135,12 @@ async function openDirectoryPicker(skillInput = null) {
   $("directory-list").replaceChildren();
   $("directory-status").textContent="正在读取文件夹…";
   $("bind-dialog").showModal();
-  const result = await api(forSkill?"/directories?kind=skill":"/directories");
+  const [result, modelOptions] = await Promise.all([
+    api(forSkill?"/directories?kind=skill":"/directories"),
+    forSkill ? null : newWorkspaceModelOptions(),
+  ]);
   if (opening!==directoryRequest || !$("bind-dialog").open) return;
+  if (modelOptions) renderWorkspaceModelFields(modelFields, modelOptions.config, modelOptions.profiles, {creating: true});
   $("directory-roots").replaceChildren(...result.roots.map((root,index) => {
     const parts=root.split("/").filter(Boolean);
     const label=root==="/"?"文件系统":!forSkill&&index===0?"任务文件夹":parts.at(-1)==="skills"?parts.slice(-2).join("/"):parts.at(-1)||root;
@@ -161,7 +167,9 @@ function directoryBreadcrumbs(path) {
 async function browseDirectory(path) {
   const request=++directoryRequest;
   const forSkill=Boolean(skillDirectoryInput);
+  const modelFields=$("bind-model-rows");
   $("bind-path").value="";
+  modelFields.hidden=modelFields.disabled=true;
   $("directory-select").disabled=true;
   $("directory-status").textContent="正在读取文件夹…";
   $("directory-list").setAttribute("aria-busy","true");
@@ -170,6 +178,8 @@ async function browseDirectory(path) {
     if (request!==directoryRequest) return;
     if (!forSkill) selectedDirectory=data.path;
     $("bind-path").value=!forSkill||data.has_skill?data.path:"";
+    const configureModels = !forSkill && !state.projects.some(project => project.path === data.path);
+    modelFields.hidden=modelFields.disabled=!configureModels;
     directoryBreadcrumbs(data.path);
     $("directory-up").disabled=!data.parent;
     $("directory-up").onclick=()=>guarded(()=>browseDirectory(data.parent));
@@ -534,6 +544,33 @@ $("stop-workspace").onclick=()=>guarded(async()=>{
   if(!await confirmAction("停止本工作区登记的角色和 watchdog？其他工作区不受影响，原图与会话历史保留。"))return;
   await workspaceApi("stop",{method:"POST",body:{}});await refreshTask();toast("已停止本工作区角色");
 });
+function openDeleteWorkspace(project){
+  const form=$("delete-workspace-form");form.reset();
+  form.elements.id.value=project.id;
+  $("delete-workspace-intro").textContent=`从列表中删除“${project.name}”（${project.path}）？`;
+  $("delete-workspace-name").textContent=project.name;
+  $("delete-workspace-files-label").hidden=!project.inside_root;
+  $("delete-workspace-external").hidden=!!project.inside_root;
+  $("delete-workspace-confirm-label").hidden=true;
+  $("delete-workspace-dialog").showModal();
+}
+$("delete-workspace").onclick=()=>{if(state.project)openDeleteWorkspace(state.project);};
+$("delete-workspace-form").elements.delete_files.onchange=event=>{
+  $("delete-workspace-confirm-label").hidden=!event.target.checked;
+  $("delete-workspace-form").elements.confirm_name.required=event.target.checked;
+};
+submit("delete-workspace-form",async form=>{
+  const pid=form.get("id"),deleteFiles=form.get("delete_files")==="on";
+  const project=state.projects.find(p=>p.id===pid);
+  if(deleteFiles&&form.get("confirm_name")!==project?.name)throw new Error("输入的名称与工作区名称不一致");
+  const result=await api(`/workspaces/${pid}/delete`,{method:"POST",body:{delete_files:deleteFiles,confirm_name:form.get("confirm_name")||""}});
+  $("delete-workspace-dialog").close();
+  state.projects=state.projects.filter(p=>p.id!==pid);
+  try{if(localStorage.getItem("sapper-project")===pid)localStorage.removeItem("sapper-project");}catch{}
+  state.overviewSignature=null;state.projectListSignature=null;
+  if(state.project?.id===pid)await showOverview();else await refreshProjects();
+  toast(result.files_deleted?"工作区及其目录已删除":"工作区已从列表移除，文件保留");
+});
 $("workspace-file-up").onclick=()=>{const parts=state.workspaceFolder.split("/");parts.pop();state.workspaceFolder=parts.join("/")||".";guarded(workspaceFiles);};
 $("native-pane").onchange=()=>selectNative($("native-pane").value);
 $("terminal-control").onclick=()=>guarded(async()=>{
@@ -554,7 +591,9 @@ submit("bind-form",async form=>{
     $("bind-dialog").close();
     return;
   }
-  const p=await api("/workspaces/bind",{method:"POST",body:Object.fromEntries(form)});
+  const body = {path: form.get("path"), name: form.get("name"), goal: form.get("goal")};
+  if (!$("bind-model-rows").disabled) body.model_assignments = readWorkspaceModelFields($("bind-model-rows"));
+  const p=await api("/workspaces/bind",{method:"POST",body});
   $("bind-dialog").close();
   state.projects = [...state.projects.filter(project => project.id !== p.id), p];
   await openProject(p,"workspace");openAgent("commander");toast("已打开工作区，请确认初步配置");

@@ -36,6 +36,56 @@ class ConsoleTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_create_project_uses_workspace_name_as_title(self):
+        named = self.app.create_project({"title": "登录绕过分析", "goal": "Find the bypass"})
+        self.assertEqual(named["name"], "登录绕过分析")
+        self.assertRegex(named["directory"], r"^workspace-[0-9a-f]{8}$")
+        explicit = self.app.create_project({"title": "Web 审计", "name": "web-audit", "goal": "Audit"})
+        self.assertEqual((explicit["name"], explicit["directory"]), ("Web 审计", "web-audit"))
+        derived = self.app.create_project({"title": "Reverse Lab", "goal": "Reverse"})
+        self.assertEqual(derived["directory"], "Reverse-Lab")
+        self.assertEqual((self.project["name"], self.project["directory"]), ("first", "first"))
+        reloaded = Console(self.app.root, self.app.state).project(named["id"])
+        self.assertEqual(reloaded["name"], "登录绕过分析")
+        with self.assertRaises(WebError):
+            self.app.create_project({"goal": "no name"})
+
+    def test_delete_workspace_hides_or_removes_files_and_unbinds_external(self):
+        from sapper_workspace import WorkspaceError
+        temp = self.app.create_project({"title": "临时", "name": "temp", "goal": "remove me"})
+        with self.app.config_lock():
+            cfg = self.app.config()
+            self.app.set_workspace_models(cfg, temp["id"], {"main": ""})
+            private_json(self.app.config_path, cfg)
+        result = self.app.workspaces.delete_workspace(temp["id"], {})
+        self.assertFalse(result["files_deleted"])
+        self.assertTrue(Path(temp["path"]).is_dir())
+        self.assertNotIn(temp["id"], [p["id"] for p in self.app.projects()])
+        self.assertNotIn(temp["id"], self.app.config().get("workspace_role_profiles", {}))
+        rebound = self.app.workspaces.bind({"path": temp["path"]})
+        self.assertEqual(rebound["id"], temp["id"])
+        self.assertIn(temp["id"], [p["id"] for p in self.app.projects()])
+        self.assertNotIn(temp["path"], self.app.config().get("hidden_workspaces", []))
+
+        with self.assertRaises(WorkspaceError):
+            self.app.workspaces.delete_workspace(temp["id"], {"delete_files": True, "confirm_name": "wrong"})
+        self.assertTrue(Path(temp["path"]).is_dir())
+        self.app.workspaces.delete_workspace(temp["id"], {"delete_files": True, "confirm_name": "临时"})
+        self.assertFalse(Path(temp["path"]).exists())
+        self.assertNotIn(temp["id"], [p["id"] for p in self.app.projects()])
+
+        outside = self.base / "outside"
+        outside.mkdir()
+        bound = self.app.workspaces.bind({"path": str(outside)})
+        listed = next(p for p in self.app.projects() if p["id"] == bound["id"])
+        self.assertFalse(listed["inside_root"])
+        with self.assertRaises(WorkspaceError):
+            self.app.workspaces.delete_workspace(bound["id"], {"delete_files": True, "confirm_name": listed["name"]})
+        self.app.workspaces.delete_workspace(bound["id"], {})
+        self.assertTrue(outside.is_dir())
+        self.assertNotIn(bound["id"], [p["id"] for p in self.app.projects()])
+        self.assertIn(self.pid, [p["id"] for p in self.app.projects()])
+
     def test_graph_writes_use_original_schema_and_confirmation(self):
         fact = self.app.graph_action(self.pid, "fact", {"description": "confirmed input", "kind": "note"})
         intent = self.app.graph_action(self.pid, "intent", {"from": [fact["id"]], "description": "check result", "requires_confirmation": True})
@@ -485,6 +535,24 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.request(path + "/resume", "POST", {})[0], 404)
         self.assertEqual(self.request(path, "DELETE")[0], 200)
         self.assertEqual(self.request("/api/agents/" + "b" * 16, "DELETE")[0], 404)
+
+    def test_delete_workspace_over_http_stops_roles_and_respects_csrf(self):
+        project = self.app.create_project({"title": "删除我", "name": "delete-ws", "goal": "test workspace deletion"})
+        aid = "c" * 16
+        self.app.workspaces.save_agent({"id": aid, "workspace_id": project["id"],
+            "role": "worker", "created_at": sapper.now_iso(), "desired_state": "running"})
+        path = f"/api/workspaces/{project['id']}/delete"
+        self.assertEqual(self.request(path, "POST", {})[0], 401)
+        self.login()
+        self.assertEqual(self.request(path, "POST", {}, headers={"X-Sapper-CSRF": "wrong"})[0], 403)
+        self.assertEqual(self.request(path, "POST", {"delete_files": True, "confirm_name": "wrong"})[0], 400)
+        status, _, body = self.request(path, "POST", {"delete_files": True, "confirm_name": "删除我"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["deleted_agents"], [aid])
+        self.assertFalse(Path(project["path"]).exists())
+        self.assertTrue(self.app.workspaces.agent(aid, include_deleted=True)["deleted_at"])
+        status, _, body = self.request("/api/projects")
+        self.assertFalse(any(p["id"] == project["id"] for p in json.loads(body)))
 
     def test_run_extension_requires_auth_csrf_and_active_budget(self):
         rid = "a" * 16

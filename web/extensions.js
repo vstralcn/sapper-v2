@@ -237,6 +237,7 @@ async function loadWorkspaceSettings(pid) {
   const data = await api(`/workspaces/${pid}/role-models`);
   if (request !== workspaceSettingsRequest || pid !== extensionWorkspace) return;
   workspaceModelConfig = data;
+  $("workspace-model-rows").replaceChildren();
   renderWorkspaceModels();
   if (extensionLibrary) extensionOptions("extensions-default-options", extensionLibrary, extensionLibrary.workspaces[pid] || {mcp_ids: [], skill_ids: []});
   $("workspace-model-status").textContent = "已读取工作区角色模型。";
@@ -245,22 +246,7 @@ async function loadWorkspaceSettings(pid) {
 }
 function renderWorkspaceModels(preserve = false) {
   if (!workspaceModelConfig) return;
-  const prior = new Map([...$("workspace-model-rows").querySelectorAll("select")].map(s => [s.name, s.value]));
-  $("workspace-model-rows").replaceChildren(...workspaceModelConfig.roles.map(role => {
-    const row = element("div", "role-model-row");
-    const label = element("label", "", role.label);
-    const select = document.createElement("select"); select.id = `workspace-model-${role.id}`; select.name = role.id; label.htmlFor = select.id;
-    const globalId = workspaceModelConfig.global_assignments[role.id];
-    const globalProfile = state.profiles.find(p => p.id === globalId);
-    const globalLabel = globalId === undefined ? "原有继承规则" : globalId === "" ? "原环境" : globalProfile ? modelConnectionLabel(globalProfile) : "连接已失效";
-    select.append(profileOption(ROLE_RULE, `继承全局：${globalLabel}`), profileOption("", "此工作区继承原环境"));
-    for (const profile of state.profiles.filter(p => !p.engine_prefix)) select.append(profileOption(profile.id, modelConnectionLabel(profile)));
-    const value = preserve && prior.has(role.id) ? prior.get(role.id) : workspaceModelConfig.assignments[role.id] ?? ROLE_RULE;
-    if (![...select.options].some(o => o.value === value)) select.append(profileOption(value, "连接已失效，请重新分配"));
-    select.value = value;
-    select.onchange = () => { workspaceModelsDirty = true; $("workspace-model-status").textContent = "有未保存的工作区模型。"; };
-    row.append(label, select); return row;
-  }));
+  renderWorkspaceModelFields($("workspace-model-rows"), workspaceModelConfig, state.profiles, {preserve});
 }
 async function saveExtensionAction(data) {
   if (!extensionLibrary) throw new Error("请先等待资源读取完成");
@@ -289,6 +275,10 @@ $("workspace-model-reload").onclick = () => guarded(async () => {
   renderWorkspaceModels();
   $("workspace-model-status").textContent = "已读取工作区角色模型。";
 });
+$("workspace-model-rows").onchange = () => {
+  workspaceModelsDirty = true;
+  $("workspace-model-status").textContent = "有未保存的工作区模型。";
+};
 $("extensions-reload").onclick = () => guarded(() => reloadExtensionLibrary(false));
 $("extensions-default-options").onchange = () => {
   workspaceResourcesDirty = true; $("extensions-selection-status").textContent = "有未保存的资源选择。";
@@ -322,10 +312,10 @@ submit("extensions-defaults-form", async () => {
   toast("工作区资源已保存，将用于新启动的角色");
   if ($("agent-dialog").open && state.project?.id === pid && $("agent-extensions-default").checked) await loadAgentExtensions();
 });
-submit("workspace-model-form", async form => {
+submit("workspace-model-form", async () => {
   const pid = extensionWorkspace;
   if (!pid || !workspaceModelConfig) throw new Error("请先等待读取工作区模型");
-  const assignments = Object.fromEntries([...form].filter(([, value]) => value !== ROLE_RULE));
+  const assignments = readWorkspaceModelFields($("workspace-model-rows"));
   const data = await api(`/workspaces/${pid}/role-models`, {method: "POST", body: {assignments, expected_revision: workspaceModelConfig.revision}});
   if (pid === extensionWorkspace) { workspaceModelConfig = data; workspaceModelsDirty = false; renderWorkspaceModels(); $("workspace-model-status").textContent = "工作区模型已保存。"; }
   if (state.project?.id === pid) { agentWorkspaceModels = {pid, ...data}; refreshAgentModelOptions(); }

@@ -87,7 +87,7 @@
           </select>
         </div>
         <div class="workspaces-table" tabindex="0" role="region" aria-label="工作区列表">
-          <table><thead><tr><th scope="col">工作区与目标</th><th scope="col">目标状态</th><th scope="col">待处理</th><th scope="col">最近带证据的事实</th></tr></thead>
+          <table><thead><tr><th scope="col">工作区与目标</th><th scope="col">目标状态</th><th scope="col">待处理</th><th scope="col">最近带证据的事实</th><th scope="col">操作</th></tr></thead>
             <tbody id="workspaces-rows"></tbody></table>
         </div>
       </section>
@@ -121,6 +121,7 @@
                   <label class="inline-check workspace-flag-option"><input id="auto-submit-flags" type="checkbox" aria-describedby="flag-submission-help">AI 主动提交 flag</label>
                   <p id="flag-submission-help" class="field-help">默认关闭；关闭时仅记录，仍可按明确指令提交。</p>
                   <button id="stop-workspace" class="danger">停止本工作区</button>
+                  <button id="delete-workspace" class="danger">删除工作区</button>
                 </div>
               </div>
             </details>
@@ -182,6 +183,16 @@
     <p class="field-help">关闭后停止后续注入，已进入会话历史的内容会保留。SSH 认证继续使用原环境配置。</p>
     <div class="dialog-actions"><button id="context-reload" class="button" type="button">重新读取</button><button class="button primary" type="submit">保存全局配置</button></div>
   </form></dialog>
+  <dialog id="delete-workspace-dialog"><form id="delete-workspace-form">
+    <div class="dialog-heading"><h2>删除工作区</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div>
+    <input type="hidden" name="id">
+    <p id="delete-workspace-intro" class="dialog-intro"></p>
+    <p class="field-help">会先停止并删除本工作区登记的角色和 watchdog，再从任务列表移除；未登记的已有终端不会被关闭。</p>
+    <label id="delete-workspace-files-label" class="inline-check"><input type="checkbox" name="delete_files"> 同时删除目录及其中所有文件（包括 .sapper 事实图，不可恢复）</label>
+    <p id="delete-workspace-external" class="field-help" hidden>该目录不在工作根目录内，只会从列表中移除，文件保留；之后可通过“打开题目目录”重新接入。</p>
+    <label id="delete-workspace-confirm-label" hidden><span>请输入工作区名称 <strong id="delete-workspace-name"></strong> 以确认</span><input name="confirm_name" autocomplete="off"></label>
+    <div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">删除工作区</button></div>
+  </form></dialog>
   <dialog id="confirm-dialog"><div class="dialog-heading"><h2>确认操作</h2></div><p id="confirm-message" class="dialog-intro"></p><div class="dialog-actions"><button id="confirm-cancel" class="button" type="button">取消</button><button id="confirm-accept" class="button primary" type="button">确认操作</button></div></dialog>
   <dialog id="bind-dialog" class="wide-dialog" aria-labelledby="directory-title"><form id="bind-form">
     <div class="dialog-heading"><h2 id="directory-title">选择题目文件夹</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div>
@@ -195,6 +206,7 @@
     </div>
     <p id="directory-status" class="field-help" role="status" aria-live="polite"></p>
     <div id="directory-workspace-fields" class="form-row"><label>显示名称 <span class="muted">选填</span><input name="name"></label><label>任务目标 <span class="muted">选填</span><input name="goal"></label></div>
+    <fieldset id="bind-model-rows" class="workspace-model-fields" hidden disabled></fieldset>
     <p class="field-help">这里显示运行 sapper 的机器上的文件夹。</p>
     <div class="dialog-actions"><button class="button dialog-close" type="button">取消</button><button id="directory-select" class="button primary" type="submit" disabled>选择此文件夹</button></div>
   </form></dialog>
@@ -220,7 +232,16 @@
   <dialog id="agent-message-dialog"><form id="agent-message-form"><div class="dialog-heading"><h2 id="agent-message-title">给角色补充说明</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div><textarea id="agent-message-text" required rows="5" aria-label="角色消息"></textarea><p id="agent-message-help" class="field-help">发送到选定角色的真实终端，不代表模型已读取或采用。</p><div class="dialog-actions"><button class="button primary" type="submit">发送说明</button></div></form></dialog>
   <dialog id="attach-agent-dialog"><form id="attach-agent-form"><div class="dialog-heading"><h2>登记已有角色</h2><button class="dialog-close icon-button" type="button" aria-label="关闭">×</button></div><input name="pane_id" type="hidden"><label>实际职责<select name="role"><option value="worker">执行者</option><option value="commander">指挥官</option><option value="general">将军</option><option value="scout">侦察兵</option><option value="verifier">验证者</option><option value="custom">自定义职责</option></select></label><label>显示名称<input name="name"></label><label>短目标 <span class="muted">选填，最多 18 字</span><input name="task_label" maxlength="18" placeholder="例如 验证登录绕过"></label><label>已知 Claude 会话 UUID <span class="muted">未知请留空</span><input name="claude_session_id"></label><p class="field-help">不移动目录、不重启会话。未知 ID 不会用“最近会话”猜测恢复。旧 watchdog 继续按原规则运行。</p><div class="dialog-actions"><button class="button primary" type="submit">登记</button></div></form></dialog>
 
-  <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><h2>新建任务</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">在工作根目录创建一个目录，使用原 sapper 初始化事实图。</p><label>目录名<input name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,63}" placeholder="例如 reverse-analysis"></label><label>任务目标<textarea name="goal" required rows="3" placeholder="描述要解决的问题与期望结果"></textarea></label><label>已有资料与约束 <span class="muted">选填</span><textarea name="context" rows="3" placeholder="将保存为原 hint"></textarea></label><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">创建任务</button></div></form></dialog>
+  <dialog id="create-dialog"><form id="create-form">
+    <div class="dialog-heading"><h2>新建任务</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div>
+    <p class="dialog-intro">在工作根目录创建一个目录，使用原 sapper 初始化事实图。</p>
+    <label>工作区名称<input name="title" required maxlength="64" placeholder="例如 登录绕过分析"><span class="field-help">显示在任务列表和概览中的标题。</span></label>
+    <label>目录名 <span class="muted">选填</span><input name="name" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}" placeholder="留空则按工作区名称自动生成"><span class="field-help">仅限英文字母、数字、点、横线或下划线。</span></label>
+    <label>任务目标<textarea name="goal" required rows="3" placeholder="描述要解决的问题与期望结果"></textarea></label>
+    <label>已有资料与约束 <span class="muted">选填</span><textarea name="context" rows="3" placeholder="将保存为原 hint"></textarea></label>
+    <div id="create-model-rows" class="workspace-model-fields"></div>
+    <div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">创建任务</button></div>
+  </form></dialog>
 
   <dialog id="run-dialog"><form id="run-form"><div class="dialog-heading"><h2>启动原 agent</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">在独立 tmux 会话调用原命令。页面关闭后继续运行。</p><div class="form-row"><label>运行方式<select name="kind" id="run-kind"><option value="auto">sapper auto · 自主推进</option><option value="dispatch">sapper dispatch · 单步调度</option><option value="shell">交互式终端</option><option value="custom">自定义原命令</option></select></label><label>模型配置<select name="profile_id" id="run-profile"><option value="">继承原环境</option></select></label></div><div id="auto-options" class="form-row"><label>运行时长（分钟）<input name="minutes" type="number" min="1" max="1440" value="10"></label><label>最多步骤<input name="max_steps" type="number" min="1" max="1000" value="8"></label></div><label id="dispatch-options" hidden>调度目标<input name="target" value="reason" placeholder="reason / verify / intent ID"></label><label id="custom-options" hidden>原命令<input name="command" placeholder="例如 sapper status；参数按原样传递"><span class="field-help">按参数列表执行。需要管道时显式使用 bash -lc；密钥请放环境或配置中。</span></label><div id="agent-options" class="checkbox-group"><label><input type="checkbox" name="skip_permissions"> 允许角色执行命令、修改文件等操作时跳过逐次审批</label><label><input type="checkbox" name="verify"> auto 后验证</label><label><input type="checkbox" name="dry_run"> 试运行／仅输出提示词</label></div><p class="field-help">未勾选的参数不会被默认添加；引擎、工具与提示词仍由原 sapper 决定。</p><p id="run-permission-warning" class="field-help" role="status" hidden></p><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">启动</button></div></form></dialog>
 
@@ -279,8 +300,8 @@
       <label class="settings-workspace-picker">当前配置的工作区<select id="settings-workspace"></select><span id="settings-workspace-path" class="field-help"></span></label>
       <div id="settings-workspace-empty" class="empty-list" hidden>还没有工作区。创建或打开题目目录后，即可配置使用的资源。</div>
       <div id="settings-workspace-content" hidden>
-        <section class="workspace-settings-section"><div class="panel-heading"><h3>角色模型</h3><span class="muted">未指定时继承全局</span></div><p class="field-help">优先级：本次指定 › 工作区角色模型 › 全局角色模型 › 原有继承规则。</p>
-          <form id="workspace-model-form"><div id="workspace-model-rows"></div><p id="workspace-model-status" class="field-help" role="status"></p><div class="dialog-actions"><button id="workspace-model-reload" class="button" type="button">重新读取</button><button type="submit" class="button primary">保存工作区模型</button></div></form>
+        <section class="workspace-settings-section"><div class="panel-heading"><h3>角色模型</h3></div><p class="field-help">新会话默认使用主模型，单独设置的角色优先使用指定连接。</p>
+          <form id="workspace-model-form"><div id="workspace-model-rows" class="workspace-model-fields"></div><p id="workspace-model-status" class="field-help" role="status"></p><div class="dialog-actions"><button id="workspace-model-reload" class="button" type="button">重新读取</button><button type="submit" class="button primary">保存工作区模型</button></div></form>
         </section>
         <section class="workspace-settings-section"><div class="panel-heading"><h3>MCP 与 Skills</h3><div><button type="button" id="extensions-select-all" class="text-button">全部启用</button><button type="button" id="extensions-select-none" class="text-button">全部关闭</button></div></div><p class="field-help">只加载勾选的资源。已有会话恢复时继续使用原快照。</p>
           <form id="extensions-defaults-form"><div id="extensions-default-options"></div><p id="extensions-selection-status" class="field-help" role="status"></p><div class="dialog-actions"><button id="extensions-reload" type="button" class="button">重新读取</button><button class="button primary" type="submit">保存资源选择</button></div></form>

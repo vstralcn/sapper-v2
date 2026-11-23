@@ -260,8 +260,10 @@ class Console:
                     project = store.load_project()
                     summary = graph_summary(store)
                 rel = str(here.relative_to(self.root))
+                title = project.get("name")
                 found.append({"id": hashlib.sha256(rel.encode()).hexdigest()[:16],
-                              "name": here.name, "path": str(here), "relative_path": rel,
+                              "name": title.strip() if isinstance(title, str) and title.strip() else here.name,
+                              "directory": here.name, "path": str(here), "relative_path": rel,
                               "goal": project["goal"], "status": project["status"],
                               "created_at": project.get("created_at"),
                               **summary})
@@ -272,10 +274,26 @@ class Console:
         return sorted(found, key=lambda p: p.get("created_at") or "", reverse=True)
 
     def projects(self):
-        found = {p["path"]: {**p, "enabled": True, "mode": "legacy"} for p in self._scan_projects()}
+        # Deleting a workspace without its files hides the scanned directory;
+        # binding the same directory again makes it visible.
+        hidden = set(self.config().get("hidden_workspaces", []))
+        found = {p["path"]: {**p, "enabled": True, "mode": "legacy"}
+                 for p in self._scan_projects() if p["path"] not in hidden}
         for bound in self.workspaces.bound_projects():
             found[bound["path"]] = bound
+        for p in found.values():
+            p["inside_root"] = self.inside_root(p["path"])
         return sorted(found.values(), key=lambda p: p.get("created_at") or "", reverse=True)
+
+    def inside_root(self, path):
+        """True for a directory strictly below the work root, safe to remove."""
+        try:
+            here, root = Path(path), self.root.resolve()
+            resolved = here.resolve()
+        except OSError:
+            return False
+        return (not here.is_symlink() and resolved != root and resolved.is_relative_to(root)
+                and not resolved.is_relative_to(self.state.resolve()))
 
     def project(self, pid):
         for p in self.projects():
@@ -316,20 +334,45 @@ class Console:
         return sapper_evidence.provenance(source, commands, items, cwd)
 
     def create_project(self, data):
-        name = require_text(data, "name", 64)
+        # `title` is the workspace name shown in the UI; `name` is the directory.
+        # Either may be omitted: the title falls back to the directory name and
+        # the directory is derived from the title when left empty.
+        title = require_text(data, "title", 64) if data.get("title") else ""
+        if data.get("name"):
+            name = require_text(data, "name", 64)
+        elif title:
+            name = re.sub(r"[^A-Za-z0-9_.-]+", "-", title).strip("-_.")[:64].rstrip("-_.")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
+                name = "workspace-" + secrets.token_hex(4)
+        else:
+            raise WebError("请填写工作区名称")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
             raise WebError("目录名请使用英文字母、数字、点、横线或下划线")
+        title = title or name
         goal = require_text(data, "goal")
         path = self.inside(self.root / name)
-        if path.exists():
-            raise WebError("目录已存在；已有图会自动出现在任务列表，请勿重复初始化", 409)
-        path.mkdir()
-        store = sapper.Store(path / ".sapper")
-        store.init("web", goal)
-        if data.get("context"):
-            store.add_hint(require_text(data, "context"), "web-user")
-        self.audit("project.created", name=name)
-        return next(p for p in self.projects() if p["path"] == str(path))
+        context = require_text(data, "context") if data.get("context") else ""
+        with self.config_lock():
+            if path.exists():
+                raise WebError("目录已存在；已有图会自动出现在任务列表，请勿重复初始化", 409)
+            cfg = self.config()
+            assignments = self.new_workspace_models(cfg, data)
+            path.mkdir()
+            store = sapper.Store(path / ".sapper")
+            store.init("web", goal)
+            if title != name:
+                with store.locked():
+                    meta = store.load_project()
+                    meta["name"] = title
+                    store.save_project(meta)
+            if context:
+                store.add_hint(context, "web-user")
+            project = next(p for p in self.projects() if p["path"] == str(path))
+            if assignments is not None:
+                self.set_workspace_models(cfg, project["id"], assignments)
+                private_json(self.config_path, cfg)
+        self.audit("project.created", name=name, title=title)
+        return project
 
     def graph(self, pid):
         store = self.store(pid)
@@ -398,43 +441,70 @@ class Console:
         cfg = self.config()
         return {"assignments": cfg.get("workspace_role_profiles", {}).get(pid, {}) if pid is not None else cfg.get("role_profiles", {}),
                 "global_assignments": cfg.get("role_profiles", {}),
+                "effective_assignments": self.role_model_defaults(cfg, pid),
                 "revision": cfg.get("role_profiles_revision", 0),
                 "roles": [{"id": role, "label": label} for role, label in ROLES.items()]}
+
+    @staticmethod
+    def validate_role_assignments(cfg, assignments, *, workspace=False):
+        allowed = set(ROLES)
+        if workspace:
+            allowed.add("main")
+        if not isinstance(assignments, dict) or assignments.keys() - allowed:
+            raise WebError("角色模型配置格式不正确")
+        profiles = {p["id"]: p for p in cfg["profiles"]}
+        for value in assignments.values():
+            if not isinstance(value, str):
+                raise WebError("请选择已保存的模型连接")
+            if value and value not in profiles:
+                raise WebError("模型连接已不存在，请重新选择", 409)
+            if value and profiles[value].get("engine_prefix"):
+                raise WebError("默认模型不能使用 CLI 包装器，请选择普通模型连接")
+
+    def new_workspace_models(self, cfg, data):
+        if "model_assignments" not in data:
+            return None
+        assignments = data["model_assignments"]
+        self.validate_role_assignments(cfg, assignments, workspace=True)
+        if "main" not in assignments:
+            raise WebError("请选择工作区主模型")
+        return assignments
+
+    @staticmethod
+    def set_workspace_models(cfg, pid, assignments):
+        cfg.setdefault("workspace_role_profiles", {})[pid] = assignments
+        cfg["role_profiles_revision"] = cfg.get("role_profiles_revision", 0) + 1
+
+    @staticmethod
+    def role_model_defaults(cfg, workspace_id):
+        local = cfg.get("workspace_role_profiles", {}).get(workspace_id, {})
+        base = dict.fromkeys(ROLES, local["main"]) if "main" in local else cfg.get("role_profiles", {})
+        return {**base, **{role: value for role, value in local.items() if role != "main"}}
 
     def save_role_models(self, data, pid=None):
         if pid is not None:
             self.project(pid)
         assignments = data.get("assignments")
-        roles = ROLES
-        if not isinstance(assignments, dict) or any(role not in roles for role in assignments):
-            raise WebError("角色模型配置格式不正确")
-        if any(not isinstance(value, str) for value in assignments.values()):
-            raise WebError("请选择已保存的模型连接")
         with self.config_lock():
             cfg = self.config()
             revision = cfg.get("role_profiles_revision", 0)
             if type(data.get("expected_revision")) is not int or data["expected_revision"] != revision:
                 raise WebError("角色模型已被其他页面更新，请重新读取后再保存；当前选择仍保留", 409)
-            profiles = {p["id"]: p for p in cfg["profiles"]}
-            for value in assignments.values():
-                if value and value not in profiles:
-                    raise WebError("模型连接已不存在，请重新选择", 409)
-                if value and profiles[value].get("engine_prefix"):
-                    raise WebError("角色默认模型不能使用 CLI 包装器，请选择普通模型连接")
+            self.validate_role_assignments(cfg, assignments, workspace=pid is not None)
             # Missing entries follow the original inheritance rule. Empty entries
             # explicitly use the environment, even for children of another model.
             if pid is None:
                 cfg["role_profiles"] = assignments
+                cfg["role_profiles_revision"] = revision + 1
             else:
-                cfg.setdefault("workspace_role_profiles", {})[pid] = assignments
-            cfg["role_profiles_revision"] = revision + 1
+                self.set_workspace_models(cfg, pid, assignments)
             private_json(self.config_path, cfg)
         self.audit("role_models.saved", workspace=pid, revision=revision + 1, assignments=assignments)
         return self.role_models(pid)
 
     def role_profile_id(self, role, data, fallback="", *, workspace_id=None):
         cfg = self.config()
-        defaults = {**cfg.get("role_profiles", {}), **cfg.get("workspace_role_profiles", {}).get(workspace_id, {})}
+        defaults = self.role_model_defaults(cfg, workspace_id)
         value = data["profile_id"] if "profile_id" in data else defaults.get(role, fallback)
         if not isinstance(value, str):
             raise WebError("模型连接 ID 必须为文本")
@@ -502,6 +572,8 @@ class Console:
     def delete_profile(self, pid):
         with self.config_lock():
             cfg = self.config()
+            if any(models.get("main") == pid for models in cfg.get("workspace_role_profiles", {}).values()):
+                raise WebError("该连接用于工作区主模型，请先在工作区配置中重新分配", 409)
             used = [label for role, label in ROLES.items()
                     if cfg.get("role_profiles", {}).get(role) == pid or any(
                         assignments.get(role) == pid for assignments in cfg.get("workspace_role_profiles", {}).values())]
@@ -1363,6 +1435,8 @@ class Handler(BaseHTTPRequestHandler):
                             return self.reply(201, app.workspaces.start_watchdog(wid))
                         if action == "stop":
                             return self.reply(200, app.workspaces.stop_workspace(wid))
+                        if action == "delete":
+                            return self.reply(200, app.workspaces.delete_workspace(wid, data))
             if re.fullmatch(r"/api/agents/[a-f0-9]{16}", path) and method == "DELETE":
                 return self.reply(200, app.workspaces.delete_agent(path.rsplit("/", 1)[1]))
             if path.startswith("/api/agents/") and method == "POST":

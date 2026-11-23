@@ -123,8 +123,9 @@ function renderProjects() {
     const item = button("", "project-item" + (project.id === state.project?.id ? " active" : ""), async () => {
       await guarded(() => openProject(project));
     });
-    item.append(element("span", "task-title", project.goal), element("span", "task-meta", `${project.name}  /  ${project.facts} 条事实`));
-    item.title = project.goal;
+    const directory = project.directory && project.directory !== project.name ? `${project.directory}  /  ` : "";
+    item.append(element("span", "task-title", project.name), element("span", "task-meta", `${directory}${project.facts} 条事实`));
+    item.title = project.goal || project.name;
     list.append(item);
   }
 }
@@ -513,7 +514,10 @@ $("profiles-dialog").addEventListener("close", () => {
   $("password-error").textContent = "";
 });
 submit("create-form", async data => {
-  const result = await api("/projects", {method: "POST", body: Object.fromEntries(data)});
+  const result = await api("/projects", {method: "POST", body: {
+    title: data.get("title").trim(), name: data.get("name").trim(), goal: data.get("goal"), context: data.get("context"),
+    model_assignments: readWorkspaceModelFields($("create-model-rows")),
+  }});
   state.projects = [...state.projects.filter(project => project.id !== result.id), result];
   $("create-dialog").close();
   $("create-form").reset();
@@ -569,7 +573,7 @@ submit("profile-form", async data => {
 });
 submit("knowledge-form", loadKnowledge);
 
-$("new-project").onclick = $("empty-create").onclick = () => $("create-dialog").showModal();
+$("new-project").onclick = $("empty-create").onclick = () => guarded(openCreateWorkspace);
 $("refresh-projects").onclick = () => guarded(() => refreshProjects());
 $("open-shell").onclick = () => openRun("shell");
 $("run-kind").onchange = updateRunOptions;
