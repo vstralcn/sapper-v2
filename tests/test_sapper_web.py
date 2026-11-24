@@ -622,6 +622,55 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.request(path, "POST", {"auto_submit_flags": False})[0], 200)
         self.assertIn("OFF: record flags", reloaded.workspaces.role_info(project["id"], "worker")["prompt"])
 
+    def test_competition_roster_links_intents_and_only_accepted_receipts_finish_tasks(self):
+        project = self.app.create_project({"name": "contest", "goal": "fixture competition"})
+        other = self.app.create_project({"name": "other-contest", "goal": "fixture isolation"})
+        pid = project["id"]
+        root = Path(project["path"])
+        (root / "round" / "Web" / "Mirror").mkdir(parents=True)
+        (root / "round" / "Pwn" / "Echo").mkdir(parents=True)
+        path = f"/api/workspaces/{pid}/competition"
+        config = {"directory": "round", "complete": True}
+        self.assertEqual(self.request(path, "POST", config)[0], 401)
+        self.login()
+        self.assertEqual(self.request(path, "POST", config, {"X-Sapper-CSRF": "bad"})[0], 403)
+        self.assertEqual(self.request(path, "POST", config)[0], 200)
+        self.assertEqual(self.request(path, "POST", config)[0], 200)
+        graph_path = f"/api/projects/{pid}/graph"
+        board = json.loads(self.request(graph_path)[2])["competition"]
+        self.assertTrue(board["complete"])
+        tasks = {task["id"]: task for task in board["tasks"]}
+        self.assertEqual(set(tasks), {"Web/Mirror", "Pwn/Echo"})
+        self.assertEqual(tasks["Web/Mirror"]["category"], "Web")
+        self.assertEqual(tasks["Web/Mirror"]["intent_ids"], [])
+        self.assertEqual(tasks["Web/Mirror"]["receipt"], None)
+        self.assertNotIn("competition", json.loads(self.request(f"/api/projects/{other['id']}/graph")[2]))
+
+        store = self.app.store(pid)
+        fact = store.add_fact("题面已导入", "test", kind="note")
+        payload = {"description": "核对附件", "from": [fact["id"]], "competition_challenge": "Web/Mirror"}
+        status, _, body = self.request(f"/api/projects/{pid}/intent", "POST", payload)
+        self.assertEqual(status, 200)
+        intent = json.loads(body)
+        self.assertEqual(self.request(f"/api/projects/{pid}/intent", "POST",
+                                      {**payload, "competition_challenge": "missing"})[0], 400)
+        store.claim_intent(intent["id"], "test")
+        store.conclude_with_new_fact(intent["id"], "子任务结单", "test")
+        captured = store.add_fact("fixture sensitive value", "test", kind="flag",
+                                  data={"challenge": "Web/Mirror", "status": "recorded", "value": "private"})
+
+        def mirror():
+            rows = json.loads(self.request(graph_path)[2])["competition"]["tasks"]
+            return next(task for task in rows if task["id"] == "Web/Mirror")
+
+        self.assertEqual(mirror()["intent_ids"], [intent["id"]])
+        self.assertIsNone(mirror()["receipt"])
+        store.update_flag_fact(captured["id"], "rejected", '{"correct": false}')
+        self.assertEqual(mirror()["receipt"]["status"], "rejected")
+        store.update_flag_fact(captured["id"], "submitted", '{"correct": true}')
+        self.assertEqual(mirror()["receipt"]["status"], "submitted")
+        self.assertNotIn("private", json.dumps(mirror()))
+
     def test_delete_role_requires_auth_and_csrf_and_removes_it_from_lists(self):
         project = self.app.create_project({"name": "delete-role", "goal": "test deletion"})
         aid = "a" * 16

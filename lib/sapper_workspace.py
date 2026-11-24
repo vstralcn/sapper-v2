@@ -25,7 +25,7 @@ import sapper_roles
 from sapper_permission_audit import permission_audit
 from sapper_processes import RunProcesses
 from sapper_extensions import AgentExtensions, ExtensionError, REQUIRED_FLAGS
-from sapper_commander import CommanderMonitor, WatchdogLog, timestamp
+from sapper_commander import CommanderMonitor, WorkerMonitor, WatchdogLog, timestamp
 from sapper_chat import ChatJournal, NativeConversation
 
 REPO = Path(__file__).resolve().parent.parent
@@ -56,6 +56,7 @@ def agent_observation(agent, pane):
     event = stamp(current.get("last_event_at"))
     started = max(stamp(agent.get(k)) for k in ("created_at", "updated_at"))
     phase = current.get("phase") if event and event >= started else None
+    waiting_for_input = phase == "waiting_user" or monitor.get("control") == "waiting_user"
     exit_code = agent.get("exit_code")
     failed = (status in ("failed", "timed_out") or
               (status in TERMINAL_STATES and type(exit_code) is int and exit_code != 0) or
@@ -64,7 +65,7 @@ def agent_observation(agent, pane):
     if failed:
         execution = "error"
         evidence = agent.get("stop_reason") or ("运行预算耗尽" if status == "timed_out" else "运行失败、非零退出码或明确的结果错误")
-    elif phase == "waiting_user" or monitor.get("control") == "waiting_user":
+    elif waiting_for_input:
         execution, evidence = "waiting", monitor.get("reason") or "原生会话或显式调度控制：等待用户输入"
     elif phase in ("responding", "tool_running"):
         execution = "running"
@@ -79,6 +80,8 @@ def agent_observation(agent, pane):
     return {"presence": presence, "execution": execution,
             "status": execution if presence == "online" else presence,
             "evidence": evidence, "last": max(event, stamp(activity.get("last_event_at"))) * 1000,
+            "needs_user_input": (presence == "online" and waiting_for_input and not failed
+                                 and status != "stopping" and agent.get("desired_state") != "stopped"),
             "attention": presence != "offline" and (failed or bool(monitor.get("attention"))),
             "attentionReason": monitor.get("attention") or (evidence if failed else "")}
 
@@ -132,6 +135,7 @@ class Workspaces:
         self._in_lifecycle = False
         self._execution_observations = {}
         self.commander = CommanderMonitor(self)
+        self.worker = WorkerMonitor(self)
         self.extensions = AgentExtensions(self)
         self.conversations = NativeConversation()
 
@@ -186,7 +190,7 @@ class Workspaces:
             # Starting points for the picker, not an allowlist. Binding an
             # existing directory is an authenticated Web action.
             home = Path.home().resolve()
-            skill_roots = [home / ".agents/skills", home / ".claude/skills"] if for_skill else []
+            skill_roots = [REPO / "skill", home / ".agents/skills", home / ".claude/skills"] if for_skill else []
             roots = dict.fromkeys([*skill_roots, self.app.root, home,
                                    Path(self.app.root.anchor), *self.app.workspace_roots])
             available = []
@@ -576,8 +580,9 @@ class Workspaces:
                 results[-1]["resume_model"] = self.resume_model_info(a, config=config)
             if a["role"] == "commander" and not a.get("legacy") and a.get("execution_mode") in ("tui", "chat"):
                 results[-1]["commander_monitor"] = self.commander.view(a["id"])
-            if (a.get("execution_mode") == "tui" and a.get("claude_session_id") and pane
-                    and not pane.get("dead") and run.get("status") not in TERMINAL_STATES):
+            live_native = pane and not pane.get("dead") and run.get("status") not in TERMINAL_STATES
+            assigned_run = pid and a.get("intent_id") and run.get("intent_id") == a["intent_id"]
+            if a.get("execution_mode") == "tui" and a.get("claude_session_id") and (live_native or assigned_run):
                 results[-1]["execution_observation"] = self.execution_view(a)
             checked = sapper_context.receipt(self.app.state, a["id"])
             results[-1]["shared_context"] = {"launch_revision": a.get("context_revision", 0),
@@ -674,7 +679,7 @@ class Workspaces:
         for agent in agents:
             row = {k: agent.get(k) for k in (
                 "id", "workspace_id", "workspace_scope", "parent_agent_id", "role",
-                "role_label", "name", "task_label", "status", "pane_id", "execution_mode", "intent_id",
+                "role_label", "name", "task_label", "status", "run_id", "pane_id", "execution_mode", "intent_id",
                 "created_at", "minutes", "desired_state", "timeout_seconds", "deadline_epoch", "activity", "stop_reason")}
             row["mission"] = (agent.get("mission") or "")[:500]
             compact_agents.append(row)
@@ -1562,7 +1567,17 @@ def watch():
                 continue
             if a.get("native_operation"):
                 continue  # Original CLI workflows have no single native session to resume.
-            if a.get("desired_state") != "running" or a.get("pane_id"):
+            if a.get("desired_state") != "running":
+                continue
+            if a.get("pane_id"):
+                if a.get("execution_mode") == "tui":
+                    try:
+                        app.workspaces.worker.tick(a["id"], rows)
+                        line = status_log.line(a["id"], app.workspaces.worker.view(a["id"]))
+                        if line:
+                            print(line, flush=True)
+                    except (sapper.FGError, OSError, ValueError) as exc:
+                        print(f"[watchdog] worker {a['id']}: {exc}", flush=True)
                 continue
             if a["status"] in ("stopped", "timed_out"):
                 continue

@@ -1,0 +1,14 @@
+{
+  "id": "kb059",
+  "title": "WAF/边界过滤的编码绕过三件套",
+  "description": "UTf-16/八进制/双反斜杠：三种实测有效的过滤器绕过手法",
+  "detail": "## 1. 编码绕过（针对关键字黑名单）\n过滤器只检测**特定编码的明文**时，换编码即可。\n\n实测 a-07（XXE）：WAF 只查 UTF-8 明文里的 `DOCTYPE`/`ENTITY`。改成 **UTF-16LE + BOM** 并声明 `Content-Type: ...; charset=UTF-16`，WAF 看不到明文关键字，后端解码后照常解析 XXE。\n```python\nbody = '<?xml version=\"1.0\"?><!DOCTYPE x [<!ENTITY e SYSTEM \"file:///challenge/flag.txt\">]><x>&e;</x>'\npayload = b'\\xff\\xfe' + body.encode('utf-16-le')   # BOM + UTF-16LE\n```\n同理可试：UTF-7、GBK 宽字节、HTML 实体、Base64（若后端会自动解）。\n\n## 2. 八进制/转义绕过（针对字符串等值比较）\n实测 a-13：Cookie 里 `user=\"adm\\073n\"`，`\\073` 即 `;`。过滤器按字面比较 `admin` 失败，但解码后等价。\n\n## 3. 正则分隔符绕过（针对路径/点号黑名单）\n实测 a-13：过滤 `_.` 字面量，但解析器用正则 `(?<!\\\\)(?:\\\\\\\\)*\\\\.` 判定分隔符。写成 `__init__\\.__globals__\\.__file__`（双反斜杠+点）——既不含 `_.` 字面量，解析时又被当成路径分隔符。\n\n## 通用排查顺序\n1. 先确认过滤器**在哪个阶段**生效（WAF / 框架路由 / 业务校验）。\n2. 找字面量比较 vs 解码后比较的差异点。\n3. 优先试：大小写、URL 双编码、UTF-16/UTF-7、八进制/十六进制转义、以及**语法等价但字面不同**的写法（`[\\\"__globals__\\\"]` vs `.__globals__`）。",
+  "commands": [],
+  "tags": [
+    "waf",
+    "bypass",
+    "web"
+  ],
+  "source": "TsecBench 2026-11 实测 a-07/a-13 + e1 系列",
+  "created_at": "2026-11-24T07:42:07Z"
+}

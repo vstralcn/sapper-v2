@@ -1,2 +1,122 @@
-.native-dialog{width:min(1000px,calc(100% - 32px))}.native-selection{display:grid;grid-template-columns:1fr 1.2fr 1fr;gap:15px;margin:20px 0}.native-fields{display:grid;grid-template-columns:1fr 1fr;gap:17px 20px;margin-top:20px}.native-field{min-width:0}.native-field>span{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.native-field code{font-weight:400;font-size:10px;color:var(--muted)}.native-field small{font-weight:400;font-size:10px;line-height:1.6}.native-wide{grid-column:1/-1}.native-check{display:flex;flex-wrap:wrap;flex-direction:row;align-content:flex-start;align-items:center;gap:8px;font-weight:400}.native-check input{width:auto}.native-check small{width:100%;margin:0}.native-form-actions{display:flex;justify-content:flex-end;gap:12px;border-top:1px solid var(--line);margin-top:24px;padding-top:18px}#native-preview{padding:16px;background:var(--surface);border:1px solid var(--line);border-radius:6px;margin-top:20px}#native-preview h3{font-size:13px}#native-preview pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.8;max-height:230px;overflow:auto;margin:10px 0}.native-config{border-top:1px solid var(--line);padding-top:17px;margin-top:23px}.native-config .inline-form{margin:15px 0}.native-config textarea{font-family:monospace;font-size:11px;line-height:1.8}.native-config .button{font-size:11px}.native-memory-tools{border:1px solid var(--line);background:var(--surface);padding:14px 16px;margin-bottom:25px;border-radius:7px}.native-memory-tools>div{display:flex;gap:15px;flex-wrap:wrap;margin-top:11px}.native-memory-tools input{font-size:12px}.native-memory-tools .text-button{font-size:11px;padding:0}.intent-native-actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}.intent-native-actions .text-button{padding:0;font-size:11px}.native-knowledge-actions{display:flex;gap:20px;flex-wrap:wrap;margin:20px 0}.native-knowledge-actions .text-button{font-size:12px}#recall-results{display:flex;flex-direction:column;gap:10px;margin:0 0 24px;border-bottom:1px solid var(--line);padding-bottom:15px}#recall-results .text-button{text-align:left;font-size:12px}#intent-result-fields>label{margin-top:15px}
-@media(max-width:720px){.native-selection,.native-fields{grid-template-columns:1fr}.native-wide{grid-column:auto}.native-config textarea{font-size:16px}.native-memory-tools input{font-size:16px}.native-form-actions{flex-wrap:wrap}}
+.native-dialog { width: min(1040px, calc(100% - 32px)); }
+#native-page-title { margin-bottom: 15px; font-size: 24px; font-weight: 650; }
+.native-intro {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.native-categories {
+  display: flex;
+  gap: 4px;
+  margin: 12px 0 15px;
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+.native-categories button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted-strong);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.native-categories button span {
+  min-width: 17px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+}
+.native-categories button:hover { background: var(--surface); }
+.native-categories button[aria-pressed=true] { border-bottom-color: var(--accent); color: var(--text); font-weight: 650; }
+.native-layout { display: grid; grid-template-columns: clamp(164px, 15vw, 220px) minmax(0, 1fr); gap: 14px; align-items: start; }
+.native-commands, .native-card { border: 1px solid var(--line); border-radius: 9px; background: var(--paper); }
+.native-commands { display: grid; align-content: start; gap: 2px; max-height: min(68svh, 660px); padding: 5px; overflow-y: auto; }
+.native-commands button {
+  min-width: 0;
+  display: grid;
+  justify-items: start;
+  gap: 3px;
+  padding: 8px 11px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+}
+.native-commands button:hover { background: var(--surface); }
+.native-commands button[aria-current=true] { background: var(--accent-soft); font-weight: 650; }
+.native-commands button code { color: var(--muted); font-weight: 400; }
+.native-categories button:focus-visible, .native-commands button:focus-visible { outline-offset: -3px; }
+.native-card { min-width: 0; padding: 17px 18px 15px; }
+.native-card-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 9px; margin-bottom: 14px; }
+#native-command-name { padding: 4px 6px; border-radius: 5px; background: var(--surface); font-weight: 600; }
+#native-parameter-count { margin-left: auto; color: var(--muted); font-size: 12px; }
+.native-selection {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg);
+}
+.native-selection label { gap: 6px; color: var(--muted-strong); font-size: 12px; }
+.native-selection select { min-width: 0; padding: 7px 9px; color: var(--text); }
+#native-project:disabled { appearance: none; opacity: 1; }
+.native-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; margin-top: 16px; }
+.native-fields:empty { display: none; }
+.native-field { min-width: 0; gap: 6px; }
+.native-field-label { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.native-field-tag { padding: 1px 5px; border-radius: 4px; background: var(--surface); color: var(--muted-strong); font-size: 10px; }
+.native-field-tag.required { background: var(--warning-soft); color: var(--warning); }
+.native-field small { margin: 0; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.native-field :is(input, textarea, select) { padding: 8px 10px; }
+.native-check { display: grid; justify-items: start; align-content: start; }
+.native-check input {
+  appearance: none;
+  width: 34px;
+  height: 19px;
+  margin: 2px 0 0;
+  padding: 2px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--line);
+  cursor: pointer;
+}
+.native-check input::before { content: ""; display: block; width: 15px; height: 15px; border-radius: 50%; background: var(--paper); }
+.native-check input:checked { background: var(--accent); }
+.native-check input:checked::before { transform: translateX(15px); background: var(--on-accent); }
+.native-check input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.native-form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 17px; padding-top: 14px; border-top: 1px solid var(--line); }
+.native-form-actions .text-button { color: var(--muted-strong); }
+#native-execute { margin-left: auto; }
+#native-preview { margin-top: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+#native-preview h3 { font-size: 13px; }
+#native-preview pre { max-height: 230px; margin: 10px 0; overflow: auto; font-size: 11px; line-height: 1.8; }
+.native-config { margin-top: 15px; padding-top: 11px; border-top: 1px solid var(--line); }
+.native-config .inline-form { margin: 15px 0; }
+.native-config textarea { font-family: monospace; font-size: 12px; line-height: 1.7; }
+.native-config .button { font-size: 12px; }
+
+.native-memory-tools{border:1px solid var(--line);background:var(--surface);padding:14px 16px;margin-bottom:25px;border-radius:7px}.native-memory-tools>div{display:flex;gap:15px;flex-wrap:wrap;margin-top:11px}.native-memory-tools input{font-size:12px}.native-memory-tools .text-button{font-size:11px;padding:0}.intent-native-actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}.intent-native-actions .text-button{padding:0;font-size:11px}.native-knowledge-actions{display:flex;gap:20px;flex-wrap:wrap;margin:20px 0}.native-knowledge-actions .text-button{font-size:12px}#recall-results{display:flex;flex-direction:column;gap:10px;margin:0 0 24px;border-bottom:1px solid var(--line);padding-bottom:15px}#recall-results .text-button{text-align:left;font-size:12px}#intent-result-fields>label{margin-top:15px}
+
+@media (max-width: 720px) {
+  .native-layout { grid-template-columns: minmax(0, 1fr); gap: 9px; }
+  .native-commands { display: flex; overflow: auto; }
+  .native-commands button { flex: 0 0 auto; }
+  .native-card { padding: 14px; }
+  .native-selection, .native-fields { grid-template-columns: minmax(0, 1fr); }
+}

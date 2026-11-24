@@ -202,7 +202,6 @@ document.querySelector('.model-tabs').onkeydown = event => {
   $(`model-${tab}-tab`).focus();
 };
 $("new-profile").onclick = () => { resetProfile(); $("profile-form").elements.name.focus(); };
-$("topbar-models").onclick = () => guarded(() => openModels());
 $("agent-model-settings").onclick = () => guarded(() => openSettings("workspaces", state.project.id));
 $("agent-profile").onchange = updateAgentModelHint;
 $("agent-parent").addEventListener("change", updateAgentModelHint);

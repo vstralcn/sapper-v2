@@ -1,0 +1,13 @@
+{
+  "id": "kb062",
+  "title": "从实战回灌知识库：本次 TSecBench 的沉淀清单",
+  "description": "18 flag/4500 分任务的完整经验索引，指向 skill/与 docs/ 的具体文件",
+  "detail": "## 沉淀产物索引\n\n| 产物 | 位置 | 内容 |\n|---|---|---|\n| 平台接入经验 | `skill/tsecbenchmark/SKILL.md` §四 | 凭据落盘、三种靶场网络通道、容器调度、worker 运维、提交纪律 |\n| 分方向作战手册 | `skill/ctf-runbook/SKILL.md` | Pwn/Reverse/Web/云/沙箱/WAF/APT 七方向的开场动作、卡点表、放弃判据 |\n| Harness 建议 | `docs/harness-optimization-tsecbench.md` | 9 条按优先级排序的优化项，附实测证据 |\n| Pwn 协议题速查 | `kb058` | 四类高频缺陷（溢出/越界读/负偏移/格式化串） |\n| WAF 绕过三件套 | `kb059` | 编码绕过、八进制转义、正则分隔符绕过 |\n| 链式题入口判定 | `kb060` | 同系列题≠同入口；卡点识别表 |\n| 多 Agent 调度 | `kb061` | 错误归因、卡死恢复、容器再平衡 |\n\n## 成绩\n18/74 flag，4500 分。Pwn 组 5/5 全清（最高效），Web 6 题，云 3 题，APT 4 flag。\n\n## 最大的三个教训\n1. **错误表象 ≠ 根因**：把 400 当限流、把 500 当上下文过大，都导致过错误决策。判定前做独立对照实验。\n2. **worker 不会自愈**：400/500 后必须外部注入，且继续对空转无效，要给具体动作。\n3. **时间盒是必需品**：没有硬上限，worker 会在单题耗 50-90 分钟。",
+  "commands": [],
+  "tags": [
+    "meta",
+    "rsi"
+  ],
+  "source": "TsecBench 2026-11",
+  "created_at": "2026-11-24T07:45:45Z"
+}

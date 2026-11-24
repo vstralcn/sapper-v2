@@ -11,6 +11,7 @@
   <link rel="stylesheet" href="workspace.css">
   <link rel="stylesheet" href="agent-topology.css">
   <link rel="stylesheet" href="overview.css">
+  <link rel="stylesheet" href="competition.css">
   <link rel="stylesheet" href="native.css">
   <link rel="stylesheet" href="models.css">
   <link rel="stylesheet" href="settings.css">
@@ -23,9 +24,24 @@
   <script src="workspace.js" defer></script>
   <script src="extensions.js" defer></script>
   <script src="overview.js" defer></script>
+  <script src="competition.js" defer></script>
   <script src="native.js" defer></script>
 </head>
 <body>
+  <svg class="icon-definitions" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="icon-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="10" rx="1"/><rect x="14" y="3" width="7" height="6" rx="1"/><rect x="3" y="17" width="7" height="4" rx="1"/><rect x="14" y="13" width="7" height="8" rx="1"/></symbol>
+    <symbol id="icon-workspace" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v10H3zM3 7V5h6l2 2h8v2"/></symbol>
+    <symbol id="icon-context" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v6m0 6v6M3 12h6m6 0h6M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1m0-12.8-2.1 2.1m-8.6 8.6-2.1 2.1"/></symbol>
+    <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h16M9 3v4m6 3v4m-5 3v4"/></symbol>
+    <symbol id="icon-book" viewBox="0 0 24 24"><path d="M12 5.5C9 3.8 6 3.6 3 4.5v14c3-.9 6-.7 9 1 3-1.7 6-1.9 9-1v-14c-3-.9-6-.7-9 1Zm0 0v14"/></symbol>
+    <symbol id="icon-terminal" viewBox="0 0 24 24"><path d="m4 6 6 6-6 6m9 0h7"/></symbol>
+    <symbol id="icon-progress" viewBox="0 0 24 24"><path d="M2 12h4l3-7 5 14 3-7h5"/></symbol>
+    <symbol id="icon-roles" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4m-6 4v-4h12v4"/></symbol>
+    <symbol id="icon-memory" viewBox="0 0 24 24"><path d="m3 7 2 2 4-4m3 2h9M3 16l2 2 4-4m3 2h9"/></symbol>
+    <symbol id="icon-records" viewBox="0 0 24 24"><path d="M5 3h9l5 5v13H5zM14 3v5h5M8 12h8m-8 4h8"/></symbol>
+    <symbol id="icon-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+    <symbol id="icon-connection" viewBox="0 0 24 24"><path d="M3 8.5a14 14 0 0 1 18 0m-15 3a9.5 9.5 0 0 1 12 0m-9 3a5 5 0 0 1 6 0m-3 3h.01"/></symbol>
+  </svg>
   <section id="login" class="login-screen">
     <div class="login-brand"><span class="brand-mark">s</span><span>Sapper <small>Web console</small></span></div>
     <div class="theme-switch login-theme" role="group" aria-label="全局主题"><button type="button" data-theme-choice="light" aria-pressed="false">浅色</button><button type="button" data-theme-choice="dark" aria-pressed="false">深色</button></div>
@@ -45,23 +61,42 @@
   <div id="workspace" class="workspace" hidden>
     <aside class="sidebar">
       <a class="brand" href="./"><span class="brand-mark">s</span><span>Sapper<small>任务工作台</small></span></a>
-      <button id="home-button" class="sidebar-link home-link active">▦ 总体概览</button>
-      <button id="workspaces-button" class="sidebar-link workspaces-link" type="button">▱ 工作区</button>
-      <button id="new-project" class="button new-project">＋ 新建任务</button>
-      <button id="bind-workspace" class="button bind-workspace">▱ 打开题目目录</button>
-      <div class="sidebar-heading"><span>工作目录中的任务</span><button id="refresh-projects" class="icon-button" aria-label="刷新任务">↻</button></div>
+      <nav class="sidebar-nav" aria-label="主导航">
+        <button id="home-button" class="sidebar-link active" type="button" aria-current="page"><svg class="ui-icon" aria-hidden="true"><use href="#icon-overview"/></svg>总体概览</button>
+        <button id="workspaces-button" class="sidebar-link" type="button"><svg class="ui-icon" aria-hidden="true"><use href="#icon-workspace"/></svg>工作区</button>
+        <button id="context-button" class="sidebar-link" type="button"><svg class="ui-icon" aria-hidden="true"><use href="#icon-context"/></svg>全局上下文</button>
+        <button id="profiles-button" class="sidebar-link" type="button"><svg class="ui-icon" aria-hidden="true"><use href="#icon-settings"/></svg>全局设置 <span id="profile-count" class="count">0</span></button>
+        <button id="knowledge-button" class="sidebar-link" type="button"><svg class="ui-icon" aria-hidden="true"><use href="#icon-book"/></svg>知识库</button>
+        <button id="native-button" class="sidebar-link" type="button"><svg class="ui-icon" aria-hidden="true"><use href="#icon-terminal"/></svg>原生功能</button>
+      </nav>
+      <div class="sidebar-heading"><span>工作目录</span><span id="sidebar-project-count" aria-label="工作区数量">0</span><button id="refresh-projects" class="icon-button" type="button" aria-label="刷新任务">↻</button></div>
       <nav id="project-list" aria-label="任务列表"></nav>
+      <div class="sidebar-actions">
+        <button id="new-project" class="button new-project" type="button">＋ 新建任务</button>
+        <button id="bind-workspace" class="button bind-workspace" type="button"><svg class="ui-icon" aria-hidden="true"><use href="#icon-workspace"/></svg>打开题目目录</button>
+      </div>
       <div class="sidebar-bottom">
-        <button id="native-button" class="sidebar-link"><span>⌘</span> 原生功能</button>
-        <button id="context-button" class="sidebar-link"><span>◎</span> 全局上下文</button>
-        <button id="profiles-button" class="sidebar-link"><span>◈</span> 全局设置 <span id="profile-count" class="count">0</span></button>
-        <button id="knowledge-button" class="sidebar-link"><span>▤</span> 知识库</button>
-        <div class="environment"><span class="status-dot"></span><span id="environment-status">正在连接</span><button id="logout" class="icon-button" aria-label="退出登录">↪</button></div>
+        <div class="environment"><span class="status-dot"></span><span id="environment-status">正在连接</span><button id="logout" class="icon-button" type="button" aria-label="退出登录">↪</button></div>
+        <p class="sidebar-account">已登录 <span id="sidebar-username"></span></p>
       </div>
     </aside>
 
     <main class="main">
-      <header class="topbar"><div class="topbar-location"><span class="small-logo">s</span> 工作空间 <span class="slash">/</span> <span id="breadcrumb">任务</span></div><div class="topbar-actions"><button id="topbar-models" class="text-button" type="button">全局设置</button><span id="connection" class="connection">● 已连接</span><div class="theme-switch" role="group" aria-label="全局主题"><button type="button" data-theme-choice="light" aria-pressed="false">浅色</button><button type="button" data-theme-choice="dark" aria-pressed="false">深色</button></div></div></header>
+      <header class="topbar">
+        <div class="topbar-location" aria-label="当前位置">
+          <button id="breadcrumb-home" class="breadcrumb-home" type="button">工作台</button>
+          <svg class="ui-icon breadcrumb-divider" aria-hidden="true"><use href="#icon-chevron"/></svg><span id="breadcrumb">总体概览</span>
+          <span id="breadcrumb-section" hidden><svg class="ui-icon breadcrumb-divider" aria-hidden="true"><use href="#icon-chevron"/></svg><span id="breadcrumb-tab"></span></span>
+        </div>
+        <div class="topbar-actions">
+          <span id="connection" class="connection" title="已连接"><svg class="ui-icon" aria-hidden="true"><use href="#icon-connection"/></svg><span id="connection-label">已连接</span></span>
+          <div class="theme-switch" role="group" aria-label="全局主题"><button type="button" data-theme-choice="light" aria-pressed="false">浅色</button><button type="button" data-theme-choice="dark" aria-pressed="false">深色</button></div>
+        </div>
+      </header>
+      <section id="user-input-requests" class="user-input-requests" aria-label="需要你处理" hidden>
+        <strong>需要你处理</strong>
+        <ul id="user-input-request-list" aria-live="polite"></ul>
+      </section>
       <section id="overview" class="overview-page" hidden>
         <div class="overview-heading"><div><h1>总体概览</h1><p>查看所有题目的进展、角色和可用环境。</p></div><button id="overview-bind" class="button primary">打开题目目录</button></div>
         <div id="overview-summary" class="overview-summary" aria-label="总体统计"></div>
@@ -103,6 +138,7 @@
         <div class="project-heading">
           <div class="project-identity"><div class="project-kicker"><span id="project-name"></span><span id="project-status" class="badge"></span><span id="workspace-permissions" class="badge" role="status" title="当前有存活进程的角色，按启动记录统计"></span></div><h1 id="project-goal"></h1><p id="project-path" class="project-path"></p></div>
           <div class="project-controls">
+            <div class="metrics" aria-label="工作区统计"><div><strong id="fact-count">0</strong><span>事实</span></div><div><strong id="intent-count">0</strong><span>待办</span></div><div><strong id="pane-count">0</strong><span>终端</span></div><div><strong id="hint-count">0</strong><span>补充</span></div></div>
             <button class="button primary" id="dispatch-role">派发角色</button>
             <details id="project-tools">
               <summary class="button">工作区操作 <span aria-hidden="true">▾</span></summary>
@@ -116,6 +152,7 @@
                 <div role="group" aria-label="工作区管理">
                   <h2>工作区管理</h2>
                   <button id="workspace-extensions">工作区使用配置</button>
+                  <button id="competition-import-menu" type="button">导入比赛题单</button>
                   <button id="enable-workspace" aria-describedby="workspace-readiness">启用 sapper</button>
                   <p id="workspace-readiness" class="field-help">正在检查接入</p>
                   <label class="inline-check workspace-flag-option"><input id="auto-submit-flags" type="checkbox" aria-describedby="flag-submission-help">AI 主动提交 flag</label>
@@ -127,9 +164,51 @@
             </details>
           </div>
         </div>
-        <div class="metrics"><div><strong id="fact-count">0</strong><span>事实记录</span></div><div><strong id="intent-count">0</strong><span>待办意图</span></div><div><strong id="pane-count">0</strong><span>活动终端</span></div><div><strong id="hint-count">0</strong><span>人工补充</span></div><span class="original-note">使用原 CLI 与 .sapper 数据</span></div>
-        <div class="tabs" role="tablist" aria-label="任务视图"><button data-tab="progress" class="active" role="tab" aria-selected="true">进展</button><button data-tab="workspace" role="tab" aria-selected="false">终端与文件</button><button data-tab="agents" role="tab" aria-selected="false">角色与协作</button><button data-tab="memory" role="tab" aria-selected="false">事实与意图</button><button data-tab="console" role="tab" aria-selected="false">运行记录</button><button data-tab="files" role="tab" aria-selected="false">文件与附件</button></div>
+        <div class="tabs" role="tablist" aria-label="任务视图">
+          <button data-tab="progress" class="active" role="tab" aria-selected="true"><svg class="ui-icon" aria-hidden="true"><use href="#icon-progress"/></svg>进展</button>
+          <button data-tab="agents" role="tab" aria-selected="false"><svg class="ui-icon" aria-hidden="true"><use href="#icon-roles"/></svg>角色与协作</button>
+          <button data-tab="memory" role="tab" aria-selected="false"><svg class="ui-icon" aria-hidden="true"><use href="#icon-memory"/></svg>事实与意图</button>
+          <button data-tab="workspace" role="tab" aria-selected="false"><svg class="ui-icon" aria-hidden="true"><use href="#icon-terminal"/></svg>终端与文件</button>
+          <button data-tab="console" role="tab" aria-selected="false"><svg class="ui-icon" aria-hidden="true"><use href="#icon-records"/></svg>运行记录</button>
+          <button id="native-tab" data-tab="native" role="tab" aria-selected="false" aria-controls="tab-native"><svg class="ui-icon" aria-hidden="true"><use href="#icon-terminal"/></svg>原生功能</button>
+          <button data-tab="files" role="tab" aria-selected="false"><svg class="ui-icon" aria-hidden="true"><use href="#icon-workspace"/></svg>文件与附件</button>
+        </div>
         <section id="tab-progress" class="tab-panel" hidden>
+          <section id="competition-board" aria-labelledby="competition-title" hidden>
+            <header class="competition-heading">
+              <div><h2 id="competition-title">赛题进程</h2><p id="competition-source"></p></div>
+              <button id="competition-import" class="button" type="button">导入题单</button>
+            </header>
+            <p id="competition-error" class="error-text" role="alert" hidden></p>
+            <div id="competition-roster" hidden>
+              <div class="competition-summary">
+                <div class="competition-score"><span id="competition-score-label">已解 / 总题数</span><div id="competition-score"></div></div>
+                <div>
+                  <div id="competition-track" class="competition-track" aria-hidden="true"></div>
+                  <div id="competition-filters" class="competition-filters" role="group" aria-label="按进度筛选"></div>
+                </div>
+              </div>
+              <div class="competition-body">
+                <section class="competition-directions" aria-labelledby="competition-directions-heading">
+                  <h3 id="competition-directions-heading">按方向</h3><div id="competition-directions"></div>
+                </section>
+                <section class="competition-list" aria-labelledby="competition-list-heading">
+                  <header class="competition-list-heading">
+                    <h3 id="competition-list-heading">全部题目</h3><span id="competition-visible" class="muted" aria-live="polite"></span>
+                    <button id="competition-clear" type="button" class="text-button" hidden>清除状态筛选</button>
+                  </header>
+                  <div class="competition-table-wrap">
+                    <table id="competition-table" aria-label="赛题进展">
+                      <thead><tr><th scope="col">题目</th><th scope="col">进度</th><th scope="col">Agent</th><th scope="col">Flag 回执</th></tr></thead>
+                      <tbody id="competition-rows"></tbody>
+                    </table>
+                  </div>
+                  <p id="competition-empty" class="empty-list" hidden></p>
+                  <p class="competition-list-foot">Flag 提交通过后标记为已解</p>
+                </section>
+              </div>
+            </div>
+          </section>
           <div class="progress-grid">
             <section class="progress-panel"><h2>需要关注</h2><div id="progress-attention"></div></section>
             <section class="progress-panel"><h2>近期证据</h2><div id="progress-evidence"></div></section>
@@ -158,14 +237,40 @@
 
         <section id="tab-files" class="tab-panel" hidden><div class="panel-heading"><div><h2>任务文件</h2><p class="field-help">上传的附件会自动记入 hint，不会向其他会话自动发送。</p></div><label class="button primary upload-label">↑ 上传附件<input id="upload-file" type="file" hidden></label></div><div class="file-breadcrumb"><button id="files-root" class="text-button">工作目录</button><span id="files-path"></span><button id="files-up" class="text-button">返回上层</button></div><div id="files-list"></div></section>
       </section>
+      <section id="tab-native" class="tab-panel" aria-label="原生功能" hidden>
+        <h1 id="native-page-title">原生功能</h1>
+        <p id="native-loading" class="field-help" role="status">正在读取命令目录…</p>
+        <div id="native-page-content"></div>
+      </section>
     </main>
   </div>
 
   <div id="toast" class="toast" role="status" popover="manual"></div>
-  <dialog id="native-dialog" class="native-dialog"><div class="dialog-heading"><h2>原生功能</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">使用表单调用原 sapper CLI。保留原参数、工具和调度循环；本轮不提供 TSecBench 平台操作。命令在所选工作区运行，输出进入原运行记录。</p>
-    <form id="native-form"><div class="native-selection"><label>执行工作区<select id="native-project" required></select></label><label>原生命令<select id="native-operation" required></select></label><label>模型配置<select id="native-profile"></select></label></div><p id="native-command-help" class="field-help"></p><p id="native-permission-warning" class="field-help" role="status" hidden></p><div id="native-fields" class="native-fields"></div><div class="native-form-actions"><button id="native-preview-button" class="button" type="button">预览原命令</button><button id="native-execute" class="button primary" type="submit" disabled>执行原命令</button></div></form>
-    <section id="native-preview" hidden><h3>实际执行内容</h3><p id="native-preview-cwd" class="field-help"></p><pre id="native-preview-command"></pre><pre id="native-preview-fleet" hidden></pre><p id="native-preview-note" class="field-help"></p></section>
-    <details class="native-config"><summary>原生编队配置／提示词模板</summary><div class="inline-form"><input id="native-config-path" aria-label="原生配置文件" list="native-config-options" value="fleet.json"><datalist id="native-config-options"><option value="fleet.json">fleet.json · 编队</option value="templates/reason.md">reason.md · 推理</option><option value="templates/explore.md">explore.md · 执行</option><option value="templates/verify.md">verify.md · 验证</option><option value="templates/brainstorm.md">brainstorm.md · 头脑风暴</option><option value="templates/blindspot.md">blindspot.md · 盲点</option><option value="templates/command.md">command.md · 指挥官</option></datalist><button id="native-config-load" class="button" type="button">读取配置</button></div><textarea id="native-config-content" rows="12" aria-label="原生配置内容" disabled></textarea><p class="field-help">可填写编队 JSON 的相对路径或选择模板。模板首次读取显示仓库原版；首次保存补齐缺失的原版模板，保留已有模板，不改仓库默认。编队沿用原 session／panes 结构；停止原生编队使用 fleet down。</p><button id="native-config-save" class="button" type="button" disabled>保存工作区配置</button></details>
+  <dialog id="native-dialog" class="native-dialog">
+    <div class="dialog-heading"><h2>原生功能</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div>
+    <div id="native-workbench">
+      <p class="native-intro"><svg class="ui-icon" aria-hidden="true"><use href="#icon-terminal"/></svg>填写参数后可预览完整的 sapper 命令。执行需要确认，可能覆盖数据或停止会话的操作会额外提示。</p>
+      <nav id="native-categories" class="native-categories" aria-label="命令分类"></nav>
+      <div class="native-layout">
+        <nav id="native-commands" class="native-commands" aria-label="原生命令"></nav>
+        <section class="native-card" aria-labelledby="native-command-title">
+          <div class="native-card-heading"><code id="native-command-name"></code><h2 id="native-command-title"></h2><span id="native-parameter-count"></span></div>
+          <form id="native-form">
+            <div class="native-selection"><label>执行工作区<select id="native-project" required></select></label><label>模型配置<select id="native-profile"></select></label></div>
+            <p id="native-command-help" class="field-help" hidden></p>
+            <p id="native-permission-warning" class="field-help" role="status" hidden></p>
+            <div id="native-fields" class="native-fields"></div>
+            <div class="native-form-actions">
+              <button id="native-preview-button" class="button primary" type="button">预览命令</button>
+              <button id="native-reset" class="text-button" type="button">重置参数</button>
+              <button id="native-execute" class="button" type="submit" disabled hidden>执行原命令</button>
+            </div>
+          </form>
+          <section id="native-preview" hidden><h3>实际执行内容</h3><p id="native-preview-cwd" class="field-help"></p><pre id="native-preview-command"></pre><pre id="native-preview-fleet" hidden></pre><p id="native-preview-note" class="field-help"></p></section>
+          <details class="native-config"><summary>原生编队配置／提示词模板</summary><div class="inline-form"><input id="native-config-path" aria-label="原生配置文件" list="native-config-options" value="fleet.json"><datalist id="native-config-options"><option value="fleet.json">fleet.json · 编队</option value="templates/reason.md">reason.md · 推理</option><option value="templates/explore.md">explore.md · 执行</option><option value="templates/verify.md">verify.md · 验证</option><option value="templates/brainstorm.md">brainstorm.md · 头脑风暴</option><option value="templates/blindspot.md">blindspot.md · 盲点</option><option value="templates/command.md">command.md · 指挥官</option></datalist><button id="native-config-load" class="button" type="button">读取配置</button></div><textarea id="native-config-content" rows="12" aria-label="原生配置内容" disabled></textarea><p class="field-help">可填写编队 JSON 的相对路径或选择模板。模板首次读取显示仓库原版；首次保存补齐缺失的原版模板，保留已有模板，不改仓库默认。编队沿用原 session／panes 结构；停止原生编队使用 fleet down。</p><button id="native-config-save" class="button" type="button" disabled>保存工作区配置</button></details>
+        </section>
+      </div>
+    </div>
   </dialog>
   <dialog id="native-output-dialog" class="wide-dialog"><div class="dialog-heading"><h2>原命令输出</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><pre id="native-output-text" class="file-preview"></pre><a id="native-output-download" class="button" download>下载运行日志</a></dialog>
   <dialog id="intent-action-dialog"><form id="intent-action-form"><div class="dialog-heading"><h2 id="intent-action-title"></h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><input name="action" type="hidden"><input name="id" type="hidden"><label>执行者标签<input name="worker" value="web-user" required></label><div id="intent-result-fields"><label>结果标题<input name="title"></label><label>已确认的结果<textarea name="description" rows="3"></textarea></label><label>证据与详细文档<textarea name="doc" rows="4"></textarea></label><label>结果类型<select name="kind"><option value="">普通事实</option><option value="note">note</option><option value="host">host</option><option value="service">service</option><option value="cred">cred</option><option value="vuln">vuln</option><option value="loot">loot</option><option value="flag">flag</option></select></label><label>结构化数据（每行 key=value）<textarea name="data" rows="2"></textarea></label></div><p class="field-help">通过原 Store 操作，保留领取者和确认门槛校验；未确认的意图不能直接完成。</p><div class="dialog-actions"><button class="button primary" type="submit">执行图操作</button></div></form></dialog>
@@ -260,7 +365,21 @@
 
   <dialog id="run-dialog"><form id="run-form"><div class="dialog-heading"><h2>启动原 agent</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><p class="dialog-intro">在独立 tmux 会话调用原命令。页面关闭后继续运行。</p><div class="form-row"><label>运行方式<select name="kind" id="run-kind"><option value="auto">sapper auto · 自主推进</option><option value="dispatch">sapper dispatch · 单步调度</option><option value="shell">交互式终端</option><option value="custom">自定义原命令</option></select></label><label>模型配置<select name="profile_id" id="run-profile"><option value="">继承原环境</option></select></label></div><div id="auto-options" class="form-row"><label>运行时长（分钟）<input name="minutes" type="number" min="1" max="1440" value="10"></label><label>最多步骤<input name="max_steps" type="number" min="1" max="1000" value="8"></label></div><label id="dispatch-options" hidden>调度目标<input name="target" value="reason" placeholder="reason / verify / intent ID"></label><label id="custom-options" hidden>原命令<input name="command" placeholder="例如 sapper status；参数按原样传递"><span class="field-help">按参数列表执行。需要管道时显式使用 bash -lc；密钥请放环境或配置中。</span></label><div id="agent-options" class="checkbox-group"><label><input type="checkbox" name="skip_permissions"> 允许角色执行命令、修改文件等操作时跳过逐次审批</label><label><input type="checkbox" name="verify"> auto 后验证</label><label><input type="checkbox" name="dry_run"> 试运行／仅输出提示词</label></div><p class="field-help">未勾选的参数不会被默认添加；引擎、工具与提示词仍由原 sapper 决定。</p><p id="run-permission-warning" class="field-help" role="status" hidden></p><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">启动</button></div></form></dialog>
 
-  <dialog id="record-dialog"><form id="record-form"><div class="dialog-heading"><h2 id="record-heading">添加记录</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><input type="hidden" name="action"><label id="record-from-label" hidden>来源事实<select name="from" id="record-from" multiple size="4"></select><span class="field-help">按住 Ctrl／Command 可选择多个事实，goal 不能作为来源。</span></label><label>短标题 <span class="muted">选填</span><input name="title"></label><label>说明<textarea name="description" rows="3" required></textarea></label><label id="record-kind-label">事实类型<select name="kind"><option value="">不指定类型</option><option>note</option><option>host</option><option>service</option><option>cred</option><option>vuln</option><option>loot</option><option>flag</option></select></label><label id="record-evidence-source-label" hidden>证据来源 <span class="muted">选填</span><input name="evidence_source" placeholder="例如 授权本地靶场、附件说明"><span class="field-help">与短标题、说明一起写入原图，不会执行任何内容。</span></label><label id="record-repro-label" hidden>复现命令 <span class="muted">选填，每行一条</span><textarea name="repro_commands" rows="2" placeholder="curl -i http://127.0.0.1/"></textarea><span class="field-help">仅作为文本记录，服务端不会执行；输入框内容会原样存入图。</span></label><label id="record-artifact-label" hidden>工件路径 <span class="muted">选填，每行一个，须在本题目录内</span><textarea name="artifacts" rows="2" placeholder="evidence/response.txt"></textarea><span class="field-help">复制到 .sapper/artifacts/&lt;sha256&gt;，单文件上限 64 MiB；拒绝符号链接和目录外文件。</span></label><label>详细文档 <span class="muted">选填</span><textarea name="doc" rows="4"></textarea></label><label id="record-confirm-label" class="inline-check" hidden><input type="checkbox" name="requires_confirmation"> 该意图需要确认后执行</label><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">保存记录</button></div></form></dialog>
+  <dialog id="competition-import-dialog" aria-labelledby="competition-import-title"><form id="competition-import-form">
+    <div class="dialog-heading"><h2 id="competition-import-title">导入比赛题单</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div>
+    <label>执行机目录<input id="competition-directory" name="directory" value="." maxlength="4096" required><span class="field-help">支持工作区相对路径或执行机绝对路径。按题目子目录导入，可用 Web、Pwn 等方向目录归类。</span></label>
+    <button id="competition-browse" class="button" type="button">浏览目录</button>
+    <label class="inline-check"><input name="complete" type="checkbox"> 此次导入后题单完整</label>
+    <p class="field-help">从比赛 API 获取题单时，由主 Agent 将清单写入工作区根目录的 <code>competition.json</code>。</p>
+    <div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">导入题单</button></div>
+  </form></dialog>
+  <dialog id="competition-detail" aria-labelledby="competition-detail-title">
+    <div class="dialog-heading"><h2 id="competition-detail-title"></h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div>
+    <p id="competition-detail-meta" class="muted"></p>
+    <dl id="competition-detail-rows" class="competition-detail-rows"></dl>
+    <div class="dialog-actions"><button id="competition-create-intent" type="button" class="button primary">创建题目意图</button></div>
+  </dialog>
+  <dialog id="record-dialog"><form id="record-form"><div class="dialog-heading"><h2 id="record-heading">添加记录</h2><button type="button" class="dialog-close icon-button" aria-label="关闭">×</button></div><input type="hidden" name="action"><input type="hidden" name="competition_challenge"><p id="record-competition" class="field-help" hidden></p><label id="record-from-label" hidden>来源事实<select name="from" id="record-from" multiple size="4"></select><span class="field-help">按住 Ctrl／Command 可选择多个事实，goal 不能作为来源。</span></label><label>短标题 <span class="muted">选填</span><input name="title"></label><label>说明<textarea name="description" rows="3" required></textarea></label><label id="record-kind-label">事实类型<select name="kind"><option value="">不指定类型</option><option>note</option><option>host</option><option>service</option><option>cred</option><option>vuln</option><option>loot</option><option>flag</option></select></label><label id="record-evidence-source-label" hidden>证据来源 <span class="muted">选填</span><input name="evidence_source" placeholder="例如 授权本地靶场、附件说明"><span class="field-help">与短标题、说明一起写入原图，不会执行任何内容。</span></label><label id="record-repro-label" hidden>复现命令 <span class="muted">选填，每行一条</span><textarea name="repro_commands" rows="2" placeholder="curl -i http://127.0.0.1/"></textarea><span class="field-help">仅作为文本记录，服务端不会执行；输入框内容会原样存入图。</span></label><label id="record-artifact-label" hidden>工件路径 <span class="muted">选填，每行一个，须在本题目录内</span><textarea name="artifacts" rows="2" placeholder="evidence/response.txt"></textarea><span class="field-help">复制到 .sapper/artifacts/&lt;sha256&gt;，单文件上限 64 MiB；拒绝符号链接和目录外文件。</span></label><label>详细文档 <span class="muted">选填</span><textarea name="doc" rows="4"></textarea></label><label id="record-confirm-label" class="inline-check" hidden><input type="checkbox" name="requires_confirmation"> 该意图需要确认后执行</label><div class="dialog-actions"><button type="button" class="button dialog-close">取消</button><button type="submit" class="button primary">保存记录</button></div></form></dialog>
 
   <dialog id="detail-dialog" class="wide-dialog"><div class="dialog-heading"><h2 id="detail-title">记录详情</h2><button class="dialog-close icon-button" aria-label="关闭">×</button></div><div id="detail-meta" class="muted"></div><p id="detail-description"></p><div id="detail-evidence" class="muted" style="white-space:pre-wrap" hidden></div><ul id="detail-artifacts" class="detail-artifacts" hidden></ul><details class="progress-cli"><summary>在 CLI 中查看记录</summary><code id="detail-cli-command"></code></details><label>详细文档<textarea id="detail-doc" rows="12"></textarea></label><div class="dialog-actions"><button class="button dialog-close">关闭</button><button class="button primary" id="save-doc">保存文档</button></div></dialog>
 

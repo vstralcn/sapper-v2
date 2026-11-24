@@ -81,6 +81,7 @@ async function showWorkspace() {
   $("login").hidden = true;
   $("workspace").hidden = false;
   $("account-username").value = state.username;
+  $("sidebar-username").textContent = state.username;
   await Promise.all([
     refreshProjects({restore:true}),
     guarded(async () => {
@@ -116,6 +117,7 @@ function renderProjects() {
   const signature = JSON.stringify([state.project?.id, state.projects]);
   if (signature === state.projectListSignature) return;
   state.projectListSignature = signature;
+  $("sidebar-project-count").textContent = state.projects.length;
   const list = $("project-list");
   list.replaceChildren();
   if (!state.projects.length) list.append(element("p", "sidebar-empty", "还没有任务。新建任务后，就可以在这里查看和操作。"));
@@ -124,7 +126,8 @@ function renderProjects() {
       await guarded(() => openProject(project));
     });
     const directory = project.directory && project.directory !== project.name ? `${project.directory}  /  ` : "";
-    item.append(element("span", "task-title", project.name), element("span", "task-meta", `${directory}${project.facts} 条事实`));
+    if (project.id === state.project?.id) item.setAttribute("aria-current", "page");
+    item.append(element("span", "task-title", project.name), element("span", "task-meta", `${directory}${project.facts} 事实 · ${project.open_intents} 待办`));
     item.title = project.goal || project.name;
     list.append(item);
   }
@@ -145,7 +148,11 @@ async function refreshTask() {
   const project = state.projects.find(p => p.id === pid);
   if (project && graphResult.status === "fulfilled") {
     const count = graph.facts.filter(f => f.id !== "goal").length;
-    if (project.facts !== count) {project.facts = count; renderProjects();}
+    const openIntents = graph.open_intents.length;
+    if (project.facts !== count || project.open_intents !== openIntents) {
+      Object.assign(project, {facts: count, open_intents: openIntents});
+      renderProjects();
+    }
   }
   $("breadcrumb").textContent = state.project.name;
   $("project-name").textContent = state.project.name;
@@ -238,9 +245,12 @@ function openDetail(record) {
   $("detail-doc").value = record.doc || "";
   $("detail-dialog").showModal();
 }
-function openRecord(action) {
+function openRecord(action, topic = null) {
   $("record-form").reset();
   $("record-form").elements.action.value = action;
+  $("record-form").elements.competition_challenge.value = topic?.id || "";
+  $("record-competition").hidden = !topic;
+  $("record-competition").textContent = topic ? `赛题 ${topic.id} · ${topic.name}。未选来源事实时使用题单记录。` : "";
   $("record-heading").textContent = action === "fact" ? "添加已确认的事实" : "添加执行意图";
   $("record-from-label").hidden = action !== "intent";
   $("record-confirm-label").hidden = action !== "intent";
@@ -405,6 +415,7 @@ function refreshProfiles() {
     select.append(option);
   }
   if (state.profiles.some(p => p.id === selected)) select.value = selected;
+  refreshNativeProfiles();
   const list = $("profiles-list");
   list.replaceChildren();
   if (!state.profiles.length) list.append(empty("尚无模型配置。也可直接继承服务启动时的原环境。"));
@@ -604,6 +615,7 @@ submit("record-form", async data => {
   const action = payload.action;
   payload.from = data.getAll("from");
   payload.requires_confirmation = data.has("requires_confirmation");
+  if (!payload.competition_challenge) delete payload.competition_challenge;
   if (!payload.kind) delete payload.kind;
   const lines = name => String(payload[name] || "").split("\n").map(line => line.trim()).filter(Boolean);
   const commands = lines("repro_commands");
@@ -706,17 +718,24 @@ document.querySelectorAll("[data-key]").forEach(node => { node.onclick = () => g
   await refreshTerminal();
 }); });
 
+function renderConnection(online=state.onlineRoles, connected=state.connectionOk ?? true) {
+  state.onlineRoles=online;
+  state.connectionOk=connected;
+  const connection=$("connection");
+  connection.classList.toggle("offline",!connected);
+  connection.title=connected?"已连接":"连接中断，正在重试";
+  $("connection-label").textContent=connected&&online!=null?`${online} 个角色在线`:connection.title;
+}
+
 setInterval(async () => {
   if (!state.csrf || state.polling || document.hidden) return;
   state.polling = true;
   try {
     await refreshTask();
     if (state.tab === "console") await Promise.all([refreshTerminal(), refreshLog()]);
-    $("connection").textContent = "● 已连接";
-    $("connection").classList.remove("offline");
+    renderConnection(undefined,true);
   } catch (error) {
-    $("connection").textContent = "● 连接中断，正在重试";
-    $("connection").classList.add("offline");
+    renderConnection(undefined,false);
   } finally { state.polling = false; }
 }, 2000);
 

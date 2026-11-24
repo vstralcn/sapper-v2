@@ -87,6 +87,26 @@ sapper flag 'flag{...}' -c <平台题目代码> --no-submit  # 本次只记录
 
 本机路径指运行服务的机器。远程浏览器的本地文件路径不能作为服务器目录使用；需要上传资料或先将目录放在执行机。Web、CLI 与 tmux 必须能访问同一文件系统和 socket；需要独立 socket 时指定 `--tmux-socket NAME`。
 
+### 比赛工作区的赛题进程
+
+每场比赛打开一个工作区。在「工作区操作 → 导入比赛题单」填写执行机目录，普通子目录按一题导入，Web、Pwn、Reverse、Crypto 等方向目录下的子目录按方向导入。题号为相对目录路径，重复导入按题号更新。确认覆盖整场比赛时勾选「此次导入后题单完整」。题单随即显示在该工作区的「进展」页。
+
+从比赛 API 获取题单时，可让主 Agent 在工作区根目录写入 `competition.json`。填写比赛给出的稳定题号，`source` 使用便于识别的来源名称。下次刷新进展时读取该文件。
+
+```json
+{
+  "source": "比赛 API",
+  "complete": true,
+  "tasks": [
+    {"id": "web-01", "name": "档案室", "category": "Web"}
+  ]
+}
+```
+
+从题目详情创建意图时自动关联题号。命令行可用 `sapper intent --from f001 --challenge web-01 "检查题目附件"`。已使用题目事实作为来源的意图，也可通过事实数据里的 `competition_challenge` 或 `challenge` 字段关联。同题可以关联多个意图。
+
+看板从派单、已观测的运行和 Flag 回执实时汇总。现有 Flag 记录以 `data.challenge` 匹配题号，`status=submitted` 表示收到通过回执。其他平台的现有集成可在收到明确结果时写入具有同样题号和状态的 `flag` 事实。仅记录 Flag 或结清子任务时，整题仍保持未解。
+
 ## 3. 角色、派发与共享图
 
 | 角色／组件 | 行为 |
@@ -131,6 +151,8 @@ bash /path/to/sapper-v2/docker/commander/worker.sh msg <agent-id> '新的补充�
 新会话使用 `--session-id UUID`，恢复用 `--resume UUID`，不用当前目录的最近会话。网页重启后保留角色／图／运行元数据，原生历史由原 CLI 保存；两者都需保留。模型或网关地址变化时不静默切换旧会话，需还原配置或创建新角色。
 
 关闭浏览器或 Web 服务不停止角色。重启使用相同 `--root`、`--state` 与 tmux socket，已绑定的外部目录从 Web 配置恢复，重新登录即可查看原会话。“停止”登记明确停止意愿再结束对应进程，工作区 watchdog 不会复活它；正常结束的单次任务也不自动重跑。Watchdog 对异常结束按原 UUID 有限重试；受管交互式指挥官另有[续轮及真实读板确认](./14-commander-liveness.md)，可在角色卡片暂停，不提供新的供应商轮换系统。
+
+受管 TUI worker 的原生回合若以 `isApiErrorMessage` 结束并进入空闲，watchdog 会在输入框为空时发送带唯一编号的恢复输入。提示只要求 worker 结合原 mission、当前 intent、共享图和已有产物，自主选择并实际执行下一步工具动作；watchdog 不生成具体解题命令。对应唤醒后的真实 `tool_use` 才确认 `work_confirmed`，文字承诺不算恢复。未恢复时按 120／240／480 秒退避，后续封顶 900 秒，不因固定次数耗尽而永久停发。正常 `end_turn`、工具运行、等待用户、非空输入框、真实用户新指令、停止／超时及已完成工作区均不自动注入。该机制不适用于 print、native_operation 或原比赛 shell 分支。
 
 “停止本工作区”先停止该题 watchdog，再停止该题登记角色；跨题目指挥官仅移除该题范围，保留其他题目，最后一个范围停止时结束指挥官。外部未登记的旧 pane 不批量结束；登记的旧 pane 仅发送原中断键，旧 watchdog 仍按原规则运行。Ctrl-C 与完整结束进程的语义不同。
 

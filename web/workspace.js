@@ -11,7 +11,8 @@ let roleInfoRequest = 0;
 let dispatchRequestId;
 let directoryRequest = 0;
 let selectedDirectory = "";
-let skillDirectoryInput = null;
+let directoryTarget = null;
+let directoryKind = "workspace";
 let listedDirectories = [];
 let agentTopology;
 const flagSettingsRequests = new Set();
@@ -40,9 +41,11 @@ refreshTask = async function () {
     if (roleResult.status === "fulfilled") {
       const roles = roleResult.value;
       state.agents = roles.agents;
+      renderUserInputRequests(state.agents);
       state.services = roles.services;
       state.mainAgent = roles.primary_agent;
       state.workspaceObservation = roles.observed_at;
+      renderConnection(roles.summary?.online ?? null);
       if($("agent-dialog").open)refreshDispatchState();
     }
     if (inspectionResult.status === "fulfilled") {
@@ -82,10 +85,13 @@ refreshTask = async function () {
 setTab = function (tab) {
   if(tab==="chat")tab="workspace";
   if (!workspaceTabs.has(tab)) tab = "progress";
+  $("breadcrumb-section").hidden=false;
+  $("breadcrumb-tab").textContent=document.querySelector(`[data-tab="${tab}"]`).textContent.trim();
   $("tab-agents").hidden = tab !== "agents";
   if (tab !== "workspace") {
     $("tab-workspace").hidden = true;
     baseSetTab(tab);
+    guarded(updateNativePage);
     rememberWorkspaceLocation();
     if (tab === "agents" && agentTopology?.current) requestAnimationFrame(() => {
       if (agentTopology.current?.needsFit) agentTopology.fit();
@@ -94,6 +100,7 @@ setTab = function (tab) {
     return;
   }
   state.tab = tab;
+  guarded(updateNativePage);
   for (const name of ["progress","memory","console","files"]) $("tab-"+name).hidden = true;
   $("tab-workspace").hidden = false;
   document.querySelectorAll("[data-tab]").forEach(n => {
@@ -114,14 +121,15 @@ async function openBind() {
   await openDirectoryPicker();
 }
 
-async function openDirectoryPicker(skillInput = null) {
+async function openDirectoryPicker(input = null, kind = input ? "skill" : "workspace") {
   const opening=++directoryRequest;
   const modelFields=$("bind-model-rows");
-  skillDirectoryInput=skillInput;
-  const forSkill=Boolean(skillInput);
-  $("directory-title").textContent=forSkill?"选择 Skill 目录":"选择题目文件夹";
+  directoryTarget=input;
+  directoryKind=kind;
+  const forSkill=kind==="skill";
+  $("directory-title").textContent=forSkill?"选择 Skill 目录":kind==="competition"?"选择题单目录":"选择题目文件夹";
   $("directory-help").textContent=forSkill?"进入包含 SKILL.md 的文件夹后，点击“使用此目录”。":"打开文件夹后，点击“选择此文件夹”。文件保持原位置。";
-  $("directory-workspace-fields").hidden=forSkill;
+  $("directory-workspace-fields").hidden=Boolean(input);
   modelFields.hidden=modelFields.disabled=true;
   $("directory-filter").hidden=!forSkill;
   $("directory-filter").value="";
@@ -137,7 +145,7 @@ async function openDirectoryPicker(skillInput = null) {
   $("bind-dialog").showModal();
   const [result, modelOptions] = await Promise.all([
     api(forSkill?"/directories?kind=skill":"/directories"),
-    forSkill ? null : newWorkspaceModelOptions(),
+    input ? null : newWorkspaceModelOptions(),
   ]);
   if (opening!==directoryRequest || !$("bind-dialog").open) return;
   if (modelOptions) renderWorkspaceModelFields(modelFields, modelOptions.config, modelOptions.profiles, {creating: true});
@@ -148,7 +156,8 @@ async function openDirectoryPicker(skillInput = null) {
     entry.title=root;
     return entry;
   }));
-  const start=forSkill?skillInput.value.trim():selectedDirectory;
+  let start=input?input.value.trim():selectedDirectory;
+  if(kind==="competition" && !start.startsWith("/"))start=state.project.path+"/"+start;
   await browseDirectory(start.startsWith("/")?start:result.roots[0]);
 }
 function directoryBreadcrumbs(path) {
@@ -166,7 +175,7 @@ function directoryBreadcrumbs(path) {
 }
 async function browseDirectory(path) {
   const request=++directoryRequest;
-  const forSkill=Boolean(skillDirectoryInput);
+  const forSkill=directoryKind==="skill";
   const modelFields=$("bind-model-rows");
   $("bind-path").value="";
   modelFields.hidden=modelFields.disabled=true;
@@ -176,9 +185,9 @@ async function browseDirectory(path) {
   try {
     const data = await api("/directories?path="+encodeURIComponent(path)+(forSkill?"&kind=skill":""));
     if (request!==directoryRequest) return;
-    if (!forSkill) selectedDirectory=data.path;
+    if (!directoryTarget) selectedDirectory=data.path;
     $("bind-path").value=!forSkill||data.has_skill?data.path:"";
-    const configureModels = !forSkill && !state.projects.some(project => project.path === data.path);
+    const configureModels = !directoryTarget && !state.projects.some(project => project.path === data.path);
     modelFields.hidden=modelFields.disabled=!configureModels;
     directoryBreadcrumbs(data.path);
     $("directory-up").disabled=!data.parent;
@@ -198,7 +207,7 @@ async function browseDirectory(path) {
 }
 
 function renderDirectoryEntries() {
-  const forSkill=Boolean(skillDirectoryInput);
+  const forSkill=directoryKind==="skill";
   const query=forSkill?$("directory-filter").value.trim().toLowerCase():"";
   const rows=listedDirectories.filter(dir=>dir.name.toLowerCase().includes(query)).map(dir => {
     const entry=button("","text-button directory-item",()=>guarded(()=>browseDirectory(dir.path)));
@@ -310,6 +319,31 @@ function renderAgents() {
   list.append(button(`打开协作拓扑 · ${rows.length} 个 Agent`,"text-button agent-preview-link",()=>setTab("agents")));
   renderAgentServices($("service-list"));
   renderAgentServices(agentTopology.el("services"));
+}
+
+function renderUserInputRequests(agents) {
+  const panel = $("user-input-requests");
+  const requests = agents.filter(a => a.pane_id && a.observation?.needs_user_input).map(a => {
+    const project = state.projects.find(p => p.id === a.workspace_id);
+    return {id: a.id, run: a.run_id, pane: a.pane_id, name: a.name || a.role_label,
+      workspace: a.workspace_id, project: project?.name};
+  });
+  const signature = JSON.stringify(requests);
+  if (panel.dataset.signature === signature) return;
+  panel.dataset.signature = signature;
+  $("user-input-request-list").replaceChildren(...requests.map(request => {
+    const row = element("li");
+    const description = state.view !== "project" && request.project
+      ? `${request.project} · ${request.name} 等待输入` : `${request.name} 等待输入`;
+    row.append(element("span", "", description), button("打开终端", "text-button", () => guarded(async () => {
+      if (state.project?.id !== request.workspace) await openProject(request.workspace, "workspace");
+      if (state.project?.id !== request.workspace) return;
+      const agent = state.agents.find(a => a.id === request.id);
+      if (agent?.observation?.needs_user_input) await openAgentOutput(agent);
+    })));
+    return row;
+  }));
+  panel.hidden = requests.length === 0;
 }
 
 async function openAgentOutput(a){
@@ -497,7 +531,7 @@ function disconnectNative(){
 }
 
 $("bind-workspace").onclick=()=>guarded(openBind);
-$("bind-dialog").addEventListener("close",()=>{++directoryRequest;skillDirectoryInput=null;listedDirectories=[];});
+$("bind-dialog").addEventListener("close",()=>{++directoryRequest;directoryTarget=null;directoryKind="workspace";listedDirectories=[];});
 $("directory-filter").oninput=renderDirectoryEntries;
 $("directory-filter").onkeydown=event=>{if(event.key==="Enter")event.preventDefault();};
 const projectTools=$("project-tools");
@@ -584,10 +618,10 @@ document.querySelectorAll(".dialog-close").forEach(node=>{node.onclick=()=>node.
 
 submit("bind-form",async form=>{
   if (!form.get("path")) throw new Error("请先选择一个可访问的文件夹");
-  if (skillDirectoryInput) {
-    skillDirectoryInput.value=form.get("path");
-    skillDirectoryInput.dispatchEvent(new Event("input",{bubbles:true}));
-    skillDirectoryInput.dispatchEvent(new Event("change",{bubbles:true}));
+  if (directoryTarget) {
+    directoryTarget.value=form.get("path");
+    directoryTarget.dispatchEvent(new Event("input",{bubbles:true}));
+    directoryTarget.dispatchEvent(new Event("change",{bubbles:true}));
     $("bind-dialog").close();
     return;
   }

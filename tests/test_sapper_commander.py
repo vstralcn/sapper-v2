@@ -138,6 +138,20 @@ class CommanderTests(unittest.TestCase):
         self.assertEqual(view["verification"], "board_confirmed")
         self.assertEqual(view["last_board"]["wake_id"], self.wake()["id"])
 
+    def test_board_read_with_unchanged_child_waits_for_idle_fallback(self):
+        child = {"id": "c" * 16, "parent_agent_id": self.agent["id"],
+                 "workspace_id": self.project["id"], "workspace_scope": [self.project["id"]],
+                 "run_id": "d" * 16, "role": "general", "status": "running"}
+        rows = [*self.rows(), child]
+        with mock.patch.object(self.manager, "agents", return_value=rows):
+            board = self.manager.strategy_board([self.project["id"]])
+        self.monitor.record_board(self.agent["id"], self.agent["run_id"], board)
+        self.idle()
+        self.tick(1059, rows=rows)
+        self.send.assert_not_called()
+        self.tick(1060, rows=rows)
+        self.send.assert_called_once()
+
     def test_wake_audit_links_terminal_delivery(self):
 
         aid = self.agent["id"]
@@ -389,6 +403,64 @@ class CommanderTests(unittest.TestCase):
         self.idle(1120)
         self.tick(1200)
         self.send.assert_called_once()
+
+    def test_native_reply_releases_waiting_user_control(self):
+        # 2026-11-24 TsecBench incident A: the commander set waiting_user, the
+        # user answered in the native TUI, control was never released and the
+        # watchdog honored the stale state for 74 minutes.
+        self.monitor.configure(self.agent["id"], "waiting_user", "请提供评测凭据")
+        with self.monitor.locked(self.agent["id"]) as data:
+            data["waiting_since"] = 1010
+        self.event("user", 1015, "<pasted_content id=\"p1\"> BENCHMARK_TOKEN x")
+        self.idle(1020)
+        self.tick(1200)
+        self.send.assert_called_once()
+        view = self.monitor.view(self.agent["id"])
+        self.assertEqual(view["control"], "active")
+        self.assertEqual(view["reason"], "用户已在原生会话中回复")
+
+    def test_task_notification_does_not_release_waiting_user_control(self):
+        self.monitor.configure(self.agent["id"], "waiting_user", "需要用户决定")
+        with self.monitor.locked(self.agent["id"]) as data:
+            data["waiting_since"] = 1010
+        self.event("user", 1012, "<task-notification> <task-id>bx</task-id> done")
+        self.tick(1200)
+        self.assertEqual(self.monitor.view(self.agent["id"])["control"], "waiting_user")
+        self.send.assert_not_called()
+
+    def test_task_notification_does_not_break_wake_verification(self):
+        # 2026-11-24 TsecBench incident B: synthetic user events cleared the
+        # accepted wake id, so the following board receipt could not verify.
+        self.idle()
+        self.tick()
+        self.accept()
+        self.event("user", 1072, "<task-notification> <task-id>bx</task-id> done")
+        self.event("assistant", 1073, [{"type": "tool_use", "id": "t1", "name": "Bash"}], "tool_use")
+        self.event("user", 1074, [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}])
+        self.monitor.record_board(self.agent["id"], self.agent["run_id"], {"agents": []})
+        view = self.monitor.view(self.agent["id"])
+        self.assertEqual(view["verification"], "board_confirmed")
+        self.assertEqual(view["last_board"]["wake_id"], self.wake()["id"])
+
+    def test_replaced_wake_board_receipt_resets_attempt_budget(self):
+        # 2026-11-24 TsecBench incident B: two accepted wakes whose receipts
+        # were unattributable (a real user message replaced the wake) burned
+        # MAX_ATTEMPTS and froze the commander for 18 minutes. The receipt is
+        # liveness evidence: end the wake cycle, budget resets, next idle
+        # sends a fresh attempt-1 wake instead of giving up.
+        self.idle()
+        self.tick()
+        self.accept()
+        self.event("user", 1072, "重试")
+        self.monitor.record_board(self.agent["id"], self.agent["run_id"], {"agents": []})
+        view = self.monitor.view(self.agent["id"])
+        self.assertNotIn("wake", view)
+        self.assertNotEqual(view["verification"], "board_confirmed")
+        self.idle(1080)
+        self.tick(1300)
+        self.assertEqual(self.wake()["attempt"], 1)
+        self.assertEqual(self.send.call_count, 2)
+        self.assertNotIn("attention", self.monitor.view(self.agent["id"]))
 
     def test_crash_recovery_is_bounded_and_not_reported_as_board_success(self):
         self.idle()

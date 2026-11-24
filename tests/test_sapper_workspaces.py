@@ -117,6 +117,41 @@ for line in sys.stdin:
     respond(line.strip())
 '''
 
+WORKER_RECOVERY_FIXTURE = r'''#!/usr/bin/env python3
+import json,os,sys
+from datetime import datetime,timezone
+from pathlib import Path
+args=sys.argv[1:]
+if '--help' in args:
+    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt')
+    raise SystemExit(0)
+if '--version' in args:
+    print('2.1.318 (fixture)')
+    raise SystemExit(0)
+sid=args[args.index('--resume' if '--resume' in args else '--session-id')+1]
+path=Path(os.environ['CLAUDE_CONFIG_DIR'])/'projects'/'fixture'/(sid+'.jsonl')
+path.parent.mkdir(parents=True,exist_ok=True)
+def event(kind,content,stop=None,api_error=False):
+    with path.open('a') as f:
+        f.write(json.dumps({'type':kind,'sessionId':sid,'timestamp':datetime.now(timezone.utc).isoformat(),
+                           'isApiErrorMessage':api_error,
+                           'message':{'content':content,'stop_reason':stop}},ensure_ascii=False)+'\n')
+def ready():
+    print('NATIVE_READY '+sid,flush=True)
+    print('❯',flush=True)
+event('user',args[-1])
+event('assistant',[{'type':'text','text':'API Error: upstream HTTP 500'}],'stop_sequence',True)
+ready()
+for line in sys.stdin:
+    prompt=line.strip()
+    event('user',prompt)
+    if '[Sapper wake:' in prompt:
+        event('assistant',[{'type':'tool_use','id':'actual-work','name':'Bash'}],'tool_use')
+        event('user',[{'type':'tool_result','tool_use_id':'actual-work','content':'concrete action completed'}])
+    event('assistant',[{'type':'text','text':'work advanced'}],'end_turn')
+    ready()
+'''
+
 
 class WorkspaceBindingTests(unittest.TestCase):
     def setUp(self):
@@ -407,10 +442,19 @@ class NativeWorkspaceTests(unittest.TestCase):
         encoded = json.dumps(event) + "\n"
         with path.open("a") as file:
             file.write(encoded[:20])
-        self.assertEqual(self.app.workspaces.agents(self.pid)[0]["execution_observation"]["phase"], "unknown")
+        observation = self.app.workspaces.agents(self.pid)[0]
+        self.assertEqual(observation["execution_observation"]["phase"], "unknown")
+        self.assertFalse(observation["observation"].get("needs_user_input"))
         with path.open("a") as file:
             file.write(encoded[20:])
-        self.assertEqual(self.app.workspaces.agents(self.pid)[0]["execution_observation"]["phase"], "waiting_user")
+        observation = self.app.workspaces.agents(self.pid)[0]
+        self.assertEqual(observation["execution_observation"]["phase"], "waiting_user")
+        self.assertTrue(observation["observation"].get("needs_user_input"))
+        answer = {"type": "user", "sessionId": agent["claude_session_id"], "timestamp": sapper.now_iso(),
+                  "message": {"content": [{"type": "tool_result", "tool_use_id": "ask", "content": "Answered"}]}}
+        with path.open("a") as file:
+            file.write(json.dumps(answer) + "\n")
+        self.assertFalse(self.app.workspaces.agents(self.pid)[0]["observation"].get("needs_user_input"))
         self.assertEqual(self.app.workspaces.services(self.pid), [])
 
     def test_idle_commander_wakes_in_place_and_crash_resumes_with_verified_board(self):
@@ -434,6 +478,20 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.assertEqual(monitor.view(aid)['verification'], 'board_confirmed')
         self.assertEqual(self.app.run_info(new_run)['claude_session_id'], run['claude_session_id'])
         self.assertEqual(monitor.view(aid)['recoveries'], 0)
+
+    def test_worker_api_error_recovers_through_real_terminal_and_tool_event(self):
+        main = self.launch(role='commander')
+        self.bin.write_text(WORKER_RECOVERY_FIXTURE)
+        os.environ['CLAUDE_CONFIG_DIR'] = str(self.base / 'native-transcripts')
+        source = self.app.store(self.pid).add_fact('API recovery fixture input', main['agent_id'])['id']
+        run = self.launch(role='worker', parent_agent_id=main['agent_id'], mission='choose and execute the next action', **{'from': source})
+        aid = run['agent_id']
+        monitor = self.app.workspaces.worker
+        self.until(lambda: monitor.view(aid).get('verification') == 'work_confirmed')
+        wake = monitor.view(aid)['wake']
+        self.assertEqual(wake['attempt'], 1)
+        self.assertEqual(wake['run_id'], run['id'])
+        self.assertEqual(self.app.workspaces.agent(aid)['run_ids'], [run['id']])
 
     def test_resume_rejects_a_changed_model_protocol(self):
         profile = self.app.save_profile({"name": "original", "model": "fixture-model"})

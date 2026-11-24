@@ -9,12 +9,13 @@ function contextStatus(c){
   return seen>=c.latest_revision?`共享环境 v${seen} · 已提供`:`共享环境 ${seen?"v"+seen:"未加载"} · v${c.latest_revision} 待更新`;
 }
 
-const workspaceTabs = new Set(["progress", "workspace", "agents", "memory", "console", "files"]);
+const workspaceTabs = new Set(["progress", "workspace", "agents", "memory", "console", "files", "native"]);
+const mainViews = {overview:["home-button","总体概览"], workspaces:["workspaces-button","工作区"], native:["native-button","原生功能"]};
 const agentStatusLabels = {running:"运行中", waiting:"等待中", idle:"在线空闲", error:"异常", offline:"已离线", unknown:"状态未确认"};
 
 function workspaceLocation() {
   if (state.view === "project" && state.project) return `#workspace/${state.project.id}/${state.tab}`;
-  return state.view === "workspaces" ? "#workspaces" : "";
+  return state.view === "overview" ? "" : "#" + state.view;
 }
 
 function rememberWorkspaceLocation() {
@@ -24,6 +25,7 @@ function rememberWorkspaceLocation() {
 
 async function restoreWorkspaceLocation() {
   if (location.hash === "#workspaces") return showOverview("workspaces");
+  if (location.hash === "#native") return showOverview("native");
   const match = /^#workspace\/([a-f0-9]{16})\/([a-z]+)$/.exec(location.hash);
   const project = match && state.projects.find(p => p.id === match[1]);
   if (project) return openProject(project, workspaceTabs.has(match[2]) ? match[2] : "progress");
@@ -38,12 +40,13 @@ async function openProject(project,tab="progress"){
   state.view="project";state.project=project;state.folder=".";state.workspaceFolder=".";state.log=null;state.workspaceFilesPid=null;
   state.graph={project, facts:[], intents:[], open_intents:[], hints:[]};
   state.panes=[];state.runs=[];state.agents=[];state.services=[];state.memorySignature=null;
+  renderUserInputRequests([]);
   state.agentSignature=null;state.nativePaneSignature=null;
   state.mainAgent=null;state.workspaceObservation=null;state.progressSignature=null;state.graphLoad="loading";
   try {localStorage.setItem("sapper-project",project.id);} catch {}
   $("overview").hidden=true;$("workspaces-page").hidden=true;$("empty-state").hidden=true;$("project-workspace").hidden=false;$("log-panel").hidden=true;
-  $("home-button").classList.remove("active");
-  $("workspaces-button").classList.remove("active");
+  renderMainNavigation();
+  renderConnection(null);
   $("breadcrumb").textContent=project.name;$("project-name").textContent=project.name;
   $("project-goal").textContent=project.goal;$("project-path").textContent=project.path;
   $("project-status").textContent="正在读取工作区…";
@@ -61,14 +64,26 @@ async function openProject(project,tab="progress"){
 async function showOverview(view="overview"){
   state.navigation=(state.navigation||0)+1;
   disconnectNative();state.view=view;state.project=null;state.log=null;
+  renderUserInputRequests([]);
   $("project-workspace").hidden=true;$("empty-state").hidden=true;$("overview").hidden=view!=="overview";
   $("workspaces-page").hidden=view!=="workspaces";
-  $("home-button").classList.toggle("active",view==="overview");
-  $("workspaces-button").classList.toggle("active",view==="workspaces");
-  $("breadcrumb").textContent=view==="workspaces"?"工作区":"总体概览";
+  renderMainNavigation();
+  $("breadcrumb").textContent=mainViews[view][1];
+  $("breadcrumb-section").hidden=true;
+  renderConnection(state.overview?.summary.active_agents ?? null);
   rememberWorkspaceLocation();
   if(view==="workspaces")renderWorkspaceTable(state.overview?.projects||state.projects);
-  renderProjects();await refreshOverview();
+  renderProjects();
+  await Promise.all([updateNativePage(),refreshOverview()]);
+}
+
+function renderMainNavigation(){
+  for(const [view,[id]] of Object.entries(mainViews)){
+    const link=$(id);
+    link.classList.toggle("active",state.view===view);
+    if(state.view===view)link.setAttribute("aria-current","page");
+    else link.removeAttribute("aria-current");
+  }
 }
 
 function projectStatus(p) {
@@ -115,6 +130,7 @@ function shellArg(value) {
 }
 
 function renderProgress() {
+  renderCompetition();
   const project = state.project;
   const observed = state.workspaceObservation;
   $("progress-observed").textContent = observed ? `状态观测于 ${new Date(observed).toLocaleString("zh-CN")}` : "正在读取角色状态…";
@@ -153,6 +169,8 @@ async function refreshOverview(){
   const data=await api("/overview");
   if(state.view==="project"||navigation!==state.navigation)return;
   state.overview=data;state.projects=data.projects;renderProjects();
+  renderUserInputRequests(data.agents);
+  renderConnection(data.summary.active_agents);
   const signature=JSON.stringify(data);
   if(state.overviewSignature===signature)return;
   state.overviewSignature=signature;
@@ -199,7 +217,7 @@ async function loadContextEditor(){
   $("context-content").value=c.content;$("context-revision").textContent=c.revision?`已保存 v${c.revision}`:"尚未配置";
 }
 async function openContext(){await loadContextEditor();$("context-dialog").showModal();}
-$("home-button").onclick=()=>guarded(showOverview);
+$("home-button").onclick=$("breadcrumb-home").onclick=()=>guarded(showOverview);
 $("workspaces-button").onclick=()=>guarded(()=>showOverview("workspaces"));
 $("workspaces-bind").onclick=()=>guarded(openBind);
 $("workspaces-search").oninput=$("workspaces-filter").onchange=()=>renderWorkspaceTable(state.overview?.projects||state.projects);

@@ -1,44 +1,164 @@
 "use strict";
 
 let nativeCatalog,nativePreview,nativeConfigVersion,nativeConfigProject,nativeConfigPath;
-let nativePreset={},nativeOutputGeneration=0;
+let nativeCommand,nativeGroup,nativePageScope;
+let nativePreset={},nativeOutputGeneration=0,nativePreviewRevision=0;
 const nativeControls=new Map();
+const nativeGroups = [
+  {label:"事实与意图", names:["status","graph","validate","frontier","pick","fact","intent","hint","show","doc","recall","claim","release","done","complete","confirm","brainstorm-pick"]},
+  {label:"调度与推进", names:["dispatch","auto","command","fleet","sweep","family"]},
+  {label:"角色通信", names:["peers","send","capture"]},
+  {label:"接入与撤销", names:["init","setup","teardown"]},
+  {label:"Flag 记账", names:["flag"]},
+  {label:"其他", names:["view","kb"]},
+];
 const nativeActionNames={add:"新增",search:"搜索",show:"查看详情",list:"列出",import:"导入 Markdown",root:"查看根目录",
   init:"初始化",up:"启动编队",down:"停止编队",status:"查看状态",hire:"派发原 auto worker",fire:"停止原 worker",workers:"列出 workers"};
 
-function invalidateNative(){nativePreview=null;$("native-execute").disabled=true;$("native-preview").hidden=true;}
+function invalidateNative(){
+  nativePreviewRevision++;
+  nativePreview=null;
+  $("native-execute").disabled=true;
+  $("native-execute").hidden=true;
+  $("native-preview").hidden=true;
+}
+function nativeCommands(group){
+  const catalog = nativeCatalog.commands;
+  const commands = group.names.map(name => catalog.find(c => c.name === name)).filter(Boolean);
+  if(group === nativeGroups.at(-1)){
+    commands.push(...catalog.filter(c => !nativeGroups.some(g => g.names.includes(c.name))));
+  }
+  return commands;
+}
+function renderNativeCategories(){
+  nativeGroup = null;
+  $("native-categories").replaceChildren(...nativeGroups.flatMap(group => {
+    const commands = nativeCommands(group);
+    if(!commands.length)return [];
+    const item = button(group.label, "", () => {
+      if(nativeGroup !== group)selectNativeCommand(commands[0].name);
+    });
+    item.dataset.category = group.label;
+    item.append(element("span","",commands.length));
+    return [item];
+  }));
+}
+function selectNativeCommand(operation,preset={},preferred=$("native-project").value){
+  nativeCommand = nativeCatalog.commands.find(command => command.name === operation);
+  const group = nativeGroups.find(g => g.names.includes(operation)) || nativeGroups.at(-1);
+  if(nativeGroup !== group){
+    nativeGroup = group;
+    $("native-categories").querySelectorAll("button").forEach(item => {
+      item.setAttribute("aria-pressed",String(item.dataset.category === group.label));
+    });
+    $("native-commands").replaceChildren(...nativeCommands(group).map(command => {
+      const item = button("", "", () => {
+        if(nativeCommand !== command)selectNativeCommand(command.name);
+      });
+      item.dataset.operation = command.name;
+      item.append(element("span","",command.label),element("code","",command.name));
+      return item;
+    }));
+    $("native-commands").scrollTop = 0;
+  }
+  $("native-commands").querySelectorAll("button").forEach(item => {
+    if(item.dataset.operation === operation)item.setAttribute("aria-current","true");
+    else item.removeAttribute("aria-current");
+  });
+  nativePreset = {...nativeDefaults(operation),...preset};
+  updateNativeProjects(preferred);
+  renderNativeFields();
+}
+function nativeDefaults(operation){
+  if(operation==="kb")return {action:"list"};
+  if(operation==="dispatch")return {target:"reason"};
+  if(["command","sweep"].includes(operation))return {root:nativeCatalog.roots[0]};
+  return {};
+}
+function resetNativeConfig(){
+  $("native-config-content").value="";
+  $("native-config-content").disabled=true;
+  $("native-config-save").disabled=true;
+}
 function updateNativeProjects(preferred){
-  const op=$("native-operation").value;
-  const nodes=state.projects.map(p=>{const n=element("option","",p.name);n.value=p.id;return n;});
-  if(op==="kb"){const n=element("option","","全局知识库（无需工作区）");n.value="global";nodes.unshift(n);}
-  $("native-project").replaceChildren(...nodes);
-  if(nodes.some(n=>n.value===preferred))$("native-project").value=preferred;
-  $("native-preview-button").disabled=!nodes.length;
-  $("native-dialog").querySelector(".native-config").hidden=$("native-project").value==="global"||!nodes.length;
+  const select=$("native-project");
+  const previous=select.value;
+  const locked=select.disabled;
+  const projects=locked?[state.project]:state.projects;
+  const nodes=projects.map(p=>new Option(p.name,p.id));
+  if(nativeCommand.name==="kb"&&!locked)nodes.unshift(new Option("全局知识库","global"));
+  select.replaceChildren(...(nodes.length?nodes:[new Option("暂无工作区","")]));
+  if(nodes.some(n=>n.value===preferred))select.value=preferred;
+  $("native-preview-button").disabled=!select.value;
+  $("native-workbench").querySelector(".native-config").hidden=!select.value||select.value==="global";
+  if(select.value!==previous)resetNativeConfig();
+}
+function refreshNativeProfiles(){
+  const selected=$("native-profile").value;
+  $("native-profile").replaceChildren(...$("run-profile").cloneNode(true).children);
+  if(Array.from($("native-profile").options).some(option=>option.value===selected))$("native-profile").value=selected;
+  if($("native-profile").value!==selected)invalidateNative();
+}
+function mountNativeWorkbench(container,operation,preset,project,locked){
+  container.append($("native-workbench"));
+  $("native-project").disabled=locked;
+  $("native-profile").value="";
+  refreshNativeProfiles();
+  renderNativeCategories();
+  selectNativeCommand(operation,preset,project);
+  resetNativeConfig();
+}
+async function updateNativePage(){
+  const pid=state.view==="project"&&state.tab==="native"?state.project.id:null;
+  const key=pid||(state.view==="native"?"global":null);
+  $("tab-native").hidden=!key;
+  $("native-page-title").hidden=!!pid;
+  if(key===(nativePageScope?.key??null))return;
+  const scope=key?{key}:null;
+  nativePageScope=scope;
+  if(!$("native-dialog").open)invalidateNative();
+  if(!scope)return;
+  const loading=$("native-loading"),content=$("native-page-content");
+  loading.textContent="正在读取命令目录…";
+  loading.hidden=false;content.hidden=true;
+  try{
+    nativeCatalog ??= await api("/native/catalog");
+  }catch(error){
+    if(nativePageScope!==scope)return;
+    nativePageScope=null;
+    loading.textContent="命令目录读取失败，请重新打开原生功能。";
+    throw error;
+  }
+  if(nativePageScope!==scope||$("native-dialog").open)return;
+  mountNativeWorkbench(content,"status",{},pid,!!pid);
+  loading.hidden=true;content.hidden=false;
 }
 async function openNative(operation="status",preset={}){
-  nativeCatalog=await api("/native/catalog");nativePreset=preset;
-  if(["command","sweep"].includes(operation)&&nativePreset.root==null)nativePreset.root=nativeCatalog.roots[0];
-  $("native-operation").replaceChildren(...nativeCatalog.commands.map(c=>{const n=element("option","",`${c.label} · ${c.name}`);n.value=c.name;return n;}));
-  $("native-operation").value=operation;
-  $("native-profile").replaceChildren(...$("run-profile").cloneNode(true).children);
-  updateNativeProjects(operation==="kb"?"global":state.project?.id||state.projects[0]?.id);
-  renderNativeFields();
-  $("native-config-content").value="";$("native-config-content").disabled=true;$("native-config-save").disabled=true;
-  $("native-dialog").showModal();
+  const navigation=state.navigation;
+  nativeCatalog ??= await api("/native/catalog");
+  if(!state.csrf||navigation!==state.navigation)return;
+  mountNativeWorkbench($("native-dialog"),operation,preset,operation==="kb"?"global":state.project?.id,false);
+  if(!$("native-dialog").open)$("native-dialog").showModal();
 }
 function renderNativeFields(){
-  invalidateNative();nativeControls.clear();const op=$("native-operation").value;
-  const spec=nativeCatalog.commands.find(c=>c.name===op);
-  $("native-command-help").textContent=op==="flag"?"只记入原本地 Flag 台账，不提交比赛平台。":op==="fleet"?"原 tmux 编队：先准备 fleet.json，再执行 up／hire／status／down。原编队独立会话需通过 fleet down 停止。":op==="teardown"?"撤销原项目接入；默认保留图，purge 会永久删除图数据。建议先停止相关运行。":spec.help;
+  invalidateNative();nativeControls.clear();
+  const spec=nativeCommand,op=spec.name;
+  $("native-command-name").textContent=op;
+  $("native-command-title").textContent=spec.label;
+  $("native-parameter-count").textContent=`${spec.fields.length} 个参数`;
+  const help=$("native-command-help");
+  help.textContent=op==="flag"?"仅记入本地 Flag 台账。":op==="fleet"?"先准备 fleet.json。独立编队通过 fleet down 停止。":op==="teardown"?"撤销项目接入。选择 purge 会永久删除图数据。":spec.help;
+  help.hidden=!help.textContent;
   const fields=$("native-fields");fields.replaceChildren();
   for(const f of spec.fields){
-    const label=element("label","native-field"),heading=element("span","",f.label+(f.required?" *":""));
-    if(f.flag)heading.append(element("code","",f.flag));label.append(heading);
+    const label=element("label","native-field"),heading=element("span","native-field-label",f.label);
+    if(f.required)heading.append(element("span","native-field-tag required","必填"));
+    if(f.repeated)heading.append(element("span","native-field-tag","可重复"));
+    label.append(heading);
     let input;
     if(f.type==="boolean"){
       input=document.createElement("input");input.type="checkbox";input.checked=nativePreset[f.name]??!!f.default;
-      label.classList.add("native-check");label.prepend(input);
+      label.classList.add("native-check");
     }else if(f.choices){
       input=document.createElement("select");
       if(!f.required){const n=element("option","",f.default==null?"使用原默认值":`默认：${f.default}`);n.value="";input.append(n);}
@@ -47,9 +167,9 @@ function renderNativeFields(){
     }else{
       const multiline=f.repeated||["description","doc","detail","message","set","note"].includes(f.name);
       input=document.createElement(multiline?"textarea":"input");
-      if(multiline){input.rows=["doc","detail","set"].includes(f.name)?5:3;label.classList.add("native-wide");}
+      if(multiline)input.rows=["doc","detail","set"].includes(f.name)?2:1;
       else input.type=f.type==="integer"?"number":"text";
-      input.placeholder=f.default==null?"":`原默认值：${f.default}`;
+      input.placeholder=f.default!=null?`默认：${f.default}`:f.repeated?"每行填写一项":f.flag||"";
       if(nativePreset[f.name]!=null)input.value=Array.isArray(nativePreset[f.name])?nativePreset[f.name].join("\n"):nativePreset[f.name];
       if(op==="dispatch"&&f.name==="target"){
         const list=element("datalist","");list.id="native-dispatch-targets";
@@ -60,14 +180,14 @@ function renderNativeFields(){
     input.required=f.required&&f.type!=="boolean";
     input.id="native-field-"+f.name;input.name=f.name;
     input.addEventListener("input",invalidateNative);input.addEventListener("change",invalidateNative);
-    if(f.type!=="boolean")label.append(input);
-    label.append(element("small","field-help",f.help));fields.append(label);nativeControls.set(f.name,{field:f,input});
+    label.append(input);
+    if(f.help)label.append(element("small","field-help",f.help));
+    fields.append(label);nativeControls.set(f.name,{field:f,input});
   }
-  nativePreset={};
   updateNativePermissionWarning();
 }
 function updateNativePermissionWarning(){
-  const op=$("native-operation").value;
+  const op=nativeCommand.name;
   const skip=nativeControls.get("skip_permissions")?.input.checked;
   const dry=nativeControls.get("dry_run")?.input.checked;
   const target=nativeControls.get("target")?.input.value.trim()||"";
@@ -83,19 +203,22 @@ function nativeRequest(){
     if(input.value==="")continue;
     values[name]=f.repeated&&f.flag?input.value.split("\n").filter(s=>s.trim()):input.value;
   }
-  return {operation:$("native-operation").value,values,profile_id:$("native-profile").value};
+  return {operation:nativeCommand.name,values,profile_id:$("native-profile").value};
 }
 async function previewNative(){
   if(!$("native-form").reportValidity())return;
+  invalidateNative();
+  const revision=nativePreviewRevision;
   const pid=$("native-project").value,request=nativeRequest();
   const p=await api(`/native/${pid}/preview`,{method:"POST",body:request});
+  if(revision!==nativePreviewRevision)return;
   nativePreview={...p,request,pid,request_id:crypto.randomUUID()};
   $("native-preview-cwd").textContent="工作目录："+p.cwd+(p.profile?` · 模型配置：${p.profile.name} / ${p.profile.model}`:" · 继承原环境");
   $("native-preview-command").textContent=p.command;
   $("native-preview-fleet").hidden=!p.fleet_config;
   $("native-preview-fleet").textContent=p.fleet_config?JSON.stringify(p.fleet_config,null,2):"";
   $("native-preview-note").textContent=p.destructive?"此操作会覆盖数据、撤销接入或停止指定编队。执行时需确认以上目标。":"执行原命令后可查看输出与退出码。LLM 命令使用原循环及权限选项，dry-run 可先检查提示词。";
-  $("native-preview").hidden=false;$("native-execute").disabled=false;
+  $("native-preview").hidden=false;$("native-execute").hidden=false;$("native-execute").disabled=false;
 }
 async function openNativeOutput(run){
   const generation=++nativeOutputGeneration;$("native-output-text").textContent="正在读取原命令输出…";
@@ -117,13 +240,23 @@ async function loadNativeConfig(){
   $("native-config-content").value=r.content;$("native-config-content").disabled=false;$("native-config-save").disabled=false;
   toast(r.exists?"已读取工作区配置":"显示原模板／示例，保存后才写入工作区");
 }
-$("native-operation").onchange=()=>{const op=$("native-operation").value;nativePreset=op==="kb"?{action:"list"}:op==="dispatch"?{target:"reason"}:["command","sweep"].includes(op)?{root:nativeCatalog.roots[0]}:{};updateNativeProjects($("native-project").value);renderNativeFields();};
-$("native-project").onchange=()=>{invalidateNative();$("native-dialog").querySelector(".native-config").hidden=$("native-project").value==="global";$("native-config-save").disabled=true;$("native-config-content").disabled=true;};
+$("native-project").onchange=()=>{
+  invalidateNative();
+  resetNativeConfig();
+  $("native-workbench").querySelector(".native-config").hidden=$("native-project").value==="global";
+};
 $("native-profile").onchange=invalidateNative;
 $("native-fields").addEventListener("input",updateNativePermissionWarning);
 $("native-fields").addEventListener("change",updateNativePermissionWarning);
 $("native-preview-button").onclick=()=>guarded(previewNative);
-$("native-button").onclick=$("workspace-native").onclick=()=>guarded(()=>openNative());
+$("native-reset").onclick=renderNativeFields;
+$("native-button").onclick=()=>guarded(()=>showOverview("native"));
+$("workspace-native").onclick=()=>{setTab("native");$("native-tab").focus();};
+$("native-dialog").addEventListener("close",()=>{
+  invalidateNative();
+  nativePageScope=null;
+  if(state.csrf&&!$("tab-native").hidden)guarded(updateNativePage);
+});
 $("native-config-load").onclick=()=>guarded(loadNativeConfig);
 $("native-config-path").onchange=()=>{$("native-config-save").disabled=true;$("native-config-content").disabled=true;};
 $("native-config-save").onclick=()=>guarded(async()=>{
@@ -135,7 +268,8 @@ submit("native-form",async()=>{
   const p=nativePreview;if(!p)throw new Error("请先预览原命令");
   if(p.destructive&&!await confirmAction(`确认执行：\n${p.command}\n工作目录：${p.cwd}\n该操作可能停止会话、覆盖或删除图数据。`))return;
   const r=await api(`/native/${p.pid}/execute`,{method:"POST",body:{...p.request,preview_token:p.preview_token,acknowledged:p.destructive,request_id:p.request_id}});
-  $("native-dialog").close();
+  invalidateNative();
+  if($("native-dialog").open)$("native-dialog").close();
   if(p.pid==="global"){await openNativeOutput(r);if(state.view==="overview")await refreshOverview();}
   else{await refreshProjects();await openProject(p.pid,"console");await openLog(r);}
   toast("原命令已启动，可查看输出和退出码");

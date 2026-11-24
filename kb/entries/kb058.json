@@ -1,0 +1,14 @@
+{
+  "id": "kb058",
+  "title": "TCP 行协议服务 Pwn 速查（越界读/负偏移/溢出）",
+  "description": "f1 系列 5 题全清的打法：这类题都是自实现行协议服务，漏洞固定在协议命令里",
+  "detail": "## 适用场景\n靶场给的是 `nc host port` 可直连的行协议服务（不是 ELF 附件），题面描述为令牌存储/LRU缓存/心跳/响应构造/缓冲区写入之类。\n\n## 通用流程\n1. `nc` 连接，发 `HELP` 或空行，把全部命令名抄下来（STORE/LIST/SETBODY/ADDHEADER/BUILD/COPY/REVEAL/HEARTBEAT/SETPAYLOAD...）。\n2. 对每个命令，逐个试：负数值、超大数值、超长字符串、空参数、缺参数。\n3. 观察哪个操作会**回显读取**内存（LIST/BUILD/REVEAL/回显接口）——漏洞点 = 越界写 + 越界读 的组合。\n\n## 实测命中的四种模式\n| 题 | 命令 | 缺陷 |\n|---|---|---|\n| f1-01 | `STORE <300字节>` 后 `LIST` | token slot 定长，写入 300 字节溢出到相邻结构，LIST 把 flag 一起读出来 |\n| f1-03 | `SETPAYLOAD AA` + `HEARTBEAT 8192` | Heartbleed 式：2 字节载荷声明 8192 长度，服务端按声明长度回显 = 越界读 |\n| f1-04 | `SETBODY` + `ADDHEADER` 多次 + `BUILD` | BUILD 导出的 hdrtab 结构里含受保护数据 |\n| f1-05 | `COPY -8 DEADBEEF` + `REVEAL` | 负偏移绕过边界检查（signed offset underflow），写到 guard 之前 |\n\n## 快速判据\n- 命令接受数字参数 → 先试 `-1`、`-8`、`999999`。\n- 有设置长度/大小的参数 → 试 长度远大于实际载荷（heartbleed）。\n- 有导出/列举/显示命令 → 这是泄露通道。",
+  "commands": [],
+  "tags": [
+    "pwn",
+    "protocol",
+    "ctf"
+  ],
+  "source": "TsecBench 2026-11 实测 f1-01..f1-05",
+  "created_at": "2026-11-24T07:41:50Z"
+}

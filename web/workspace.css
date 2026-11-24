@@ -40,7 +40,6 @@
 .project-tools-panel .danger{margin-top:5px}
 .project-tools-panel .workspace-flag-option{display:flex;align-items:center;gap:8px;padding:8px 9px;font-size:13px;cursor:pointer}
 .workspace-flag-option input{width:auto;margin:0;accent-color:var(--accent)}
-.workspace:has(#project-workspace:not([hidden])) #native-button{display:none}
 @media(max-width:720px){.project-controls{margin-top:14px}}
 .extension-resource { display: flex; align-items: center; gap: 12px; padding: 8px 0; flex-wrap: wrap; }
 .extension-resource > span { flex: 1; overflow-wrap: anywhere; }

@@ -49,3 +49,128 @@ dialog{background:var(--paper);border:1px solid var(--line);border-radius:12px;p
 .theme-switch button[aria-pressed=true]{background:var(--paper);color:var(--accent);font-weight:600;box-shadow:0 1px 3px #162b3914}
 .login-theme{position:absolute;right:40px;top:32px}
 @media(max-width:720px){.topbar-actions{gap:10px}.topbar .connection{max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.theme-switch button{padding:6px 9px}.login-theme{right:25px;top:25px}}
+
+.icon-definitions { position: absolute; width: 0; height: 0; overflow: hidden; }
+.ui-icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.65;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.workspace {
+  --page-gutter: 36px;
+  grid-template-columns: 214px minmax(0, 1fr);
+}
+.sidebar { padding: 20px 14px 0; }
+.brand { padding: 0 6px; font-size: 21px; }
+.sidebar :is(.brand, .sidebar-nav, .sidebar-heading, .sidebar-actions, .sidebar-bottom) { flex-shrink: 0; }
+#project-list { min-height: 0; overflow: auto; }
+.sidebar-nav { display: grid; gap: 3px; margin-top: 26px; }
+.sidebar-nav .sidebar-link { min-height: 40px; padding: 9px 10px; border-radius: 6px; font-size: 13px; }
+.sidebar-nav .sidebar-link:hover { background: var(--nav-hover); }
+.sidebar-nav .sidebar-link.active { background: var(--nav-active); color: var(--nav-text); font-weight: 600; }
+.sidebar-heading { gap: 8px; margin: 22px 9px 7px; }
+.sidebar-heading span:first-child { margin-right: auto; font-size: 12px; font-weight: 600; }
+.sidebar-heading .icon-button { font-size: 16px; }
+.project-item { position: relative; padding: 9px 8px 9px 24px; }
+.project-item::before {
+  content: "";
+  position: absolute;
+  top: 15px;
+  left: 10px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--nav-muted);
+}
+.project-item.active::before { background: var(--focus); }
+.project-item .task-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; }
+.sidebar-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 22px; }
+.sidebar-actions .button {
+  flex: 1 0 100%;
+  justify-content: flex-start;
+  margin: 0;
+  padding: 6px 9px;
+  min-height: 33px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--nav-link);
+  font-size: 12px;
+}
+.sidebar-actions .button:hover { background: var(--nav-hover); color: var(--nav-text); }
+.sidebar-actions .ui-icon { width: 15px; height: 15px; }
+.sidebar-bottom { margin-inline: -14px; padding: 9px 19px 13px; border-top: 1px solid var(--nav-line); }
+.sidebar .environment { margin: 0; padding: 0; border: 0; font-size: 11px; }
+.sidebar-account { margin-top: 5px; color: var(--nav-muted); font-size: 11px; }
+.sidebar-account span { color: var(--nav-link); }
+
+.topbar { min-height: 55px; padding-inline: var(--page-gutter); }
+.topbar-location, #breadcrumb-section, .topbar .connection { display: flex; align-items: center; gap: 8px; }
+.topbar-location { color: var(--muted); }
+.breadcrumb-home { padding: 4px 0; border: 0; background: transparent; color: inherit; }
+.breadcrumb-home:hover { color: var(--accent); }
+.breadcrumb-divider { width: 13px; height: 13px; }
+#breadcrumb { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+#breadcrumb-section { flex-shrink: 0; }
+.topbar .connection { color: var(--muted); max-width: none; }
+.topbar .connection .ui-icon { color: var(--success); }
+.topbar .connection.offline, .topbar .connection.offline .ui-icon { color: var(--danger); }
+.user-input-requests {
+  margin: 12px var(--page-gutter) 0;
+  padding: 10px 14px;
+  border-inline-start: 3px solid var(--warning);
+  border-radius: 5px;
+  background: var(--warning-soft);
+  color: var(--text);
+  font-size: 13px;
+}
+.user-input-requests strong { color: var(--warning); }
+.user-input-requests ul { list-style: none; margin: 4px 0 0; padding: 0; }
+.user-input-requests li { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.user-input-requests li span { overflow-wrap: anywhere; }
+.user-input-requests li button { flex-shrink: 0; }
+.project-heading { padding: 24px var(--page-gutter) 18px; }
+.project-heading h1 { font-size: 21px; line-height: 1.4; margin: 7px 0; }
+.project-kicker { flex-wrap: wrap; gap: 7px 10px; }
+.project-heading .project-controls { max-width: 50%; }
+#project-tools { margin-top: 0; }
+.project-controls .metrics {
+  margin: 0;
+  padding: 8px 11px;
+  gap: 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--paper);
+}
+.project-controls .metrics > div { display: flex; gap: 4px; white-space: nowrap; }
+.project-controls .metrics strong { font-size: 14px; }
+.tabs { margin-inline: var(--page-gutter); padding: 0; gap: 5px; overflow-x: auto; }
+.tabs > button { display: inline-flex; align-items: center; gap: 7px; padding: 10px 12px 11px; white-space: nowrap; }
+.tabs > button:hover { background: var(--surface); color: var(--text); }
+.tabs .ui-icon { width: 16px; height: 16px; }
+.tab-panel { padding-inline: var(--page-gutter); }
+
+@media (max-width: 1100px) {
+  .workspace { --page-gutter: 24px; grid-template-columns: 187px minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  .workspace { --page-gutter: 19px; }
+  .sidebar { display: flex; gap: 7px; padding: 14px 16px 8px; }
+  .sidebar-nav { display: flex; gap: 3px; margin-top: 3px; overflow-x: auto; }
+  .sidebar-nav .sidebar-link { width: auto; min-height: 33px; padding: 6px 8px; gap: 5px; font-size: 11px; white-space: nowrap; }
+  .sidebar-nav .ui-icon { width: 14px; height: 14px; }
+  .sidebar-actions { margin: 0; }
+  .sidebar-actions .button { flex: 0 1 auto; }
+  .sidebar-bottom { margin: 0; padding: 3px 0; border: 0; justify-content: space-between; }
+  .sidebar .environment { margin-top: 3px; }
+  .sidebar-account { margin-top: 0; }
+  .topbar .connection #connection-label { display: none; }
+  .topbar-location, #breadcrumb-section { gap: 4px; }
+  .project-heading .project-controls { justify-content: flex-start; max-width: none; }
+  #project-tools { margin-left: auto; }
+  .tabs > button { padding-inline: 9px; }
+}

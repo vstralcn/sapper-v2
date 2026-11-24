@@ -33,6 +33,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import sapper
+import sapper_competition as competition
 import sapper_context
 import sapper_evidence
 from kb import KnowledgeBase, KBError
@@ -417,13 +418,39 @@ class Console:
         return project
 
     def graph(self, pid):
-        store = self.store(pid)
+        project = self.project(pid)
+        root = Path(project["path"])
+        store = sapper.Store(self.inside(root / ".sapper", root))
         if not store.exists():
-            project = self.project(pid)
-            return {"project": {"id": "proj", "goal": project["goal"], "status": "not_enabled"},
-                    "facts": [], "intents": [], "hints": [], "open_intents": [], "done_intents": [], "fact_ids": []}
-        with store.locked():
-            return sapper.build_graph_view(store)
+            graph = {"project": {"id": "proj", "goal": project["goal"], "status": "not_enabled"},
+                     "facts": [], "intents": [], "hints": [], "open_intents": [], "done_intents": [], "fact_ids": []}
+        else:
+            with store.locked():
+                graph = sapper.build_graph_view(store)
+        try:
+            roster = competition.read_roster(root)
+            if roster is not None:
+                graph["competition"] = competition.with_graph(roster, graph)
+        except sapper.FGError as exc:
+            graph["competition"] = {"error": self.redact(str(exc))}
+        return graph
+
+    def import_competition(self, pid, data):
+        root = Path(self.project(pid)["path"])
+        complete = data.get("complete", False)
+        if type(complete) is not bool:
+            raise WebError("完整题单选项必须为布尔值")
+        directory = self.workspaces.allowed(root / Path(require_text(data, "directory", 4096)).expanduser())
+        roster = competition.scan_directory(directory, complete=complete)
+        with self.config_lock():
+            existing = competition.read_roster(root)
+            if existing:
+                tasks = {row["id"]: row for row in existing["tasks"]}
+                tasks.update((row["id"], row) for row in roster["tasks"])
+                roster = competition.normalize_roster({**roster, "tasks": list(tasks.values())})
+            sapper.atomic_write_json(root / competition.FILENAME, roster)
+        self.audit("competition.imported", workspace=pid, tasks=len(roster["tasks"]))
+        return roster
 
     def graph_action(self, pid, action, data):
         store = self.store(pid)
@@ -440,9 +467,27 @@ class Console:
                                     title=data.get("title"), doc=data.get("doc"), kind=data.get("kind"),
                                     data=data.get("data"), evidence=self.evidence(store, pid, data))
         elif action == "intent":
-            result = store.add_intent(data.get("from", []), require_text(data, "description"),
-                                      "web-user", requires_confirmation=bool(data.get("requires_confirmation")),
-                                      title=data.get("title"), doc=data.get("doc"))
+            topic = data.get("competition_challenge")
+            from_ids = data.get("from", [])
+            description = require_text(data, "description")
+            if topic is not None:
+                topic = require_text(data, "competition_challenge", 160)
+                roster = competition.read_roster(Path(self.project(pid)["path"]))
+                task = next((task for task in (roster or {}).get("tasks", []) if task["id"] == topic), None)
+                if task is None:
+                    raise WebError("题号不在当前工作区题单中")
+                if from_ids == []:
+                    store.require()
+                    with self.config_lock():
+                        fact = next((f for f in store.list_facts()
+                                     if f.get("kind") == "note" and (f.get("data") or {}).get("competition_challenge") == topic), None)
+                        if fact is None:
+                            fact = store.add_fact(f"题单登记 {topic}", "web-user", title=task["name"], kind="note",
+                                                  data={"competition_challenge": topic})
+                        from_ids = [fact["id"]]
+            result = store.add_intent(from_ids, description, "web-user",
+                                      requires_confirmation=bool(data.get("requires_confirmation")),
+                                      title=data.get("title"), doc=data.get("doc"), competition_challenge=topic)
         elif action == "confirm":
             result = store.confirm_intent(require_text(data, "id", 64))
         elif action == "claim":
@@ -1426,7 +1471,7 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             q = lambda name, default="": query.get(name, [default])[0]
             static_names = {"/", "/theme.js", "/app.js", "/style.css", "/workspace.js", "/extensions.js", "/workspace.css", "/overview.js", "/overview.css", "/native.js", "/native.css",
-                            "/agent-topology.js", "/agent-topology-model.js", "/agent-topology.css", "/models.js", "/models.css", "/settings.css",
+                            "/agent-topology.js", "/agent-topology-model.js", "/agent-topology.css", "/models.js", "/models.css", "/settings.css", "/competition.js", "/competition.css",
                             "/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js"}
             if path in static_names and method == "GET":
                 filename = "index.html" if path == "/" else path[1:]
@@ -1516,6 +1561,8 @@ class Handler(BaseHTTPRequestHandler):
                             return self.reply(200, app.workspaces.enable(wid, data))
                         if action == "settings":
                             return self.reply(200, app.workspaces.save_settings(wid, data))
+                        if action == "competition":
+                            return self.reply(200, app.import_competition(wid, data))
                         if action == "sessions":
                             return self.reply(201, app.workspaces.create_session(wid, data))
                         if action == "dispatch":

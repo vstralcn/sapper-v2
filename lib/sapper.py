@@ -397,6 +397,7 @@ class Store:
         *,
         assigned_worker: str | None = None,
         family: str | None = None,
+        competition_challenge: str | None = None,
     ) -> dict:
         if not isinstance(description, str) or not description.strip():
             raise FGError("intent description cannot be empty")
@@ -407,6 +408,11 @@ class Store:
             raise FGError("assignment needs a worker and an intent ready to be claimed")
         if family is not None and not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", family):
             raise FGError("invalid family key")
+        if competition_challenge is not None and (
+            not isinstance(competition_challenge, str) or not competition_challenge.strip()
+            or len(competition_challenge) > 160 or re.search(r"[\x00-\x1f\x7f]", competition_challenge)
+        ):
+            raise FGError("competition challenge must be a nonempty ID of at most 160 characters")
         if not isinstance(from_ids, list) or any(not isinstance(fid, str) for fid in from_ids):
             raise FGError("intent `from` ids must be a list of strings")
         # A hyper-edge only needs each dependency once; de-duplicate model or
@@ -436,6 +442,8 @@ class Store:
                 "created_at": now_iso(),
                 "concluded_at": None,
             }
+            if competition_challenge is not None:
+                intent["competition_challenge"] = competition_challenge.strip()
             atomic_write_json(self.intents_dir / f"{iid}.json", intent)
             if family is not None:
                 import sapper_family
@@ -709,6 +717,8 @@ class Store:
                 raise FGError(f"invalid flag status {status!r}")
             data = dict(fact.get("data") or {})
             data["status"] = status
+            if status in ("submitted", "rejected", "duplicate"):
+                data["submission_at"] = now_iso()
             if result_note:
                 data["result"] = result_note
             fact["data"] = normalize_fact_data(data)
@@ -810,6 +820,8 @@ def _node_schema_errors(data: object, kind: str) -> list[str]:
     elif kind == "intent":
         if data.get("family") is not None and not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(data.get("family"))):
             errors.append("'family' must be a valid family key or null")
+        if data.get("competition_challenge") is not None and not isinstance(data["competition_challenge"], str):
+            errors.append("'competition_challenge' must be a string or null")
         if not isinstance(data.get("from"), list) or not data.get("from") or not all(
             isinstance(x, str) and x != GOAL_ID and _VALID_NODE_ID_RE.fullmatch(x)
             for x in data.get("from", [])
@@ -1951,6 +1963,7 @@ def cmd_intent(args) -> int:
         title=args.title,
         doc=_read_doc_arg(args),
         family=getattr(args, "family", None),
+        competition_challenge=getattr(args, "challenge", None),
     )
     print(intent["id"])
     if args.json:
@@ -4757,6 +4770,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="read the detailed document from this file path")
     sp.add_argument("--creator", default="user")
     sp.add_argument("--family", default=None, help="assign this intent to a registered solution family")
+    sp.add_argument("--challenge", default=None, help="link to a challenge ID in the workspace competition roster")
     sp.add_argument("--confirm", action="store_true", help="requires human confirmation")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_intent)

@@ -39,3 +39,33 @@
 - **问题与改动**　Geek2026 的部分会话在最后可见步骤后仍有请求和工具交互引用。`scripts/analyze_agent_run.py` 在会话摘要中列出最后关联请求、尾段快照数，以及末份上下文相对该请求新增的、仅见于请求 blob 的工具调用和结果引用。
 - **验证与结果**　回放脱敏归档中的 21 个会话，按请求增量重建的 9,404 个上下文顺序均与导出一致。s007 的尾段为 67 份快照，新增调用／结果引用 0／1；s008 为 375、363／363；s017 为 622、613／613。可见步骤合计 8,294，已知输入合计 1,744,312,718 token。原生格式解析用 `tests/test_agent_run_analysis.py` 核对。
 - **决策**　采纳覆盖指标用于解释运行记录。归档只能检验计数，跨归档表现和对任务完成率的影响待验证。
+
+### 2026-11-24 · 003 修正看板回执触发的提前唤醒
+
+- **问题与预期**　NSSCTF 本轮保存了两份原生会话，逐条工具回执确认了 10 个不同的通过判定。指挥官 41 次唤醒中，39 次匹配到同 ID 的读板回执。27 轮在上轮结束后不足 60 秒触发，且唯一的工具调用是读板。这 27 轮共 53 步，已知输入量为 3,244,421 token。各步可从快照重建的共享图计数均相同。该用量是观察值，实际节省量有待配对运行测量。
+- **实际改动**　`Workspaces.strategy_board()` 在精简子角色状态时保留 `run_id`。读板回执和 watchdog 的定时检查据此用同一组 `id`、`run_id`、`status` 计算状态签名。旧版把缺失的 `run_id` 当作 `None`，对同一运行产生不同签名，绕过了 60 秒空闲兜底。新增一项通过真实看板构建路径复现的回归测试。
+- **验证与结果**　旧投影取自 `b3bc022`，配对中仅替换 `strategy_board()`。每组使用相同初始状态、事件时间、3 秒检查间隔、确定性的本地校验文件响应和 SHA-256 验收。候选版和基线均按时交付 3/3，实际模型调用为 0。
+
+| 配对用例 | 唤醒数，旧版 → 候选版 | 正确交付时刻，旧版 → 候选版 |
+| --- | --- | --- |
+| 原问题：子角色稳定，等待兜底 | 20 → 1 | 60 秒 → 60 秒 |
+| 回归：新增待审事实 | 4 → 1 | 12 秒 → 12 秒 |
+| 独立构造：子角色状态相同，运行实例更换 | 4 → 1 | 12 秒 → 12 秒 |
+
+- **证据**　[本轮复盘与证据索引](../.sapper-web/analysis/workspace-7a19edd0-rsi-20261124/review.md)、[逐项配对结果](../.sapper-web/analysis/workspace-7a19edd0-rsi-20261124/board-wake-comparison.json)、[回归测试](../tests/test_sapper_commander.py)与[跨任务知识库条目](../kb/entries/kb057.json)。原始会话、图、交付物和逐文件校验和在本地私有归档中。
+- **决策与下一轮**　保留为通过离线验收的候选。真实模型成本、任务完成率和独立真实留出任务的配对结果待验证。部署版本及发布决定待定。归档另有 6 条 HTTP 400，原始记录未提供可区分原因的错误码，本轮保留为待查线索。
+
+### 2026-11-24 · 004 修复 TsecBench 三次指挥官停滞的策略根因
+
+- **问题与预期**　TsecBench 运行（本地归档 `runs/TsecBench`、`.sapper-web/runs/0c269bd76b818dfa/output.log`、`actions.jsonl`）中指挥官进程全程未崩溃，但约 105 分钟停滞。① 04:07 指挥官自设 `waiting_user` 后用户在原生 TUI 回复凭据，control 无 TUI 恢复路径（chat 路径有 `sapper_workspace.py chat_message`），watchdog 尊重陈旧状态 74 分钟；② 唤醒验证链被任意 user 文本事件打断（含 Claude Code 注入的 `<task-notification>`），读板回执无法匹配 wake_id；③ 两次不可归因回执耗尽 `MAX_ATTEMPTS=2`，停发唤醒 18 分钟，仅用户手动 pause/unpause 后恢复。触发器为本地桥接 18765 全天 9+ 次 400 结束回合。预期：两次事故输入序列下指挥官空闲时间 ≤ 90 秒、无需人工干预。
+- **实际改动**　`lib/sapper_commander.py` 三处：`configure()` 记录 `waiting_since`；`event()` 对合成事件（`<task-`/`<command-`/`<local-command` 前缀，经真实归档枚举确认）不断开 `accepted_wake_id`、不解除等待状态，并新增真实用户输入恢复 `waiting_user` 的对称路径；`record_board()` 将"唤醒已接收 + 同 agent/run 读板但被用户消息替换"的回执作为存活证据结束该轮唤醒（预算重置、不记 `board_confirmed`）。未改动：`MAX_ATTEMPTS` 上限、唤醒退避、API 错误快速重试、角色提示词 sleep 契约、桥接本身——均列为不确定项暂缓。
+- **验证与结果**　`tests/test_sapper_commander.py` 新增 4 项回归（真实回复解除等待、合成事件不解锁、合成事件不断链、替换唤醒回执重置预算），指挥官专项 34 项全过；全量 `python3 -m unittest discover -s tests -q` 307 项通过。用真实事故 JSONL 回放：04:07:40 凭据回复后 control 恢复 active；`重试` 替换唤醒后回执结束该轮（预算重置）；`<task-notification>` 后回执直接 `board_confirmed`。未验证：真实模型长时间运行下的表现（需下一轮实战观察）。
+- **证据**　watchdog 日志与审计（`.sapper-web/runs/0c269bd76b818dfa/`、`.sapper-web/actions.jsonl` 04:07–06:35 段）、事故时间线分析见本轮会话；行为契约同步更新 `docs/web/14-commander-liveness.md`。
+- **决策与下一轮**　三项修复保留。下一轮候选（本轮明确暂缓）：唤醒失败退避替代硬上限、`isApiErrorMessage` 结尾的短间隔重试、角色提示词明确"主动等待用 sleep 工具"契约、桥接 400 根治。
+
+### 2026-11-24 · 005 恢复 API 错误后空闲的 worker
+
+- **问题与预期**　TsecBench 的 worker 进程仍在，但 400/500 使原生 agent 回合退出；mission 中的“稍后重试”无法驱动已经结束的循环。外部只发“继续”又可能得到一句承诺后再次空闲。预期只恢复明确的 API 错误空闲，不干扰正常完成、运行中的工具、主动等待或用户输入，也不让 watchdog 接管解题策略。
+- **实际改动**　`lib/sapper_commander.py` 新增 `WorkerMonitor`，状态独立保存在 Web 私有目录 `worker-monitor/`。它复用原生 JSONL 增量观测，仅对 `isApiErrorMessage` 后的空闲且空输入框发送关联唤醒。提示让 worker 依据原 mission、当前 intent、共享图和已有产物，自主选择并立即执行一个具体工具动作；对应唤醒后的真实 `tool_use` 才确认 `work_confirmed`。无响应或再次失败按 120／240／480 秒退避，封顶 900 秒，无永久停发上限；真实用户输入优先。`lib/sapper_workspace.py` 将在线受管 TUI worker 接入现有 watch 循环，崩溃重启路径保持不变。
+- **验证与结果**　`tests/test_sapper_worker_recovery.py` 新增 8 项：正常空闲不唤醒、工具确认、文字承诺不重确认、四次重试无硬上限、工具运行不中断、真实用户优先、未提交输入保护、停止／超时保护及 watch 接线。`tests/test_sapper_workspaces.py` 新增真实 fixture CLI＋tmux＋watchdog 集成：worker 首轮写入 API 错误，watchdog 实际注入一次恢复，收到工具事件后确认，run 与会话未重启。相关 74 项通过；全量 `python3 -m unittest discover -s tests -q` 316 项通过；`git diff --check`、Python 编译及 shell 语法检查通过。
+- **决策与下一轮**　采纳为 workspace 受管 TUI worker 的恢复机制。原比赛 shell 分支、print 和 native_operation 未扩展。尚未验证真实模型长时间运行下的恢复率、误唤醒率及分数收益；下一轮用真实或归档故障序列比较“注入→真实工具→有效 fact／提交”的链路，而不是以发送成功或文字回复作为收益。

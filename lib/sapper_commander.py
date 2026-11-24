@@ -1,7 +1,8 @@
-"""Observe and drive managed workspace commanders, without running their strategy.
+"""Observe and drive managed native agents, without running their strategy.
 
 Native session JSONL is read incrementally and treated as observation, not orders.
-Unknown formats fail closed. A wake is verified only by the real board command.
+Unknown formats fail closed. Commander wakes require a real board read; worker
+API-error recoveries require a correlated real tool call.
 """
 from __future__ import annotations
 
@@ -23,6 +24,8 @@ from sapper_context import atomic_private
 IDLE_SECONDS = 60
 ACK_SECONDS = 120
 MAX_ATTEMPTS = 2
+WORKER_ACK_SECONDS = 120
+WORKER_MAX_BACKOFF = 900
 CONTROLS = {"active", "paused", "waiting_user", "completed"}
 WAKE = re.compile(r"\[Sapper wake:([a-f0-9]{32})\]")
 TRANSCRIPT_UNAVAILABLE = "未找到唯一的原生会话记录，无法确认空闲"
@@ -102,11 +105,14 @@ class CommanderMonitor:
             agent = self.manager.agent(aid)
             if agent["role"] != "commander" or agent.get("legacy") or agent.get("execution_mode") not in ("tui", "chat"):
                 raise sapper.FGError("仅支持受管指挥官的续轮控制")
-            with self.locked(aid) as data:
-                data.update(control=control, reason=reason)
-                data.pop("attention", None)
-                data.pop("wake", None)
-                data["recoveries"] = 0
+        with self.locked(aid) as data:
+            data.update(control=control, reason=reason)
+            data.pop("attention", None)
+            data.pop("wake", None)
+            data.pop("waiting_since", None)
+            if control == "waiting_user":
+                data["waiting_since"] = time.time()
+            data["recoveries"] = 0
         self.app.audit("commander.control", agent=aid, control=control)
         return self.view(aid)
 
@@ -193,8 +199,14 @@ class CommanderMonitor:
                 value = block.get("text", "")
                 if not isinstance(value, str):
                     continue
+                # Synthetic user-role events (background task notifications,
+                # slash-command echoes) are not human input: they must
+                # neither break the wake verification chain nor release
+                # waiting_user. Pasted content is genuine user input.
+                synthetic = value.lstrip().startswith(("<task-", "<command-", "<local-command"))
                 data.update(phase="responding", tools={})
-                data.pop("accepted_wake_id", None)
+                if not synthetic:
+                    data.pop("accepted_wake_id", None)
                 tools = data["tools"]
                 # Native interrupt receipts must never be auto-continued.
                 if value.startswith("[Request interrupted by user"):
@@ -203,6 +215,15 @@ class CommanderMonitor:
                 elif (data.get("reason") == "用户中断了原生会话" and not WAKE.search(value)
                       and at > data.get("interrupted_at", at)):
                     data.update(control="active", reason="用户已在原生会话中继续")
+                elif (not synthetic and data.get("control") == "waiting_user"
+                      and not WAKE.search(value) and at >= data.get("waiting_since", 0)):
+                    # A native reply answers the pending question. The web
+                    # chat path already released waiting_user; the TUI path
+                    # had no release, stranding the commander (2026-11-24
+                    # TsecBench: a credentials answer left control stale and
+                    # the watchdog honored it for 74 min).
+                    data.update(control="active", reason="用户已在原生会话中回复")
+                    data.pop("waiting_since", None)
                 wake = data.get("wake", {})
                 if (WAKE.search(value) and WAKE.search(value).group(1) == wake.get("id")
                         and at >= wake.get("sent_at", float("inf"))):
@@ -259,6 +280,17 @@ class CommanderMonitor:
                 wake.update(status="board_confirmed", confirmed_at=receipt["at"])
                 wake["run_id"] = run_id
                 data.update(verification="board_confirmed", recoveries=0)
+                data.pop("attention", None)
+            elif wake and wake.get("accepted_at") is not None and wake.get("status") != "board_confirmed":
+                # Liveness, not verification: the wake was received and this
+                # very commander/run read the board, but an interleaved
+                # native user message replaced the wake so the receipt
+                # cannot be attributed to it. End the wake cycle without
+                # claiming board_confirmed; the attempt budget resets so the
+                # next idle starts a fresh wake instead of exhausting
+                # MAX_ATTEMPTS and freezing the commander (2026-11-24
+                # TsecBench: 18 min dead stop until a human toggled control).
+                data.pop("wake", None)
                 data.pop("attention", None)
         self.app.audit("commander.board", agent=aid, run=run_id, wake=receipt["wake_id"])
 
@@ -355,3 +387,105 @@ class CommanderMonitor:
                     data["wake"]["status"] = "sent"
                     data["verification"] = "process_started"
             self.app.audit("commander.recovery_requested", agent=aid, run=resumed["id"], wake=token, request_id=token)
+
+
+class WorkerMonitor(CommanderMonitor):
+    """Resume only API-error-idle native workers; actual tool work confirms recovery."""
+
+    def path(self, aid):
+        self.manager.agent_path(aid)
+        return self.app.state / "worker-monitor" / (aid + ".json")
+
+    def prompt(self, wake_id):
+        return (f"[Sapper wake:{wake_id}] 上一轮因 API 错误中断。"
+                "不要只回复收到或“继续”。读取原 mission、当前 intent、共享图最新事实和已有产物，"
+                "核对已完成工作后，自主选择并立即调用工具执行一个最可能推进任务的具体动作。"
+                "不要重复已完成工作；确已完成或必须等待用户时，说明依据。"
+                "外部 watchdog 只负责故障恢复，不替你选择解题路线。")
+
+    def event(self, agent, data, event):
+        super().event(agent, data, event)
+        if (not isinstance(event, dict) or event.get("isSidechain")
+                or event.get("runId", agent.get("run_id")) != agent.get("run_id")
+                or event.get("sessionId", agent["claude_session_id"]) != agent["claude_session_id"]):
+            return
+        kind = event.get("type")
+        if kind not in ("user", "assistant"):
+            return
+        at = timestamp(event.get("timestamp"))
+        if at is None:
+            return
+        message = event.get("message") or {}
+        blocks = message.get("content", []) if isinstance(message, dict) else []
+        if isinstance(blocks, str):
+            blocks = [{"type": "text", "text": blocks}]
+        if not isinstance(blocks, list):
+            return
+        if kind == "assistant" and event.get("isApiErrorMessage"):
+            data["api_error_idle"] = True
+            return
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if kind == "assistant" and block.get("type") == "tool_use":
+                data["api_error_idle"] = False
+                wake = data.get("wake", {})
+                if (data.get("accepted_wake_id") == wake.get("id")
+                        and wake.get("accepted_at") is not None and at >= wake.get("sent_at", float("inf"))):
+                    wake.update(status="work_confirmed", confirmed_at=at)
+                    data.update(verification="work_confirmed", recoveries=0)
+                    data.pop("attention", None)
+                elif wake:
+                    data.pop("wake", None)
+            elif kind == "user" and block.get("type") == "text":
+                value = block.get("text", "")
+                if (isinstance(value, str) and not WAKE.search(value)
+                        and not value.lstrip().startswith(("<task-", "<command-", "<local-command"))):
+                    # A real user instruction supersedes automatic recovery.
+                    data.pop("api_error_idle", None)
+                    data.pop("wake", None)
+
+    def tick(self, aid, rows, now=None):
+        now = time.time() if now is None else now
+        with self.manager.lifecycle():
+            agent = self.manager.agent(aid)
+            row = next((a for a in rows if a["id"] == aid), {})
+            if row and row.get("run_id") != agent.get("run_id"):
+                return
+            if (agent.get("role") == "commander" or agent.get("desired_state") != "running"
+                    or agent.get("legacy") or agent.get("execution_mode") != "tui"
+                    or agent.get("native_operation") or not row.get("pane_id")):
+                return
+            run = self.app.run_info(agent["run_id"])
+            if (run["status"] in ("stopping", "stopped", "timed_out")
+                    or (self.app.run_path(run["id"]) / "stop_requested").exists()
+                    or self.app.project(agent["workspace_id"])["status"] == "completed"):
+                return
+            with self.locked(aid) as data:
+                self.observe(agent, data)
+                if data.get("control") != "active" or not data.get("caught_up"):
+                    return
+                if data.get("phase") != "idle" or not data.get("api_error_idle"):
+                    return
+                wake = data.get("wake", {})
+                pending = wake and wake.get("status") != "work_confirmed"
+                attempt = wake.get("attempt", 1) if pending else 0
+                if pending:
+                    delay = min(WORKER_MAX_BACKOFF, WORKER_ACK_SECONDS * (2 ** max(0, attempt - 1)))
+                    if now - wake["sent_at"] < delay:
+                        return
+                pane = self.app.capture(row["pane_id"])["text"]
+                prompts = re.findall(r"^\s*❯(.*)$", pane, re.M)
+                if not prompts or prompts[-1].strip():
+                    data["attention"] = "API 错误后等待空闲输入框；未发送恢复指令"
+                    return
+                token = uuid.uuid4().hex
+                data["wake"] = {"id": token, "run_id": run["id"], "sent_at": now,
+                                "attempt": attempt + 1 if pending else 1, "status": "sent"}
+                data.update(verification="recovery_sent")
+                data.pop("attention", None)
+                atomic_private(self.path(aid), data)
+                self.app.send(row["pane_id"], {"text": self.prompt(token)}, target_agent=aid,
+                              kind="wake", message_id=token)
+                self.app.audit("worker.recovery_sent", agent=aid, run=run["id"], wake=token,
+                               request_id=token, target_agent=aid, kind="wake", message_id=token)

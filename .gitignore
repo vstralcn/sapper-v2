@@ -32,8 +32,32 @@ PREP-INTERVIEW.md
 docker/ENV-COMMANDER.md
 COMMANDER-HANDOVER.md
 
-# Local Web console state (credentials, task workspaces and captured output)
+# Local Sapper and Claude state, task workspaces and captured output
 .sapper-web/
 .sapper-agents/
-.sapper/sessions/
+.sapper/
+.claude/
 /runs/
+
+# Local environment and credentials
+.env
+.env.*
+.envrc
+!.env.example
+!.env.sample
+!.env.template
+auth.sqlite3
+auth.sqlite3-*
+credentials.json
+.netrc
+
+# VPN profiles and private keys
+*.ovpn
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
