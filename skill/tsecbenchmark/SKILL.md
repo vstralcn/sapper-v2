@@ -19,6 +19,12 @@ description: 当 AI Agent 需要通过 TSec Benchmark Platform（TSecBench）跑
 1. 获取BENCHMARK_BASE_URL 和 BENCHMARK_TOKEN 配置信息。（在TSecBench平台创建跑分任务后下发）
 2. （仅本地模式需要）连接靶场VPN。所有题目入口地址，必须在连接靶场环境VPN后才可访问，否则将无法解题拿到答案。（靶场VPN和BENCHMARK_BASE_URL、BENCHMARK_TOKEN一起在TSecBench平台创建跑分任务后下发）
 
+   使用平台下发的 `.ovpn` 文件连接：
+   ```bash
+   sudo openvpn --config /path/to/your.ovpn
+   ```
+   按提示输入凭据（如有），出现 `Initialization Sequence Completed` 表示连接成功；保持进程运行，结束时按 `Ctrl+C` 断开。
+
 # 一、总览
 
 ## 1. 认证方式
