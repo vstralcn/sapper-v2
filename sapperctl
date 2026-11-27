@@ -31,23 +31,21 @@ from sapper_web import (
 
 
 def default_config():
-    return {"root": str(REPO / "runs"), "port": 8766, "socket": "default"}
+    return {"root": str(REPO / "runs"), "port": 8766}
 
 
 def web_args(config, state):
     return [str(REPO / "lib/sapper_web.py"), "--state", str(state),
-            "--root", config["root"], "--port", str(config["port"]),
-            "--tmux-socket", config["socket"]]
+            "--root", config["root"], "--port", str(config["port"])]
 
 
 def workspace_status(args, state):
     settings = state / "sapperctl.json"
     config = read_json(settings, default_config())
     root = args.root.expanduser().resolve() if args.root else Path(config["root"])
-    tmux_socket = args.tmux_socket or config["socket"]
-    if settings.exists() and (root != Path(config["root"]) or tmux_socket != config["socket"]):
-        raise WebError("请使用该实例记录的任务根目录和 tmux socket")
-    app = Console(root, state, tmux_socket, initialize=False)
+    if settings.exists() and root != Path(config["root"]):
+        raise WebError("请使用该实例记录的任务根目录")
+    app = Console(root, state, initialize=False)
     path = Path(args.workspace or ".").expanduser().resolve()
     project = next((p for p in app.projects() if p["id"] == args.workspace or Path(p["path"]) == path), None)
     if project is None:
@@ -246,7 +244,7 @@ def live_runs(state, config):
 
 def stop_managed(state, config):
     if (state / "runs").exists() or (state / "agents").exists():
-        app = Console(Path(config["root"]), state, config["socket"])
+        app = Console(Path(config["root"]), state)
         with app.workspaces.lifecycle():
             runs = live_runs(state, config)
             for path in (state / "agents").glob("*.json"):
@@ -282,7 +280,6 @@ def main():
     parser.add_argument("--state", type=Path, default=REPO / ".sapper-web", help="实例状态目录")
     parser.add_argument("--port", type=int, help="首次 start 的起始端口，默认 8766，占用时逐一递增")
     parser.add_argument("--root", type=Path, help="首次 start 的任务根目录")
-    parser.add_argument("--tmux-socket", help="首次 start 的 tmux -L 名称，默认 default")
     parser.add_argument("--username", help="auth-init 或 password-reset 的管理员用户名")
     parser.add_argument("--workspace", help="workspace-status 的工作区 ID 或目录，默认当前目录")
     parser.add_argument("--json", action="store_true", help="workspace-status 输出 JSON")
@@ -312,8 +309,6 @@ def main():
                 requested["port"] = args.port
         if args.root:
             requested["root"] = str(args.root.expanduser().resolve())
-        if args.tmux_socket:
-            requested["socket"] = args.tmux_socket
         if requested != config and (settings.exists() or args.action != "start" or
                                     web_pids(state, config) or any((state / "runs").glob("*/run.json"))):
             parser.error("已有实例使用原配置。新配置请用 start --state 选择独立目录。")
@@ -330,7 +325,7 @@ def main():
             pids = web_pids(state, config)
             print("Web：" + (", ".join(map(str, pids)) if pids else "未发现匹配进程"))
             print(f"目录：{state}\n地址：http://127.0.0.1:{config['port']}/")
-            print(f"受管无头进程：{len(live_runs(state, config))}（socket {config['socket']}）")
+            print(f"受管无头进程：{len(live_runs(state, config))}")
             print(f"在线模型桥：{len(sapper_models.bridge_operation(state))}")
             return
         if args.action in ("restart", "stop", "stop-web"):

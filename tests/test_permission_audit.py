@@ -94,7 +94,6 @@ class PermissionAuditTests(unittest.TestCase):
         basis = self.app.store(self.pid).add_fact("supplied archive", "user")["id"]
         with mock.patch("sapper_workspace.console_from_environment", return_value=self.app), \
              mock.patch.dict(os.environ, {"SAPPER_WORKSPACE_ID": self.pid, "SAPPER_AGENT_ID": parent["id"]}), \
-             mock.patch.object(self.app, "tmux", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
              mock.patch.object(self.app, "panes", return_value=[]), contextlib.redirect_stdout(io.StringIO()) as output:
             worker(["spawn", self.pid, "--from", basis, "--request-id", "cli-dispatch"])
         run = json.loads(output.getvalue())
@@ -106,8 +105,7 @@ class PermissionAuditTests(unittest.TestCase):
 
     def test_worker_policy_applies_to_new_and_resumed_sessions(self):
         self.prepare()
-        with mock.patch.object(self.app, "tmux", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
-             mock.patch.object(self.app, "panes", return_value=[]):
+        with mock.patch.object(self.app, "panes", return_value=[]):
             run = self.manager.create_session(self.pid, {"role": "worker", "execution_mode": "print",
                                                        "skip_permissions": False})
             resumed = self.manager.resume(run["agent_id"], {"skip_permissions": False})

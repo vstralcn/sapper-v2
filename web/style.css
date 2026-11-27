@@ -174,3 +174,22 @@ dialog{background:var(--paper);border:1px solid var(--line);border-radius:12px;p
   #project-tools { margin-left: auto; }
   .tabs > button { padding-inline: 9px; }
 }
+
+/* Phase 4: structured turn-stream chat view */
+.chat-grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 18px; align-items: start; }
+.chat-main, .chat-side { display: grid; gap: 14px; min-width: 0; }
+.chat-side section { border: 1px solid var(--line, #d8dce3); border-radius: 10px; padding: 12px; }
+.turn-card { border: 1px solid var(--line, #d8dce3); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+.turn-card > header { cursor: pointer; padding: 10px 12px; font-weight: 600; background: var(--soft, #f4f6f9); }
+.turn-body-holder { padding: 10px 12px; display: grid; gap: 8px; }
+.turn-user, .turn-assistant { margin: 0; white-space: pre-wrap; word-break: break-word; }
+.turn-user { color: #2b5f9e; }
+.turn-thinking summary { cursor: pointer; color: #6b7280; }
+.turn-thinking pre, .turn-tool pre, .attachment-preview pre { white-space: pre-wrap; word-break: break-word; max-height: 280px; overflow: auto; }
+.turn-tool { border: 1px dashed var(--line, #d8dce3); border-radius: 8px; padding: 8px; }
+.turn-settlement { border-top: 1px solid var(--line, #d8dce3); padding-top: 6px; color: #6b7280; font-size: 12px; }
+.audit-item { border-bottom: 1px solid var(--line, #d8dce3); padding: 6px 0; }
+.audit-item p { margin: 3px 0; font-size: 12px; }
+.chat-input { display: flex; gap: 8px; align-items: end; }
+.chat-input textarea { flex: 1; resize: vertical; }
+@media (max-width: 1100px) { .chat-grid { grid-template-columns: 1fr; } }

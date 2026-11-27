@@ -9,7 +9,7 @@ function contextStatus(c){
   return seen>=c.latest_revision?`共享环境 v${seen} · 已提供`:`共享环境 ${seen?"v"+seen:"未加载"} · v${c.latest_revision} 待更新`;
 }
 
-const workspaceTabs = new Set(["progress", "workspace", "agents", "memory", "console", "files", "native"]);
+const workspaceTabs = new Set(["chat", "progress", "workspace", "agents", "memory", "console", "files", "native"]);
 const mainViews = {overview:["home-button","总体概览"], workspaces:["workspaces-button","工作区"], native:["native-button","原生功能"]};
 const agentStatusLabels = {running:"运行中", waiting:"等待中", idle:"在线空闲", error:"异常", offline:"已离线", unknown:"状态未确认"};
 

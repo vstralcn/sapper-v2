@@ -21,6 +21,57 @@ const baseRefreshTask = refreshTask;
 const baseSetTab = setTab;
 
 function workspaceApi(action, options = {}) { return api(`/workspaces/${state.project.id}/${action}`, options); }
+
+const headlessTerminalStates = new Set(["exited", "stopped", "failed", "interrupted", "timed_out", "crashed", "startup_timeout"]);
+function isAgentTerminal(agent) {
+  const live = state.agents.find(a => a.id === agent?.id) || agent;
+  return headlessTerminalStates.has(live?.status);
+}
+function renderFaultAudit(items) {
+  if (typeof TurnStreamUI !== "undefined") TurnStreamUI.renderAudit($("commander-fault-audit"), items);
+}
+function renderCommanderApprovals(requests) {
+  const panel = $("commander-approvals");
+  if (!panel) return;
+  panel.replaceChildren(element("h3", "", "待审批"));
+  if (!requests.length) { panel.append(empty("暂无待审批请求")); return; }
+  for (const request of requests) {
+    const row = element("div", "approval-item");
+    row.append(element("p", "", `${request.tool_name || "工具"} · ${request.id}`));
+    row.append(button("允许", "button", () => guarded(async () => {
+      await workspaceApi("chat", {method: "POST", body: {question_id: request.id, allow: true}});
+      await openCommanderChat();
+    })));
+    row.append(button("拒绝", "button", () => guarded(async () => {
+      await workspaceApi("chat", {method: "POST", body: {question_id: request.id, allow: false}});
+      await openCommanderChat();
+    })));
+    panel.append(row);
+  }
+}
+async function openCommanderChat() {
+  const main = state.mainAgent;
+  const stream = $("turn-stream");
+  if (!main) { stream.replaceChildren(empty("尚未创建顶层指挥官")); return; }
+  const commander = main.role === "commander";
+  $("commander-chat-form").hidden = !commander;
+  $("commander-approvals").hidden = !commander;
+  let runId = main.run_id || "";
+  if (commander) {
+    try {
+      const view = await workspaceApi("chat");
+      runId = view.run_id || runId;
+      renderCommanderApprovals(view.requests || []);
+    } catch (error) {
+      renderCommanderApprovals([]);
+    }
+  }
+  if (typeof TurnStreamUI !== "undefined") {
+    TurnStreamUI.open(main, {runId, readOnly: !commander, isTerminal: () => isAgentTerminal(main)});
+  } else {
+    stream.replaceChildren(empty("结构化事件视图未加载"));
+  }
+}
 function formatAgentStatus(a,panes=state.panes) {
   const observation = a.observation || (typeof AgentTopologyModel !== "undefined" && AgentTopologyModel.observe(a,panes));
   return agentStatusLabels[observation?.status] || agentStatusLabels.unknown;
@@ -45,6 +96,7 @@ refreshTask = async function () {
       state.services = roles.services;
       state.mainAgent = roles.primary_agent;
       state.workspaceObservation = roles.observed_at;
+      renderFaultAudit(roles.fault_audit || []);
       renderConnection(roles.summary?.online ?? null);
       if($("agent-dialog").open)refreshDispatchState();
     }
@@ -83,8 +135,23 @@ refreshTask = async function () {
 };
 
 setTab = function (tab) {
-  if(tab==="chat")tab="workspace";
   if (!workspaceTabs.has(tab)) tab = "progress";
+  if (tab === "chat") {
+    state.tab = tab;
+    document.querySelectorAll("[data-tab]").forEach(n => {
+      n.classList.toggle("active", n.dataset.tab === tab);
+      n.setAttribute("aria-selected", String(n.dataset.tab === tab));
+    });
+    $("tab-progress").hidden = true;
+    $("tab-agents").hidden = true;
+    $("tab-memory").hidden = true;
+    $("tab-workspace").hidden = true;
+    $("tab-chat").hidden = false;
+    $("breadcrumb-section").hidden = false;
+    $("breadcrumb-tab").textContent = document.querySelector('[data-tab="chat"]').textContent.trim();
+    guarded(openCommanderChat);
+    return;
+  }
   $("breadcrumb-section").hidden=false;
   $("breadcrumb-tab").textContent=document.querySelector(`[data-tab="${tab}"]`).textContent.trim();
   $("tab-agents").hidden = tab !== "agents";
@@ -456,6 +523,7 @@ function terminalTheme(){
 window.addEventListener("sapper:themechange",()=>{if(terminal)terminal.options.theme=terminalTheme();});
 
 function ensureTerminal(){
+  if(!$("native-terminal"))return;
   if(terminal)return;
   terminal=new Terminal({cursorBlink:true,fontSize:12,fontFamily:'"SFMono-Regular",Consolas,monospace',scrollback:5000,disableStdin:true,theme:terminalTheme()});
   terminalFit=new FitAddon.FitAddon();terminal.loadAddon(terminalFit);terminal.open($("native-terminal"));
@@ -478,6 +546,7 @@ function agentOptionLabel(a){
   return `${a.name||a.role_label} · ${goal} · ${a.id.slice(0,6)}`;
 }
 function renderNativePanes(){
+  if(!$("native-pane"))return;
   const rolePanes=new Set(state.agents.map(a=>a.pane_id));
   const all=state.panes.filter(p=>!p.dead&&(p.project_id===state.project.id||rolePanes.has(p.id)));
   const options=all.map(p=>{
@@ -494,6 +563,7 @@ function renderNativePanes(){
   if(chosen!==state.nativePane)selectNative(chosen);
 }
 function selectNative(pane){
+  if(!$("native-pane"))return;
   if(state.nativePane===pane&&state.nativeStream)return;
   if(state.nativeStream)state.nativeStream.close();state.nativeStream=null;
   state.nativePane=pane;state.nativeControl=false;inputBuffer="";
@@ -606,8 +676,8 @@ submit("delete-workspace-form",async form=>{
   toast(result.files_deleted?"工作区及其目录已删除":"工作区已从列表移除，文件保留");
 });
 $("workspace-file-up").onclick=()=>{const parts=state.workspaceFolder.split("/");parts.pop();state.workspaceFolder=parts.join("/")||".";guarded(workspaceFiles);};
-$("native-pane").onchange=()=>selectNative($("native-pane").value);
-$("terminal-control").onclick=()=>guarded(async()=>{
+if ($("native-pane")) $("native-pane").onchange=()=>selectNative($("native-pane").value);
+if ($("terminal-control")) $("terminal-control").onclick=()=>guarded(async()=>{
   if(!state.nativePane)throw new Error("请先选择活动终端");
   state.nativeControl=!state.nativeControl;terminal.options.disableStdin=!state.nativeControl;
   $("terminal-control").textContent=state.nativeControl?"只读查看":"接管输入";$("terminal-control").classList.toggle("controlling",state.nativeControl);
@@ -646,6 +716,14 @@ submit("agent-form",async form=>{
   $("agent-dialog").close();setTab("workspace");await refreshTask();
   if(state.mainAgent?.pane_id)selectNative(state.mainAgent.pane_id);
   toast("已交给本工作区主 agent，可在终端查看和继续交流");
+});
+submit("commander-chat-form", async () => {
+  const text = $("commander-chat-text").value.trim();
+  if (!text) return;
+  await workspaceApi("chat", {method: "POST", body: {text}});
+  $("commander-chat-text").value = "";
+  if (typeof TurnStreamUI !== "undefined") TurnStreamUI.kick();
+  if (typeof kickStatus === "function") kickStatus();
 });
 submit("agent-message-form",async()=>{
   const result=await api(`/agents/${messageAgent}/messages`,{method:"POST",body:{text:$("agent-message-text").value}});

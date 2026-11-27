@@ -46,6 +46,26 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn("description", view)
         self.assertNotIn("mission", view)
 
+    def test_audit_list_is_readonly_newest_first_and_carries_lifecycle(self):
+        primary = self.emit()
+        self.ledger.delivered(primary)
+        self.ledger.claim(primary, "c" * 16)
+        items = self.ledger.audit_list()
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertTrue(item["audit_only"])
+        self.assertEqual(item["status"], "audit")
+        self.assertEqual(item["owner_agent_id"], "commander-1")
+        self.assertEqual(item["source_agent_id"], "worker-1")
+        self.assertEqual(item["kind"], "crashed")
+        actions = [step["action"] for step in item["trace"]]
+        self.assertIn("created", actions)
+        self.assertIn("delivered", actions)
+        self.assertIn("claimed", actions)
+        # Reading the audit list never claims, closes or escalates anything.
+        self.assertEqual(self.ledger.view(primary)["status"], "claimed")
+        self.assertEqual(len(self.ledger.audit_list(limit=0)), 0)
+
     def test_only_current_owner_may_confirm(self):
         eid = self.emit()
         self.ledger.delivered(eid)

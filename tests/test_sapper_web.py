@@ -83,6 +83,15 @@ class WebStartupTests(unittest.TestCase):
                 self.assertEqual("--dangerously-skip-permissions" in stderr.getvalue(), uid == 0)
 
 
+    def test_turn_stream_frontend_folding_and_pairing_logic(self):
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        script = Path(__file__).resolve().parent / "test_turn_stream.cjs"
+        result = subprocess.run(["node", str(script)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("turn-stream logic OK", result.stdout)
+
+
 class ConsoleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -93,14 +102,6 @@ class ConsoleTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
-
-    def test_tmux_timeout_reports_operation_without_showing_command_payload(self):
-        self.app.tmux_socket = "fixture-socket"
-        with mock.patch("sapper_web.subprocess.run", side_effect=subprocess.TimeoutExpired("private", 2)):
-            with self.assertRaisesRegex(WebError, "tmux 响应超时.*send-keys.*fixture-socket.*2") as caught:
-                self.app.tmux("send-keys", "private", timeout=2)
-        self.assertEqual(caught.exception.status, 503)
-        self.assertNotIn("private", str(caught.exception))
 
     def test_host_liveness_distinguishes_alive_dead_and_legacy_runs(self):
         rid = "a" * 16
@@ -336,6 +337,38 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("结构化正文", rendered)
         self.assertNotIn("should not be consumed", rendered)
 
+    def test_attachment_range_is_sed_aligned_and_dual_capped(self):
+        rid = "9" * 16
+        directory = self.app.run_path(rid)
+        private_json(directory / "run.json", {"id": rid, "status": "exited"})
+        (directory / "attachments").mkdir(exist_ok=True)
+        payload = "第一行\nsecond line\n" + "三" * 1000
+        (directory / "attachments" / "sample.txt").write_text(payload)
+        first = self.app.attachment_range(rid, "attachments/sample.txt", 1, 2)
+        self.assertEqual((first["start_line"], first["end_line"]), (1, 2))
+        self.assertEqual(first["text"], "第一行\nsecond line")
+        self.assertEqual(first["total_lines"], 3)
+        self.assertTrue(first["has_more"])
+        third = self.app.attachment_range(rid, "attachments/sample.txt", 3, 2)
+        self.assertEqual((third["start_line"], third["end_line"]), (3, 3))
+        self.assertFalse(third["has_more"])
+        with mock.patch("sapper_web.ATTACHMENT_MAX_BYTES", 7):
+            capped = self.app.attachment_range(rid, "attachments/sample.txt", 1, 2)
+        self.assertTrue(capped["line_truncated"])
+        self.assertNotIn("\ufffd", capped["text"])
+        self.assertLessEqual(capped["bytes"], 7)
+
+    def test_attachment_range_rejects_absolute_traversal_and_symlink(self):
+        rid = "9" * 16
+        directory = self.app.run_path(rid)
+        private_json(directory / "run.json", {"id": rid, "status": "exited"})
+        (directory / "attachments").mkdir(exist_ok=True)
+        (directory / "attachments" / "escape.txt").symlink_to("/etc/passwd")
+        for path in ("/etc/passwd", "../outside.txt", "attachments/../outside.txt",
+                     "attachments/escape.txt"):
+            with self.subTest(path=path), self.assertRaises(WebError):
+                self.app.attachment_range(rid, path)
+
     def test_dead_host_takeover_closes_orphan_turn(self):
         rid = "f" * 16
         directory = self.app.run_path(rid)
@@ -446,6 +479,40 @@ class HttpTests(unittest.TestCase):
         self.cookie = headers["Set-Cookie"].split(";", 1)[0]
         self.csrf = json.loads(body)["csrf"]
 
+    def test_attachment_route_enforces_caps_and_path_safety(self):
+        self.login()
+        rid = "9" * 16
+        directory = self.app.run_path(rid)
+        private_json(directory / "run.json", {"id": rid, "status": "exited"})
+        (directory / "attachments").mkdir(exist_ok=True)
+        (directory / "attachments" / "sample.txt").write_text("第一行\nsecond\n" + "三" * 1000)
+        query = "?path=attachments%2Fsample.txt&start_line=2&limit=1"
+        status, _, body = self.request(f"/api/runs/{rid}/attachment{query}")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual((page["start_line"], page["end_line"]), (2, 2))
+        self.assertEqual(page["text"], "second")
+        self.assertTrue(page["has_more"])
+        self.assertEqual(self.request(f"/api/runs/{rid}/attachment?path=..%2Fescape")[0], 400)
+
+    def test_workspace_status_carries_readonly_fault_audit(self):
+        self.login()
+        project = self.app.create_project({"name": "audit", "goal": "fixture"})
+        from sapper_routing import RoutingLedger
+        ledger = RoutingLedger(self.app.state, project["id"])
+        ledger.set_top("commander-1")
+        ledger.emit(kind="crashed", generation=1, source_agent_id="worker-1",
+                    superior_id="commander-1", cwd="/tmp/task", level="worker",
+                    side_effect_warning="may_have_written_files", evidence={"exit_code": 1})
+        status, _, body = self.request(f"/api/workspaces/{project['id']}/agents")
+        self.assertEqual(status, 200, body)
+        audit = json.loads(body)["fault_audit"]
+        self.assertEqual(len(audit), 1)
+        self.assertTrue(audit[0]["audit_only"])
+        self.assertEqual(audit[0]["kind"], "crashed")
+        self.assertEqual(audit[0]["source_agent_id"], "worker-1")
+        self.assertTrue(any(step["action"] == "created" for step in audit[0]["trace"]))
+
     def test_turns_route_uses_strict_seq_cursor_and_bounded_pages(self):
         self.login()
         rid = "c" * 16
@@ -534,8 +601,8 @@ class HttpTests(unittest.TestCase):
         _, _, body = self.request(f"/api/workspaces/{pid}/agents")
         web = json.loads(body)
         cli_view = json.loads(subprocess.check_output([sys.executable, str(repo / "sapperctl"), "workspace-status",
-            "--state", str(self.app.state), "--root", str(self.app.root), "--tmux-socket", self.app.tmux_socket,
-            "--workspace", project["path"], "--json"], text=True))
+                          "--state", str(self.app.state), "--root", str(self.app.root),
+                          "--workspace", project["path"], "--json"], text=True))
         self.assertEqual(cli_view["project"]["id"], pid)
         self.assertEqual(cli_view["summary"], web["summary"])
         self.assertEqual(cli_view["agents"][0]["observation"], web["agents"][0]["observation"])
@@ -987,7 +1054,6 @@ signal.signal(signal.SIGINT,interrupted)
 print(json.dumps({{'type':'system','subtype':'init'}}),flush=True)
 while True: time.sleep(.1)
 """
-        self.app.tmux("new-session", "-d", "-s", "unrelated-timeout", "sleep 20")
         run = self.print_run(code, timeout=0.4)
         info = self.finished(run["id"])
         self.assertEqual(info["status"], "timed_out")
@@ -997,7 +1063,6 @@ while True: time.sleep(.1)
         self.assertEqual(marker.read_text(), "saved evidence")
         self.assertIn("checkpoint saved", self.app.log(run["id"])["text"])
         self.until(lambda: "checkpoint saved" in (self.app.run_path(run["id"]) / "output.log").read_text())
-        self.assertEqual(self.app.tmux("has-session", "-t", "unrelated-timeout").returncode, 0)
         with self.assertRaises(WebError):
             self.app.extend(run["id"], {"minutes": 1})
 
@@ -1074,29 +1139,12 @@ while True: time.sleep(.1)
         parent_code = f"import subprocess,sys,time;subprocess.Popen([sys.executable,'-c',{child_code!r}]);print('READY',flush=True);time.sleep(20)"
         run = self.app.start(self.pid, {"kind": "custom", "command": shlex.join([sys.executable, "-u", "-c", parent_code])})
         self.until(lambda: "READY" in self.app.log(run["id"])["text"])
-        other = self.app.tmux("new-session", "-d", "-s", "unrelated", "sleep 20")
-        self.assertEqual(other.returncode, 0)
         self.app.stop(run["id"])
         self.assertEqual(self.app.run_info(run["id"])["status"], "stopped")
-        self.assertEqual(self.app.tmux("has-session", "-t", "unrelated").returncode, 0)
         time.sleep(2.2)
         self.assertFalse(child_marker.exists())
 
-    def test_shared_graph_worker_and_original_commander_are_discovered(self):
-        sibling = self.app.root / "test-task-w2"
-        sibling.mkdir()
-        (sibling / ".sapper").symlink_to(self.app.store(self.pid).root, target_is_directory=True)
-        commander = self.app.root / "commander-home"
-        commander.mkdir()
-        self.assertEqual(self.app.tmux("new-session", "-d", "-s", "sapper-cmd", "-n", "commander", "-c", str(commander), "sleep 10").returncode, 0)
-        self.assertEqual(self.app.tmux("new-window", "-t", "sapper-cmd", "-n", "test-task-w2", "-c", str(sibling), "sleep 10").returncode, 0)
-        panes = self.app.panes()
-        self.assertEqual(len(panes), 2)
-        self.assertEqual(next(p for p in panes if p["name"] == "test-task-w2")["project_id"], self.pid)
-        self.assertEqual(next(p for p in panes if p["name"] == "commander")["role"], "commander")
-
-    def test_launch_inherits_service_environment_instead_of_old_tmux_server(self):
-        self.app.tmux("new-session", "-d", "-s", "old-environment", "sleep 10")
+    def test_launch_inherits_service_environment(self):
         code = "import os;print(os.environ['SAPPER_WEB_TEST_VALUE'],flush=True)"
         with mock.patch.dict(os.environ, {"SAPPER_WEB_TEST_VALUE": "fresh-service-value"}):
             run = self.app.start(self.pid, {"kind": "custom", "command": shlex.join([sys.executable, "-u", "-c", code])})

@@ -401,6 +401,39 @@ class RoutingLedger:
                 raise RoutingError("事件不存在", 404)
             return dict(event)
 
+    def audit_list(self, limit=50):
+        """Read-only audit copies owned by the top commander, newest first.
+
+        This never mutates the ledger: the audit list is a global notice only,
+        with no claim/close/escalate action exposed to the viewer.
+        """
+        top = self._top_id()
+        if not top:
+            return []
+        copies = [event for event in self._load().values()
+                  if event.get("status") == "audit" and event.get("audit_only")
+                  and event.get("owner_agent_id") == top]
+        copies.sort(key=lambda event: (event.get("created_at") or "", event.get("event_id") or ""),
+                    reverse=True)
+        traces = {}
+        if self.audit.exists():
+            with self.audit.open(encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    event_id = record.get("event_id")
+                    if event_id:
+                        traces.setdefault(event_id, []).append(record)
+        result = []
+        for copy in copies[:limit]:
+            item = dict(copy)
+            item["trace"] = (traces.get(copy.get("event_id"), [])
+                             + traces.get(copy.get("parent_event_id"), []))
+            result.append(item)
+        return result
+
     def trace(self, event_id):
         """Full lifecycle trace of one event (produce -> deliver -> confirm -> escalate)."""
         result = []

@@ -158,8 +158,7 @@ class CommanderTests(unittest.TestCase):
         pane = {"id": "%123", "project_id": self.project["id"]}
         self.idle()
         with mock.patch.object(self.app, "send", wraps=Console.send.__get__(self.app)), \
-                mock.patch.object(self.app, "pane", return_value=pane), \
-                mock.patch.object(self.app, "tmux", return_value=mock.Mock(returncode=0)):
+                mock.patch.object(self.app, "pane", return_value=pane):
             self.app.send("%123", {"text": "private input", "target_agent": "spoofed",
                                    "kind": "wake", "message_id": "spoofed"})
             self.tick()
@@ -191,6 +190,29 @@ class CommanderTests(unittest.TestCase):
         wake, = [e for e in events if e["action"] == "commander.wake_sent"]
         self.assertEqual((wake["target_agent"], wake["message_id"]), (aid, item["id"]))
 
+    def test_chat_wake_echo_in_the_send_second_is_accepted_and_confirmed(self):
+        # ChatJournal stamps frames with whole-second timestamps while sent_at
+        # keeps fractions. A real CLI echoes the wake back within ~100ms, i.e.
+        # in the send's own second; that receipt must still close the chain.
+        from sapper_chat import ChatJournal
+
+        self.agent["execution_mode"] = "chat"
+        self.manager.save_agent(self.agent)
+        aid = self.agent["id"]
+        journal = ChatJournal(self.app.state, aid)
+        journal.events.write_text(json.dumps({"type": "result", "timestamp": self.iso(1000)}) + "\n")
+        self.monitor.tick(self.agent["id"], self.rows(), now=1070.75)
+        token = self.wake()["id"]
+        echo = {"type": "user", "uuid": "echo", "message": {"role": "user", "content": self.monitor.prompt(token)},
+                "timestamp": self.iso(1070), "sessionId": self.agent["claude_session_id"]}
+        with journal.events.open("a") as file:
+            file.write(json.dumps(echo) + "\n")
+        board = self.manager.strategy_board([self.project["id"]])
+        self.monitor.record_board(aid, self.agent["run_id"], board)
+        view = self.monitor.view(aid)
+        self.assertEqual(view["verification"], "board_confirmed")
+        self.assertEqual(view["last_board"]["wake_id"], token)
+
     def test_two_watchdogs_send_only_one_wake(self):
         self.idle()
         other = Console(self.app.root, self.app.state)
@@ -206,8 +228,7 @@ class CommanderTests(unittest.TestCase):
     def test_native_terminal_interrupt_pauses_automatic_turns(self):
         from sapper_terminal import TerminalBridge
         pane = {'id': '%123', 'session': self.run['session'], 'project_id': self.project['id']}
-        with mock.patch.object(self.app, 'pane', return_value=pane), \
-             mock.patch.object(self.app, 'tmux', return_value=mock.Mock(returncode=0)):
+        with mock.patch.object(self.app, 'pane', return_value=pane):
             TerminalBridge(self.app).input('%123', {'data': '\x03'})
         self.idle()
         self.tick(2000)

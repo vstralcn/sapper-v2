@@ -270,12 +270,14 @@ function setTab(tab) {
     node.classList.toggle("active", active);
     node.setAttribute("aria-selected", String(active));
   });
-  for (const name of ["progress", "memory", "console", "files"]) $("tab-" + name).hidden = name !== tab;
+  for (const name of ["progress", "memory", "console", "files", "chat"]) $("tab-" + name).hidden = name !== tab;
   if (tab === "progress") renderProgress();
-  if (tab === "console") guarded(refreshTerminal);
+  if (tab === "chat" && typeof openCommanderChat === "function") guarded(openCommanderChat);
+  if (tab !== "chat" && typeof TurnStreamUI !== "undefined" && TurnStreamUI.focus) TurnStreamUI.close();
   if (tab === "files") guarded(loadFiles);
 }
 function renderPanes() {
+  if (!$("pane-select")) return;
   const signature = JSON.stringify(state.panes);
   if (state.paneSignature === signature) return;
   state.paneSignature = signature;
@@ -291,18 +293,6 @@ function renderPanes() {
   }
   $("pane-select").replaceChildren(...options);
   if (state.panes.some(p => p.id === selected)) $("pane-select").value = selected;
-}
-async function refreshTerminal() {
-  const pane = $("pane-select").value;
-  if (!pane) return;
-  const result = await api(`/panes/${encodeURIComponent(pane)}`);
-  if (pane !== $("pane-select").value) return;
-  const output = $("terminal-output");
-  const follow = output.scrollHeight - output.scrollTop - output.clientHeight < 60;
-  if (output.textContent !== result.text) {
-    output.textContent = result.text || "终端尚无可见输出。";
-    if (follow) output.scrollTop = output.scrollHeight;
-  }
 }
 function appendRunActivity(node, run) {
   const a = run.activity || {};
@@ -628,14 +618,6 @@ submit("record-form", async data => {
   await refreshTask();
   toast(commands.length || artifacts.length || payload.evidence_source ? "已保存记录与证据" : "已通过原接口保存记录");
 });
-submit("terminal-form", async () => {
-  const pane = $("pane-select").value;
-  if (!pane) throw new Error("请先选择一个活动终端");
-  const result = await api(`/panes/${encodeURIComponent(pane)}/send`, {method: "POST", body: {text: $("terminal-text").value}});
-  $("terminal-text").value = "";
-  toast(result.message);
-  await refreshTerminal();
-});
 submit("run-form", async data => {
   const payload = Object.fromEntries(data);
   payload.minutes = Number(payload.minutes);
@@ -661,15 +643,11 @@ submit("knowledge-form", loadKnowledge);
 
 $("new-project").onclick = $("empty-create").onclick = () => guarded(openCreateWorkspace);
 $("refresh-projects").onclick = () => guarded(() => refreshProjects());
-$("open-shell").onclick = () => openRun("shell");
 $("run-kind").onchange = updateRunOptions;
 $("run-form").addEventListener("input",updateRunOptions);
 $("run-form").addEventListener("change",updateRunOptions);
 $("add-fact").onclick = () => openRecord("fact");
 $("add-intent").onclick = () => openRecord("intent");
-$("worker-manage").onclick = () => $("worker-dialog").showModal();
-$("pane-select").onchange = () => guarded(refreshTerminal);
-$("refresh-terminal").onclick = () => guarded(refreshTerminal);
 $("close-log").onclick = () => { state.log = null; $("log-panel").hidden = true; };
 $("profiles-button").onclick = () => guarded(() => openModels());
 $("reset-profile").onclick = resetProfile;
@@ -711,12 +689,6 @@ $("upload-file").onchange = () => guarded(async () => {
 $("logout").onclick = () => guarded(async () => { await api("/logout", {method: "POST", body: {}}); showLogin(); });
 document.querySelectorAll("[data-tab]").forEach(node => { node.onclick = () => setTab(node.dataset.tab); });
 document.querySelectorAll(".dialog-close").forEach(node => { node.onclick = () => node.closest("dialog").close(); });
-document.querySelectorAll("[data-key]").forEach(node => { node.onclick = () => guarded(async () => {
-  const pane = $("pane-select").value;
-  if (!pane) throw new Error("请先选择终端");
-  await api(`/panes/${encodeURIComponent(pane)}/send`, {method: "POST", body: {key: node.dataset.key}});
-  await refreshTerminal();
-}); });
 
 function renderConnection(online=state.onlineRoles, connected=state.connectionOk ?? true) {
   state.onlineRoles=online;
@@ -727,17 +699,38 @@ function renderConnection(online=state.onlineRoles, connected=state.connectionOk
   $("connection-label").textContent=connected&&online!=null?`${online} 个角色在线`:connection.title;
 }
 
-setInterval(async () => {
-  if (!state.csrf || state.polling || document.hidden) return;
+let statusTimer = null;
+async function statusPoll() {
+  if (!state.csrf || document.hidden) return;
+  if (state.polling) { scheduleStatus(); return; }
   state.polling = true;
   try {
     await refreshTask();
-    if (state.tab === "console") await Promise.all([refreshTerminal(), refreshLog()]);
+    if (state.tab === "console") await refreshLog();
     renderConnection(undefined,true);
   } catch (error) {
     renderConnection(undefined,false);
-  } finally { state.polling = false; }
-}, 2000);
+  } finally {
+    state.polling = false;
+    scheduleStatus();
+  }
+}
+function scheduleStatus() {
+  if (statusTimer) clearTimeout(statusTimer);
+  if (state.csrf && !document.hidden) statusTimer = setTimeout(statusPoll, 2000);
+}
+function kickStatus() {
+  if (statusTimer) clearTimeout(statusTimer);
+  if (state.csrf && !document.hidden) statusTimer = setTimeout(statusPoll, 100);
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    if (statusTimer) clearTimeout(statusTimer);
+  } else {
+    scheduleStatus();
+    if (typeof TurnStreamUI !== "undefined") TurnStreamUI.resume();
+  }
+});
 
 document.addEventListener("DOMContentLoaded", async () => {
   try {
@@ -753,6 +746,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     return;
   }
   await guarded(showWorkspace);
+  scheduleStatus();
 }, {once:true});
 
 const profileProtocolNames={anthropic:'Anthropic Messages',responses:'Responses',chat_completions:'Chat Completions'};

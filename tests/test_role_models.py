@@ -93,8 +93,7 @@ class RoleModelTests(unittest.TestCase):
         self.assertEqual(model["original_profile_id"], "")
         self.assertEqual(model["current_profile_id"], self.glm["id"])
         with mock.patch.dict(os.environ, {}, clear=True), \
-                mock.patch.object(self.app, "start", wraps=Console.start.__get__(self.app)), \
-                mock.patch.object(self.app, "tmux") as tmux:
+                mock.patch.object(self.app, "start", wraps=Console.start.__get__(self.app)):
             with self.assertRaises(WebError) as error:
                 self.app.workspaces.resume(agent["id"], {"profile_id":self.glm["id"]})
         message = str(error.exception)
@@ -103,7 +102,6 @@ class RoleModelTests(unittest.TestCase):
         self.assertNotIn("fixture-private-key", message)
         self.assertEqual(error.exception.status, 409)
         self.assertEqual(self.app.workspaces.agent(agent["id"])["profile_id"], "")
-        tmux.assert_not_called()
 
     def test_explicit_new_main_uses_current_default_and_preserves_old_identity(self):
         old = self.launch(role="commander", profile_id="")

@@ -219,6 +219,16 @@ class ChatLifecycleTests(unittest.TestCase):
     tearDown = workspace_fixture.NativeWorkspaceTests.tearDown
     until = workspace_fixture.NativeWorkspaceTests.until
 
+    def ready(self, rid):
+        info = self.app.run_info(rid)
+        if info["status"] in ("exited", "failed"):
+            return True
+        if (info.get("activity") or {}).get("events", 0) > 0:
+            return True
+        directory = self.app.run_path(rid)
+        return any((directory / name).exists() and (directory / name).stat().st_size
+                   for name in ("frames.jsonl", "turns.jsonl"))
+
     def start_chat(self):
         self.bin.write_text(CHAT_FIXTURE)
         # Capabilities were cached by setUp's enable() using the tui fixture;
@@ -238,7 +248,7 @@ class ChatLifecycleTests(unittest.TestCase):
         # Frozen spec v1.0 二: permission is tiered strictly by role. A commander
         # may never opt into --dangerously-skip-permissions, even on resume.
         run = self.app.workspaces.dispatch(self.pid, {"role": "commander", "skip_permissions": True})
-        self.until(lambda: "NATIVE_READY" in self.app.log(run["id"])["text"])
+        self.until(lambda: self.ready(run["id"]))
         aid = run["agent_id"]
         self.assertNotIn("--dangerously-skip-permissions", run["command"])
         self.assertFalse(self.app.workspaces.agent(aid)["skip_permissions"])
@@ -247,7 +257,7 @@ class ChatLifecycleTests(unittest.TestCase):
         self.assertIn("Sapper 指挥官职责", argv_text)
         self.app.workspaces.stop_agent(aid)
         retained = self.app.workspaces.resume(aid, {"skip_permissions": True})
-        self.until(lambda: "NATIVE_READY" in self.app.log(retained["id"])["text"])
+        self.until(lambda: self.ready(retained["id"]))
         self.assertNotIn("--dangerously-skip-permissions", retained["command"])
         self.assertFalse(self.app.workspaces.agent(aid)["skip_permissions"])
         self.assertEqual(retained["claude_session_id"], run["claude_session_id"])

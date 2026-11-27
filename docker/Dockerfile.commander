@@ -1,10 +1,9 @@
-# Commander-architecture variant: base tmux toolchain plus the commander
-# units (worker.sh / watchdog.sh / SKILL.md) and an entrypoint that boots the
-# AI commander TUI in tmux window 0 and the watchdog guardian behind it.
+# Commander-architecture variant: headless base image plus the commander units
+# (worker.sh / watchdog.sh / SKILL.md) and their entrypoint.
 #
 # Build:  docker build -f docker/Dockerfile.commander -t sapper-agent:commander .
-#         (requires sapper-agent:tmux to exist locally; context = repo root)
-FROM sapper-agent:tmux
+#         (requires sapper-agent:latest to exist locally; context = repo root)
+FROM sapper-agent:latest
 
 USER root
 # Arsenal layer (mounted here instead of the base image so the base stays cached):

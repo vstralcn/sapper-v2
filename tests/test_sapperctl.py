@@ -1,5 +1,5 @@
-"""Local lifecycle regression using an isolated Web state, bridge and tmux socket."""
-from contextlib import ExitStack
+"""Local lifecycle regression using an isolated Web state."""
+from contextlib import ExitStack, suppress
 import gc
 import json
 import os
@@ -77,8 +77,6 @@ class SapperCtlTests(unittest.TestCase):
     def test_restart_preserves_jobs_and_full_stop_only_closes_owned_resources(self):
         with tempfile.TemporaryDirectory(prefix="sapper ctl ") as tmp:
             state, root = Path(tmp) / "state", Path(tmp) / "tasks"
-            name = "ctl-" + uuid.uuid4().hex
-            tmux = ["tmux", "-L", name]
             with socket.socket() as s:
                 s.bind(("127.0.0.1", 0))
                 port = s.getsockname()[1]
@@ -88,12 +86,12 @@ class SapperCtlTests(unittest.TestCase):
                                       check=check, capture_output=True, text=True, timeout=40)
 
             try:
-                started = ctl("start", "--port", str(port), "--root", str(root), "--tmux-socket", name)
+                started = ctl("start", "--port", str(port), "--root", str(root))
                 self.assertEqual("--dangerously-skip-permissions" in started.stderr, os.geteuid() == 0)
-                app = Console(root, state, name)
+                app = Console(root, state)
                 project = app.create_project({"name": "fixture", "goal": "lifecycle"})
                 run = app.start(project["id"], {"kind": "custom", "command": "sleep 120"})
-                subprocess.run(tmux + ["new-session", "-d", "-s", "unrelated", "sleep 120"], check=True)
+                unrelated = subprocess.Popen(["sleep", "120"])
                 with warnings.catch_warnings():
                     # ensure_bridge deliberately detaches the transport process;                    # dropping that Popen is expected, not a leak in this test.
                     warnings.simplefilter("ignore", ResourceWarning)
@@ -110,7 +108,7 @@ class SapperCtlTests(unittest.TestCase):
                 self.assertIn("受管无头进程：1", ctl("status").stdout)
                 self.assertIn("在线模型桥：1", ctl("status").stdout)
                 ctl("stop")
-                self.assertEqual(subprocess.check_output(tmux + ["list-sessions", "-F", "#{session_name}"], text=True).strip(), "unrelated")
+                self.assertIsNone(unrelated.poll(), "unrelated process must survive full stop")
                 self.assertEqual(sapper_models.bridge_operation(state), [])
                 self.assertIn(app.run_info(run["id"])["status"], ("stopped", "exited"))
                 ctl("stop")
@@ -120,7 +118,10 @@ class SapperCtlTests(unittest.TestCase):
                     self.assertNotEqual(ctl("stop", check=False).returncode, 0)
             finally:
                 ctl("stop", check=False)
-                subprocess.run(tmux + ["kill-server"], capture_output=True)
+                if "unrelated" in locals():
+                    unrelated.terminate()
+                    with suppress(subprocess.TimeoutExpired):
+                        unrelated.wait(timeout=3)
 
 
 if __name__ == "__main__":

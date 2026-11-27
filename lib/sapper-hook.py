@@ -156,6 +156,11 @@ def _managed_messages(store_path: Path | None) -> str:
                 or record.get("role") == "commander" or not isinstance(record.get("cwd"), str)
                 or (Path(record["cwd"]) / DEFAULT_STORE).resolve() != store_path.resolve()):
             return ""
+        if record.get("execution_mode") == "chat":
+            # The headless supervisor delivers this queue over stdin.  Draining
+            # it here would mark the mission "provided" before any turn was
+            # sent, so the process would start and never be prompted.
+            return ""
         from sapper_chat import ChatJournal
         messages = ChatJournal(state, aid).inbox()
         return ("来自当前工作区指挥关系的定向补充，请核对与当前任务的关系：\n" +

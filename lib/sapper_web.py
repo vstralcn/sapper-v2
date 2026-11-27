@@ -42,7 +42,7 @@ from sapper_native import NativeSurface, NativeError
 from sapper_permission_audit import FIELDS as PERMISSION_AUDIT_FIELDS
 from sapper_extensions import ExtensionError, clean_environment, api_environment
 import sapper_models
-from sapper_turns import iter_frames, read_events
+from sapper_turns import _setting, iter_frames, read_events
 from sapper_auth import AuthError, AuthStore, SESSION_SECONDS, manage_credentials
 
 REPO = Path(__file__).resolve().parent.parent
@@ -60,6 +60,11 @@ CLAUDE_STARTUP_WARNING = "警告：Claude Code "
 INTERRUPT_GRACE = 10
 TERMINATE_GRACE = 3
 MAX_RUN_SECONDS = 1440 * 60
+# Frozen spec v1.0 阶段四: attachment range reads enforce BOTH dimensions so a
+# single multi-megabyte JSON line cannot blow up a request or the page.
+ATTACHMENT_MAX_LINES = _setting("SAPPER_ATTACHMENT_MAX_LINES", 2000, 1, 100000)
+ATTACHMENT_MAX_BYTES = _setting("SAPPER_ATTACHMENT_MAX_BYTES", 256 * 1024, 1, 64 * 1024 * 1024)
+ATTACHMENT_PAGE_DEFAULT = _setting("SAPPER_ATTACHMENT_PAGE_DEFAULT", 200, 1, 100000)
 KEYS = {"Enter", "Escape", "Tab", "BTab", "Up", "Down", "Left", "Right",
         "C-c", "C-d", "C-u", "C-l", "BSpace", "Space"}
 HIDDEN = {".git", ".claude", ".codex", ".sapper-web", "node_modules", "__pycache__",
@@ -233,7 +238,7 @@ class Console:
                             "facts": sum(p["facts"] for p in projects)},
                 "context": {k: context[k] for k in ("revision", "enabled", "prompt_enabled", "hook_enabled", "updated_at")},
                 "environment": {"system": "macOS" if platform.system() == "Darwin" else platform.system(), "architecture": platform.machine(),
-                                "python": platform.python_version(), "tmux": shutil.which("tmux") is not None,
+                                "python": platform.python_version(),
                                 "claude": self.workspaces.capabilities(), "workspace_roots": [str(p) for p in self.workspace_roots]}}
 
     def redaction_keys(self):
@@ -687,38 +692,13 @@ class Console:
             private_json(self.config_path, cfg)
         self.audit("profile.deleted", profile=pid)
 
-    def tmux(self, *args, timeout=10):
-        prefix = ["tmux"] + (["-L", self.tmux_socket] if self.tmux_socket else [])
-        try:
-            return subprocess.run(prefix + list(args), capture_output=True, text=True, timeout=timeout)
-        except FileNotFoundError as exc:
-            raise WebError("未安装 tmux，请先安装后使用运行与终端功能", 503) from exc
-        except subprocess.TimeoutExpired:
-            socket = self.tmux_socket or "default"
-            raise WebError(f"tmux 响应超时（{args[0]}，socket={socket!r}，等待 {timeout:g} 秒）", 503) from None
-
-    def query_tmux(self, operation, *args):
-        proc = self.tmux(operation, *args)
-        if not proc.returncode:
-            return proc
-        error = proc.stderr.strip()
-        if (error.startswith("no server running on ")
-                or error.startswith("error connecting to ") and error.endswith(" (No such file or directory)")
-                or operation == "has-session" and error.startswith("can't find session: ")
-                or operation == "list-panes" and error == "no sessions"):
-            return None
-        raise WebError(f"tmux 无法确认状态（{operation}，退出码 {proc.returncode}）", 503)
-
     def panes(self):
         """Presentation shim: one pseudo-pane per live managed headless run.
 
-        Frozen spec v1.0 二: managed runs no longer use a terminal multiplexer.
-        The frontend still speaks the pane-shaped API until the phase-4 switch,
-        so managed runs are mapped from run.json + host.json.  Legacy external
-        tmux panes (user-attached terminals) remain discoverable until phase 4.
+        There is no terminal multiplexer.  Print runs still consume this
+        pane-shaped read API until their dedicated phase-5 cleanup.
         """
         result = []
-        managed_sessions = set()
         for path in (self.state / "runs").glob("*/run.json"):
             run = read_json(path, {})
             rid = run.get("id") or path.parent.name
@@ -728,7 +708,6 @@ class Console:
             if not (path.parent / "host.json").exists():
                 continue
             session = "sapper-web-" + rid
-            managed_sessions.add(session)
             agent = self.workspaces.agent(run.get("agent_id"), include_deleted=True) if run.get("agent_id") else {}
             result.append({
                 "id": "run-" + rid,
@@ -740,44 +719,6 @@ class Console:
                 "project_id": run.get("project_id"),
                 "role": agent.get("role"),
             })
-        # Legacy external terminals: discover them only when tmux is installed.
-        # They are never managed/reaped by this service.
-        if not shutil.which("tmux"):
-            return result
-        fmt = "#{pane_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}\t#{pane_dead}\t#{pane_current_command}"
-        proc = self.query_tmux("list-panes", "-a", "-F", fmt)
-        if proc is None:
-            return result
-        projects = sorted(self.projects(), key=lambda p: len(p["path"]), reverse=True)
-        for line in proc.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) != 6:
-                continue
-            pane, session, name, cwd, dead, command = parts
-            if session in managed_sessions:
-                continue
-            path = Path(cwd).resolve()
-            linked_store = None
-            for parent in (path, *path.parents):
-                if not any(parent.is_relative_to(r) for r in self.workspace_roots):
-                    break
-                if (parent / ".sapper" / "project.json").is_file():
-                    candidate = (parent / ".sapper").resolve()
-                    if any(candidate.is_relative_to(r) for r in self.workspace_roots):
-                        linked_store = candidate
-                    break
-            for p in projects:
-                if (path.is_relative_to(Path(p["path"]))
-                        or linked_store == (Path(p["path"]) / ".sapper").resolve()):
-                    result.append({"id": pane, "session": session, "name": name, "path": cwd,
-                                   "dead": dead == "1", "command": command, "project_id": p["id"],
-                                   "legacy": True})
-                    break
-            else:
-                if session == "sapper-cmd" and name == "commander" and path.is_relative_to(self.root):
-                    result.append({"id": pane, "session": session, "name": name, "path": cwd,
-                                   "dead": dead == "1", "command": command, "project_id": None,
-                                   "role": "commander", "legacy": True})
         return result
 
     def pane(self, pane_id):
@@ -975,8 +916,13 @@ class Console:
             primary, error = self.workspaces.main_agent(pid, agents=agents), None
         except WorkspaceError as exc:
             primary, error = None, str(exc)
+        from sapper_routing import RoutingLedger
+        # Frozen spec v1.0 阶段四: the read-only global audit copy is carried on
+        # the existing commander status poll — no independent timer or endpoint.
+        fault_audit = RoutingLedger(self.state, pid).audit_list()
         return {"agents": agents, "primary_agent": primary, "primary_error": error,
                 "summary": agent_summary(agents), "observed_at": sapper.now_iso(),
+                "fault_audit": fault_audit,
                 "services": self.workspaces.services(pid, run_records=runs, pane_records=panes)}
 
     def start(self, pid, data, *, native=None):
@@ -1002,7 +948,6 @@ class Console:
         env.update(PATH=str(self.state / "bin") + os.pathsep + os.environ.get("PATH", ""),
                    PYTHONUNBUFFERED="1", SAPPER_ROOT=str(self.root),
                    SAPPER_GLOBAL_CONTEXT_FILE=str(self.context_path), SAPPER_CONTEXT_PROMPT_REVISION="")
-        env["SAPPER_TMUX_SOCKET"] = self.tmux_socket or ""
         if "SAPPER_KB_ROOT" in env:
             env["SAPPER_KB_ROOT"] = str(KnowledgeBase.default_root().resolve())
         if profile and sapper_models.protocol(profile) != "anthropic":
@@ -1287,6 +1232,66 @@ class Console:
         keys = self.redaction_keys()
         result = read_events(self.run_path(rid) / "turns.jsonl", after_seq, limit)
         return json.loads(self.redact(json.dumps(result, ensure_ascii=False), keys=keys))
+
+    def attachment_range(self, rid, relative, start_line=1, limit=None):
+        """Read a sed-aligned line range from a run attachment, with dual caps."""
+        directory = self.run_path(rid)
+        relative = str(relative or "")
+        parts = Path(relative).parts
+        if Path(relative).is_absolute() or not parts or any(p in ("", ".", "..") for p in parts):
+            raise WebError("附件路径不合法", 400)
+        if any("\x00" in part for part in parts):
+            raise WebError("附件路径不合法", 400)
+        root = directory.resolve()
+        resolved = (directory / relative).resolve()
+        if not resolved.is_relative_to(root):
+            raise WebError("附件路径不得逃出运行目录", 403)
+        if not resolved.is_file():
+            raise WebError("附件不存在", 404)
+        start_line = min(max(1, int(start_line)), 10 ** 9)
+        limit = ATTACHMENT_PAGE_DEFAULT if limit is None else min(max(1, int(limit)), ATTACHMENT_MAX_LINES)
+
+        lines = []
+        used = 0
+        end_line = start_line - 1
+        total_lines = 0
+        has_more = False
+        with resolved.open("rb") as handle:
+            for number, raw in enumerate(handle, 1):
+                total_lines = number
+                if number < start_line:
+                    continue
+                if len(lines) >= limit or used >= ATTACHMENT_MAX_BYTES:
+                    has_more = True
+                    continue
+                data = raw.rstrip(b"\n")
+                remaining = ATTACHMENT_MAX_BYTES - used
+                line_truncated = False
+                if len(data) > remaining:
+                    data = data[:remaining]
+                    line_truncated = True
+                try:
+                    value = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    # A byte cap may cut a multi-byte code point: keep only the
+                    # complete prefix instead of emitting U+FFFD replacement.
+                    value = data[:exc.start].decode("utf-8")
+                    line_truncated = True
+                lines.append((number, value, line_truncated))
+                end_line = number
+                used += len(data)
+        text = "\n".join(value for _number, value, _cut in lines)
+        text = self.redact(text)
+        return {
+            "path": relative,
+            "start_line": start_line if lines else end_line,
+            "end_line": end_line,
+            "bytes": len(text.encode("utf-8")),
+            "text": text,
+            "line_truncated": any(cut for _number, _value, cut in lines),
+            "total_lines": total_lines,
+            "has_more": has_more,
+        }
 
     def file(self, pid, relative):
         project_dir = Path(self.project(pid)["path"])
@@ -1984,8 +1989,8 @@ class Handler(BaseHTTPRequestHandler):
                 app.auth.logout(session)
                 return self.reply(200, {"ok": True}, headers={"Set-Cookie": self.expired_cookie()})
             if path == "/api/health" and method == "GET":
-                return self.reply(200, {"root": str(app.root), "state": str(app.state), "tmux_socket": app.tmux_socket or "default",
-                                       "tmux": bool(shutil.which("tmux")), "claude": bool(shutil.which("claude")),
+                return self.reply(200, {"root": str(app.root), "state": str(app.state),
+                                       "claude": bool(shutil.which("claude")),
                                        "sapper": str(SAPPER), "worker_script": str(REPO / "docker/commander/worker.sh"),
                                        "workspace_roots": [str(p) for p in app.workspace_roots]})
             if path == "/api/directories" and method == "GET":
@@ -2160,6 +2165,11 @@ class Handler(BaseHTTPRequestHandler):
                     after_seq = query_number(q("after_seq"), "after_seq", 0, 0, 2 ** 31 - 1)
                     limit = query_number(q("limit"), "limit", None, 1, 1000)
                     return self.reply(200, app.turn_events(rid, after_seq, limit))
+                if len(parts) == 5 and parts[4] == "attachment" and method == "GET":
+                    path = q("path", "")
+                    start_line = query_number(q("start_line", "1"), "start_line", 1, 1, 10 ** 9)
+                    limit = query_number(q("limit"), "limit", None, 1, ATTACHMENT_MAX_LINES)
+                    return self.reply(200, app.attachment_range(rid, path, start_line, limit))
             if path == "/api/knowledge" and method == "GET":
                 kb = KnowledgeBase.default_root()
                 knowledge = KnowledgeBase(kb)
@@ -2269,14 +2279,13 @@ def warn_claude_startup(binary):
 def main(argv=None):
     if argv is None and len(sys.argv) >= 3 and sys.argv[1] == "_runner":
         return run_child(sys.argv[2])
-    parser = argparse.ArgumentParser(description="在网页操作现有 sapper 和 tmux，不替换 agent 引擎")
+    parser = argparse.ArgumentParser(description="在网页操作现有 sapper，不替换 agent 引擎")
     parser.add_argument("--root", type=Path, default=REPO / "runs", help="受管任务根目录（自动发现四层内的 .sapper）")
     parser.add_argument("--state", type=Path, default=REPO / ".sapper-web", help="Web 私有配置和日志目录")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--public-url", default="", help="反向代理公开地址，用于 Host 校验和安全 cookie")
     parser.add_argument("--url-prefix", default="", help="例如 /sapper（反向代理保留此前缀）")
-    parser.add_argument("--tmux-socket", default=None, help="可选 tmux -L socket 名称")
     parser.add_argument("--workspace-root", action="append", type=Path, default=[], help="目录浏览快捷入口（可选，可重复指定；也可直接在网页选择目录）")
     parser.add_argument("--claude-bin", default=os.environ.get("SAPPER_CLAUDE_BIN", "claude"), help="原 Claude Code 可执行文件")
     credentials = parser.add_mutually_exclusive_group()
@@ -2299,7 +2308,7 @@ def main(argv=None):
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             parser.error("--public-url 必须是 HTTP(S) 地址")
     warn_root_startup()
-    app = Console(args.root, args.state, args.tmux_socket, workspace_roots=args.workspace_root, claude_bin=args.claude_bin)
+    app = Console(args.root, args.state, workspace_roots=args.workspace_root, claude_bin=args.claude_bin)
     try:
         server = WebServer((args.host, args.port), app, args.public_url, args.url_prefix)
     except OSError as exc:

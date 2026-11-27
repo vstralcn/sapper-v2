@@ -26,9 +26,6 @@ class IntentLifecycleTests(unittest.TestCase):
     tearDown = fixtures.WorkspaceBindingTests.tearDown
 
     def prepare(self):
-        tmux = mock.patch.object(self.app, "tmux", return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
-        tmux.start()
-        self.addCleanup(tmux.stop)
         self.manager = self.app.workspaces
         self.pid = self.manager.bind({"path": str(self.question)})["id"]
         self.manager.enable(self.pid, {})
@@ -78,7 +75,6 @@ class IntentLifecycleTests(unittest.TestCase):
             return {**run, "status": "stopped"}
 
         with mock.patch.object(self.app, "_stop_run", side_effect=low_stop), \
-             mock.patch.object(self.app, "tmux", return_value=SimpleNamespace(returncode=1)), \
              mock.patch("sapper_workspace.RunProcesses") as tracker:
             tracker.return_value.finish.return_value = False
             self.assertEqual(self.manager.stop_agent(self.source["id"])["status"], "stop_pending")
@@ -173,7 +169,6 @@ class IntentLifecycleTests(unittest.TestCase):
                 expected_owner=self.source["id"], reason="replace")
 
         with mock.patch.object(self.app, "_stop_run", side_effect=low_stop), \
-             mock.patch.object(self.app, "tmux", return_value=SimpleNamespace(returncode=1)), \
              ThreadPoolExecutor(max_workers=2) as pool:
             stopped = pool.submit(self.manager.stop_agent, self.source["id"])
             self.assertTrue(entered.wait(5))
@@ -297,7 +292,6 @@ class ProcessExitTests(unittest.TestCase):
                     "process_births": {"98765": "Fri Nov  6 14:00:00 2026"}}
             app.run_info = mock.Mock(side_effect=lambda rid: dict(info))
             app.run_path = mock.Mock(return_value=Path(directory))
-            app.tmux = mock.Mock(return_value=SimpleNamespace(returncode=1))
             app.audit = mock.Mock()
             reused = {98765: {"parent": 1, "group": 98765, "birth": "Sat Nov  7 14:00:00 2026"}}
             with mock.patch("sapper_processes.process_table", return_value=reused), \

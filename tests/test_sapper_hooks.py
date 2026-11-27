@@ -33,6 +33,30 @@ class HookProcessTests(unittest.TestCase):
                                         input=json.dumps({"cwd":str(path)}),capture_output=True,text=True,check=True)
                 self.assertEqual("TARGETED_CORRECTION" in result.stdout, expected)
 
+    def test_headless_queue_is_left_for_the_supervisor(self):
+        # A chat-mode run is prompted over stdin by its supervisor. A hook that
+        # drained the queue first marked the mission "provided" before any turn
+        # was sent, so the process started and was never prompted.
+        from sapper_chat import ChatJournal
+        with tempfile.TemporaryDirectory(prefix="headless hook ") as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            sapper.Store(workspace / ".sapper").init("test", "workspace")
+            state = root / "state"
+            (state / "agents").mkdir(parents=True)
+            aid = "c" * 16
+            (state / "agents" / f"{aid}.json").write_text(json.dumps(
+                {"id":aid,"role":"worker","workspace_id":"w","cwd":str(workspace),"execution_mode":"chat"}))
+            journal = ChatJournal(state, aid)
+            journal.begin("r" * 16, "HEADLESS_MISSION")
+            env = {**os.environ,"SAPPER_MODE":"workspace","SAPPER_WEB_STATE":str(state),
+                   "SAPPER_AGENT_ID":aid,"SAPPER_WORKSPACE_ID":"w"}
+            for event in ("sessionstart", "userpromptsubmit"):
+                result = subprocess.run([sys.executable,str(HOOK),event],env=env,cwd=root,
+                                        input=json.dumps({"cwd":str(workspace)}),capture_output=True,text=True,check=True)
+                self.assertNotIn("HEADLESS_MISSION", result.stdout)
+            self.assertEqual([m["status"] for m in journal.view()["messages"] if m["text"] == "HEADLESS_MISSION"], ["queued"])
+
     def test_managed_commander_gets_role_workflow_in_both_hooks(self):
         with tempfile.TemporaryDirectory(prefix="commander hook ") as tmp:
             root = Path(tmp)

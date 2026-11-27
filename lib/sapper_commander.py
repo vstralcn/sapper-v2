@@ -64,6 +64,14 @@ def timestamp(value):
         return None
 
 
+def not_before(at, since):
+    """Journal event times are truncated to whole seconds while send times are
+    not: a receipt in the send's own second is still after the send.  A wake
+    token only exists after it was sent, so this cannot accept an older frame.
+    """
+    return at is not None and since is not None and at >= since // 1
+
+
 class CommanderMonitor:
     def __init__(self, manager):
         self.manager = manager
@@ -226,7 +234,7 @@ class CommanderMonitor:
                     data.pop("waiting_since", None)
                 wake = data.get("wake", {})
                 if (WAKE.search(value) and WAKE.search(value).group(1) == wake.get("id")
-                        and at >= wake.get("sent_at", float("inf"))):
+                        and not_before(at, wake.get("sent_at"))):
                     wake.update(accepted_at=at, status="accepted")
                     data["accepted_wake_id"] = wake["id"]
                     data["verification"] = "input_accepted"
@@ -431,7 +439,8 @@ class WorkerMonitor(CommanderMonitor):
                 data["api_error_idle"] = False
                 wake = data.get("wake", {})
                 if (data.get("accepted_wake_id") == wake.get("id")
-                        and wake.get("accepted_at") is not None and at >= wake.get("sent_at", float("inf"))):
+                        and wake.get("accepted_at") is not None
+                        and not_before(at, wake.get("sent_at"))):
                     wake.update(status="work_confirmed", confirmed_at=at)
                     data.update(verification="work_confirmed", recoveries=0)
                     data.pop("attention", None)
@@ -452,9 +461,13 @@ class WorkerMonitor(CommanderMonitor):
             row = next((a for a in rows if a["id"] == aid), {})
             if row and row.get("run_id") != agent.get("run_id"):
                 return
+            # pane_id is a TUI-only guard: headless chat runs have no pane, but
+            # their recovery must still be monitored via ChatJournal events.
+            chat = agent.get("execution_mode") == "chat"
             if (agent.get("role") == "commander" or agent.get("desired_state") != "running"
                     or agent.get("legacy") or agent.get("execution_mode") not in ("tui", "chat")
-                    or agent.get("native_operation") or not row.get("pane_id")):
+                    or agent.get("native_operation")
+                    or (not chat and not row.get("pane_id"))):
                 return
             run = self.app.run_info(agent["run_id"])
             if (run["status"] in ("stopping", "stopped", "timed_out")

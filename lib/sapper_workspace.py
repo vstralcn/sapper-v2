@@ -1222,13 +1222,6 @@ class Workspaces:
                 return self.stop_pending(a)
         except (OSError, ValueError, subprocess.SubprocessError):
             return self.stop_pending(a)
-        if a.get("run_id"):
-            # A finished wrapper may have left its tmux shell alive. It belongs
-            # to this run, not to a replacement or an external terminal.
-            session = self.app.run_info(a["run_id"])["session"]
-            self.app.tmux("kill-session", "-t", session)
-            if not self.app.tmux("has-session", "-t", session).returncode:
-                return self.stop_pending(a)
         return {**result, "released_intents": self.release_stopped_intents(a)}
 
     @serialized

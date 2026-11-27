@@ -7,7 +7,6 @@
   <title>Sapper · 任务工作台</title>
   <script src="theme.js"></script>
   <link rel="stylesheet" href="style.css">
-  <link rel="stylesheet" href="vendor/xterm.css">
   <link rel="stylesheet" href="workspace.css">
   <link rel="stylesheet" href="agent-topology.css">
   <link rel="stylesheet" href="overview.css">
@@ -15,9 +14,8 @@
   <link rel="stylesheet" href="native.css">
   <link rel="stylesheet" href="models.css">
   <link rel="stylesheet" href="settings.css">
-  <script src="vendor/xterm.js" defer></script>
-  <script src="vendor/addon-fit.js" defer></script>
   <script src="app.js" defer></script>
+  <script src="turn-stream.js" defer></script>
   <script src="models.js" defer></script>
   <script src="agent-topology-model.js" defer></script>
   <script src="agent-topology.js" defer></script>
@@ -165,6 +163,7 @@
           </div>
         </div>
         <div class="tabs" role="tablist" aria-label="任务视图">
+          <button data-tab="chat" role="tab" aria-selected="false"><svg class="ui-icon" aria-hidden="true"><use href="#icon-progress"/></svg>对话</button>
           <button data-tab="progress" class="active" role="tab" aria-selected="true"><svg class="ui-icon" aria-hidden="true"><use href="#icon-progress"/></svg>进展</button>
           <button data-tab="agents" role="tab" aria-selected="false"><svg class="ui-icon" aria-hidden="true"><use href="#icon-roles"/></svg>角色与协作</button>
           <button data-tab="memory" role="tab" aria-selected="false"><svg class="ui-icon" aria-hidden="true"><use href="#icon-memory"/></svg>事实与意图</button>
@@ -173,6 +172,21 @@
           <button id="native-tab" data-tab="native" role="tab" aria-selected="false" aria-controls="tab-native"><svg class="ui-icon" aria-hidden="true"><use href="#icon-terminal"/></svg>原生功能</button>
           <button data-tab="files" role="tab" aria-selected="false"><svg class="ui-icon" aria-hidden="true"><use href="#icon-workspace"/></svg>文件与附件</button>
         </div>
+        <section id="tab-chat" class="tab-panel" hidden>
+          <div class="chat-grid">
+            <div class="chat-main">
+              <div id="turn-stream" aria-label="结构化轮次事件"></div>
+              <form id="commander-chat-form" class="chat-input" hidden>
+                <textarea id="commander-chat-text" rows="3" placeholder="向顶层指挥官发送消息"></textarea>
+                <button class="button" type="submit">发送</button>
+              </form>
+            </div>
+            <aside class="chat-side">
+              <section id="commander-approvals" aria-label="待审批请求"></section>
+              <section id="commander-fault-audit" aria-label="只读故障审计"></section>
+            </aside>
+          </div>
+        </section>
         <section id="tab-progress" class="tab-panel" hidden>
           <section id="competition-board" aria-labelledby="competition-title" hidden>
             <header class="competition-heading">
@@ -216,7 +230,7 @@
           </div>
           <details class="progress-cli"><summary>在 CLI 中查看同一工作区</summary><code id="progress-cli-command"></code></details>
         </section>
-        <section id="tab-workspace" class="tab-panel" hidden><div class="workspace-grid"><aside class="workspace-files"><div class="panel-heading"><h2>题目文件</h2><button id="workspace-file-up" class="text-button">上层</button></div><p id="workspace-file-path" class="field-help">工作区根目录</p><div id="workspace-file-list"></div></aside><div class="workspace-terminal"><div class="native-toolbar"><select id="native-pane" aria-label="选择角色终端"></select><button id="terminal-control" class="button">接管输入</button></div><div id="native-terminal" aria-label="Claude Code 原生终端"></div><div class="native-footer"><span id="native-mode">选择或启动角色会话</span><span>原 tmux PTY · 会话独立于网页</span></div></div><aside class="workspace-agents"><div class="panel-heading"><h2>Agent 状态 <span id="workspace-agent-count"></span></h2></div><div id="agent-list" class="agent-preview"></div><div id="service-list"></div></aside></div></section>
+        <section id="tab-workspace" class="tab-panel" hidden><div class="workspace-grid"><aside class="workspace-files"><div class="panel-heading"><h2>题目文件</h2><button id="workspace-file-up" class="text-button">上层</button></div><p id="workspace-file-path" class="field-help">工作区根目录</p><div id="workspace-file-list"></div></aside><aside class="workspace-agents"><div class="panel-heading"><h2>Agent 状态 <span id="workspace-agent-count"></span></h2></div><div id="agent-list" class="agent-preview"></div><div id="service-list"></div></aside></div></section>
 
         <section id="tab-agents" class="tab-panel" hidden><div id="agent-topology" class="agent-topology"></div></section>
 
@@ -230,8 +244,8 @@
         </section>
 
         <section id="tab-console" class="tab-panel" hidden>
-          <div class="console-grid"><div class="terminal-section"><div class="terminal-toolbar"><label>原生终端<select id="pane-select" aria-label="选择终端"></select></label><button id="refresh-terminal" class="icon-button" aria-label="刷新终端">↻</button><span class="terminal-tag">2 秒快照</span></div><pre id="terminal-output" class="terminal-output" tabindex="0">尚无终端。启动原 agent、打开终端，或接入该目录中已有的 tmux 会话。</pre><div class="terminal-keys"><button data-key="C-c">Ctrl C · 中断</button><button data-key="Escape">Esc</button><button data-key="Tab">Tab</button><button data-key="Up">↑</button><button data-key="Down">↓</button><button data-key="Enter">Enter</button><button id="worker-manage">原 worker 管理</button></div><form id="terminal-form" class="terminal-input"><input id="terminal-text" aria-label="发送到终端的内容" placeholder="向选中的原会话发送文字…" required autocomplete="off"><button class="button primary" type="submit">发送 ↵</button></form><p class="field-help">发送表示已输入终端。是否读取或采用，请以原 agent 的回应为准。</p></div>
-          <aside class="run-sidebar"><div class="panel-heading"><h2>运行记录</h2><button id="open-shell" class="text-button">＋ 终端</button></div><div id="runs-list"></div></aside></div>
+          <div class="console-grid">
+          <aside class="run-sidebar"><div class="panel-heading"><h2>运行记录</h2></div><div id="runs-list"></div></aside></div>
           <div id="log-panel" class="log-panel" hidden><div class="panel-heading"><h2 id="log-title">运行输出</h2><div><label class="inline-check"><input id="follow-log" type="checkbox" checked> 跟随输出</label><button id="close-log" class="text-button">收起</button></div></div><pre id="log-output" tabindex="0"></pre><p class="field-help">新限时角色显示流式活动摘要；下载保留原始输出。活动或静默都不能单独证明有效进展或卡住。其他运行保留原终端日志。</p></div>
         </section>
 

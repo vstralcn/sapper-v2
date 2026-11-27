@@ -215,20 +215,6 @@ class NativeIntegrationTests(unittest.TestCase):
         self.assertTrue((self.kb / "entries/kb002.json").exists())
         self.assertFalse((self.app.root / ".sapper").exists())
 
-    def test_original_peer_discovery_authorization_send_capture_and_remove(self):
-        peer = "native-peer-" + uuid.uuid4().hex[:6]
-        self.app.tmux("new-session", "-d", "-s", peer, "-c", str(self.root), "cat")
-        _, output = self.execute("peers", {"discover": True, "json": True})
-        self.assertIn(peer, output)
-        self.assertEqual(sapper._load_peers(self.app.store(self.pid))["peers"], {})
-        self.execute("peers", {"add": "test-peer", "target": peer + ":0.0"})
-        self.execute("send", {"peer": "test-peer", "message": "literal native peer hello"})
-        _, output = self.execute("capture", {"peer": "test-peer", "lines": 120})
-        self.assertIn("literal native peer hello", output)
-        self.assertIn("literal native peer hello", (self.root / ".sapper/ai-channel.txt").read_text())
-        self.execute("peers", {"remove": "test-peer"})
-        self.assertEqual(sapper._load_peers(self.app.store(self.pid))["peers"], {})
-
     def test_teardown_preserves_user_instructions_graph_and_binding(self):
         (self.root / "CLAUDE.md").write_text("USER INSTRUCTIONS\n")
         self.app.workspaces.enable(self.pid, {})
@@ -270,20 +256,3 @@ class NativeIntegrationTests(unittest.TestCase):
             self.assertIn("verified result" if target == "verify" else "native original fixture", output)
         self.execute("dispatch", {"target": "reason"}, profile=True)
         self.assertEqual(store.load_project()["status"], "completed")
-
-    def test_native_fleet_config_preview_status_up_hire_workers_fire_down(self):
-        cfg = {"session": "native-fleet-" + uuid.uuid4().hex[:8], "root": str(self.app.root),
-               "panes": [{"name": "board", "type": "shell", "command": "echo ORIGINAL_FLEET; sleep 30"}]}
-        self.app.native.save_config(self.pid, {"path": "formation.json", "content": json.dumps(cfg), "version": None})
-        self.execute("fleet", {"action": "status", "file": "formation.json"})
-        self.execute("fleet", {"action": "up", "file": "formation.json"}, profile=True)
-        screen = self.app.tmux("capture-pane", "-p", "-t", cfg["session"] + ":board").stdout
-        self.assertIn("ORIGINAL_FLEET", screen)
-        self.app.store(self.pid).add_fact("verified fixture evidence", "test")
-        self.execute("fleet", {"action": "hire", "file": "formation.json", "target": self.project["name"], "minutes": 1, "max_steps": 1}, profile=True)
-        self.until(lambda: self.app.store(self.pid).load_project()["status"] == "completed")
-        _, output = self.execute("fleet", {"action": "workers", "file": "formation.json"})
-        self.assertIn(self.project["name"], output)
-        self.execute("fleet", {"action": "fire", "file": "formation.json", "target": self.project["name"]})
-        self.execute("fleet", {"action": "down", "file": "formation.json"})
-        self.assertNotEqual(self.app.tmux("has-session", "-t", cfg["session"]).returncode, 0)
