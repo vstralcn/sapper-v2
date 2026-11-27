@@ -258,6 +258,7 @@ class Workspaces:
                 return existing
             discovered = next((p for p in self.app._scan_projects() if p["path"] == str(path)), None)
             assignments = self.app.new_workspace_models(cfg, data) if not discovered else None
+            env_vars = self.app.validate_workspace_env(data["env"]) if "env" in data and not discovered else None
             default_name = discovered["name"] if discovered else path.name
             if not discovered:
                 try:
@@ -275,8 +276,10 @@ class Workspaces:
                 cfg["hidden_workspaces"] = [h for h in cfg["hidden_workspaces"] if h != str(path)]
             if assignments is not None:
                 self.app.set_workspace_models(cfg, record["id"], assignments)
+            if env_vars is not None:
+                self.app.set_workspace_env(cfg, record["id"], env_vars)
             sapper.atomic_write_json(self.app.config_path, cfg)
-        self.app.audit("workspace.bound", workspace=record["id"], path=str(path))
+        self.app.audit("workspace.bound", workspace=record["id"], path=str(path), env_names=sorted(env_vars or {}))
         return record
 
     def inspect(self, pid):
@@ -1455,6 +1458,8 @@ class Workspaces:
                              if w.get("id") != pid and w.get("path") != project["path"]]
         if cfg.get("workspace_role_profiles", {}).pop(pid, None) is not None:
             cfg["role_profiles_revision"] = cfg.get("role_profiles_revision", 0) + 1
+        if cfg.get("workspace_env", {}).pop(pid, None) is not None:
+            cfg["workspace_env_revision"] = cfg.get("workspace_env_revision", 0) + 1
         hidden = [h for h in cfg.get("hidden_workspaces", []) if h != project["path"]]
         if inside and not remove_files:
             hidden.append(project["path"])

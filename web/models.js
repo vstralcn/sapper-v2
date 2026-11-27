@@ -84,6 +84,66 @@ function readWorkspaceModelFields(container) {
   ).map(select => [select.name, select.value === WORKSPACE_MODEL_ENV ? "" : select.value]));
 }
 
+// Workspace environment variables: dynamic name/value rows with an "add" button.
+// Creation dialogs collect plaintext values; the settings panel edits write-only
+// (existing values render blank with a "keep" placeholder, empty value = keep).
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+const ENV_RESERVED_PREFIX = /^(SAPPER_|CLAUDE_|ANTHROPIC_)/;
+const ENV_RESERVED_NAMES = new Set(["PATH", "PYTHONUNBUFFERED", "CLAUDECODE", "IS_DEMO",
+  "DISABLE_DOCTOR_COMMAND", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "BENCHMARK_TOKEN"]);
+
+function envVarRow(name = "", value = "", {masked = false, onRemove = null} = {}) {
+  const row = element("div", "env-var-row");
+  const nameInput = document.createElement("input");
+  nameInput.name = "env-name";
+  nameInput.placeholder = "变量名，如 MCP_KEY";
+  nameInput.value = name;
+  nameInput.maxLength = 64;
+  nameInput.spellcheck = false;
+  nameInput.autocomplete = "off";
+  nameInput.readOnly = masked && Boolean(name);
+  const valueInput = document.createElement("input");
+  valueInput.name = "env-value";
+  valueInput.type = "password";
+  valueInput.placeholder = masked && name ? "已设置，留空保留" : "值";
+  valueInput.value = value;
+  valueInput.maxLength = 4096;
+  valueInput.autocomplete = "new-password";
+  const remove = button("×", "text-button env-var-remove", () => {
+    if (onRemove) onRemove(name);
+    row.remove();
+  });
+  remove.type = "button";
+  remove.setAttribute("aria-label", "删除此环境变量");
+  row.append(nameInput, valueInput, remove);
+  return row;
+}
+
+function renderEnvRows(container, rows = [], options = {}) {
+  container.replaceChildren(...rows.map(([name, value]) => envVarRow(name, value, options)));
+}
+
+function addEnvRow(container, options = {}) {
+  const row = envVarRow("", "", options);
+  container.append(row);
+  row.querySelector('[name="env-name"]').focus();
+  return row;
+}
+
+function readEnvRows(container) {
+  const result = {};
+  for (const row of container.querySelectorAll(".env-var-row")) {
+    const name = row.querySelector('[name="env-name"]').value.trim();
+    const value = row.querySelector('[name="env-value"]').value;
+    if (!name && !value) continue;
+    if (!ENV_NAME_PATTERN.test(name)) throw new Error(`环境变量名“${name}”不正确：以字母或下划线开头，仅含字母、数字、下划线，最多 64 字符。`);
+    if (ENV_RESERVED_PREFIX.test(name) || ENV_RESERVED_NAMES.has(name)) throw new Error(`${name} 为系统保留变量，请改用其他名称。`);
+    if (Object.hasOwn(result, name)) throw new Error(`环境变量 ${name} 重复。`);
+    result[name] = value;
+  }
+  return result;
+}
+
 async function newWorkspaceModelOptions() {
   const [config, profiles] = await Promise.all([api("/role-models"), api("/profiles")]);
   return {config: {...config, assignments: {}}, profiles};
@@ -95,8 +155,10 @@ async function openCreateWorkspace() {
   if (dialog.open) return;
   renderWorkspaceModelFields($("create-model-rows"), config, profiles, {creating: true});
   extensionOptions("create-extension-options", resources, resources.selection, {compact: true});
+  renderEnvRows($("create-env-rows"), []);
   dialog.showModal();
 }
+$("create-env-add").onclick = () => addEnvRow($("create-env-rows"));
 function roleDefaultLabel(role) {
   const assignments = effectiveRoleAssignments();
   if (!(role in assignments)) return "沿用原有规则";

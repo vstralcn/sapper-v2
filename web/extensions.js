@@ -3,6 +3,7 @@
 let extensionLibrary = null, extensionWorkspace = null, agentExtensionRequest = 0;
 let workspaceModelConfig = null, workspaceSettingsRequest = 0;
 let workspaceResourcesDirty = false, workspaceModelsDirty = false;
+let workspaceEnvConfig = null, workspaceEnvDirty = false, workspaceEnvRemoved = new Set();
 let skillMetadataRequest = null;
 
 function extensionName(value) {
@@ -231,25 +232,40 @@ async function openSettings(tab = "models", pid = null) {
   showSettingsTab(tab);
 }
 async function canChangeWorkspace() {
-  return !(workspaceModelsDirty || workspaceResourcesDirty) || await confirmAction("当前工作区有未保存的配置。放弃这些更改并切换工作区？");
+  return !(workspaceModelsDirty || workspaceResourcesDirty || workspaceEnvDirty) || await confirmAction("当前工作区有未保存的配置。放弃这些更改并切换工作区？");
 }
 async function loadWorkspaceSettings(pid) {
   const request = ++workspaceSettingsRequest;
-  extensionWorkspace = pid || null; workspaceModelConfig = null;
-  workspaceResourcesDirty = false; workspaceModelsDirty = false;
+  extensionWorkspace = pid || null; workspaceModelConfig = null; workspaceEnvConfig = null;
+  workspaceResourcesDirty = false; workspaceModelsDirty = false; workspaceEnvDirty = false;
   $("settings-workspace-content").hidden = true;
   $("settings-workspace-empty").hidden = !!pid;
   $("settings-workspace-path").textContent = state.projects.find(p => p.id === pid)?.path || "";
   if (!pid) return;
-  const data = await api(`/workspaces/${pid}/role-models`);
+  const [data, envConfig] = await Promise.all([api(`/workspaces/${pid}/role-models`), api(`/workspaces/${pid}/env`)]);
   if (request !== workspaceSettingsRequest || pid !== extensionWorkspace) return;
   workspaceModelConfig = data;
   $("workspace-model-rows").replaceChildren();
   renderWorkspaceModels();
+  workspaceEnvConfig = envConfig;
+  renderWorkspaceEnv();
   if (extensionLibrary) extensionOptions("extensions-default-options", extensionLibrary, extensionLibrary.workspaces[pid] || {mcp_ids: [], skill_ids: []});
   $("workspace-model-status").textContent = "已读取工作区角色模型。";
   $("extensions-selection-status").textContent = "已读取工作区资源选择。";
+  $("workspace-env-status").textContent = "已读取工作区环境变量。";
   $("settings-workspace-content").hidden = false;
+}
+function renderWorkspaceEnv() {
+  if (!workspaceEnvConfig) return;
+  workspaceEnvRemoved = new Set();
+  renderEnvRows($("workspace-env-rows"), workspaceEnvConfig.vars.map(v => [v.name, ""]), {
+    masked: true,
+    onRemove: name => {
+      if (name) workspaceEnvRemoved.add(name);
+      workspaceEnvDirty = true;
+      $("workspace-env-status").textContent = "有未保存的环境变量。";
+    },
+  });
 }
 function renderWorkspaceModels(preserve = false) {
   if (!workspaceModelConfig) return;
@@ -296,6 +312,36 @@ $("workspace-model-rows").onchange = () => {
   workspaceModelsDirty = true;
   $("workspace-model-status").textContent = "有未保存的工作区模型。";
 };
+$("workspace-env-rows").oninput = () => {
+  workspaceEnvDirty = true;
+  $("workspace-env-status").textContent = "有未保存的环境变量。";
+};
+$("workspace-env-add").onclick = () => {
+  addEnvRow($("workspace-env-rows"), {masked: true, onRemove: name => {
+    if (name) workspaceEnvRemoved.add(name);
+    workspaceEnvDirty = true;
+    $("workspace-env-status").textContent = "有未保存的环境变量。";
+  }});
+  workspaceEnvDirty = true;
+  $("workspace-env-status").textContent = "有未保存的环境变量。";
+};
+$("workspace-env-reload").onclick = () => guarded(async () => {
+  const pid = extensionWorkspace;
+  if (!pid) return;
+  const config = await api(`/workspaces/${pid}/env`);
+  if (pid !== extensionWorkspace) return;
+  workspaceEnvConfig = config; workspaceEnvDirty = false;
+  renderWorkspaceEnv();
+  $("workspace-env-status").textContent = "已读取工作区环境变量。";
+});
+submit("workspace-env-form", async () => {
+  const pid = extensionWorkspace;
+  if (!pid || !workspaceEnvConfig) throw new Error("请先选择工作区并等待读取完成");
+  const vars = readEnvRows($("workspace-env-rows"));
+  const data = await api(`/workspaces/${pid}/env`, {method: "POST", body: {vars, remove: [...workspaceEnvRemoved], expected_revision: workspaceEnvConfig.revision}});
+  if (pid === extensionWorkspace) { workspaceEnvConfig = data; workspaceEnvDirty = false; renderWorkspaceEnv(); $("workspace-env-status").textContent = "工作区环境变量已保存。"; }
+  toast("环境变量已保存，将注入新启动的角色");
+});
 $("extensions-reload").onclick = () => guarded(() => reloadExtensionLibrary(false));
 $("extensions-default-options").onchange = () => {
   workspaceResourcesDirty = true; $("extensions-selection-status").textContent = "有未保存的资源选择。";

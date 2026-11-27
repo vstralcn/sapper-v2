@@ -198,6 +198,8 @@ async function openDirectoryPicker(input = null, kind = input ? "skill" : "works
   $("directory-help").textContent=forSkill?"进入包含 SKILL.md 的文件夹后，点击“使用此目录”。":"打开文件夹后，点击“选择此文件夹”。文件保持原位置。";
   $("directory-workspace-fields").hidden=Boolean(input);
   modelFields.hidden=modelFields.disabled=true;
+  $("bind-env-fields").hidden=$("bind-env-fields").disabled=true;
+  renderEnvRows($("bind-env-rows"), []);
   $("directory-filter").hidden=!forSkill;
   $("directory-filter").value="";
   $("directory-select").textContent=forSkill?"使用此目录":"选择此文件夹";
@@ -246,6 +248,7 @@ async function browseDirectory(path) {
   const modelFields=$("bind-model-rows");
   $("bind-path").value="";
   modelFields.hidden=modelFields.disabled=true;
+  $("bind-env-fields").hidden=$("bind-env-fields").disabled=true;
   $("directory-select").disabled=true;
   $("directory-status").textContent="正在读取文件夹…";
   $("directory-list").setAttribute("aria-busy","true");
@@ -256,6 +259,7 @@ async function browseDirectory(path) {
     $("bind-path").value=!forSkill||data.has_skill?data.path:"";
     const configureModels = !directoryTarget && !state.projects.some(project => project.path === data.path);
     modelFields.hidden=modelFields.disabled=!configureModels;
+    $("bind-env-fields").hidden=$("bind-env-fields").disabled=!configureModels;
     directoryBreadcrumbs(data.path);
     $("directory-up").disabled=!data.parent;
     $("directory-up").onclick=()=>guarded(()=>browseDirectory(data.parent));
@@ -686,6 +690,7 @@ if ($("terminal-control")) $("terminal-control").onclick=()=>guarded(async()=>{
 document.querySelectorAll("[data-tab]").forEach(node=>{node.onclick=()=>setTab(node.dataset.tab);});
 document.querySelectorAll(".dialog-close").forEach(node=>{node.onclick=()=>node.closest("dialog").close();});
 
+$("bind-env-add").onclick = () => addEnvRow($("bind-env-rows"));
 submit("bind-form",async form=>{
   if (!form.get("path")) throw new Error("请先选择一个可访问的文件夹");
   if (directoryTarget) {
@@ -697,6 +702,10 @@ submit("bind-form",async form=>{
   }
   const body = {path: form.get("path"), name: form.get("name"), goal: form.get("goal")};
   if (!$("bind-model-rows").disabled) body.model_assignments = readWorkspaceModelFields($("bind-model-rows"));
+  if (!$("bind-env-fields").disabled) {
+    const env = readEnvRows($("bind-env-rows"));
+    if (Object.keys(env).length) body.env = env;
+  }
   const p=await api("/workspaces/bind",{method:"POST",body});
   $("bind-dialog").close();
   state.projects = [...state.projects.filter(project => project.id !== p.id), p];

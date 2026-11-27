@@ -20,9 +20,25 @@
 }
 ```
 
-`env` 和 `headers` 只接受环境变量引用（headers 可带 `Bearer ` 前缀），实际值来自 Web 服务进程环境，启动前检查是否存在。不要把密钥写入 command、args 或 URL。URL 不接受嵌入凭据、查询参数和片段。命令及参数保持 argv 形式；stdio server 的相对路径以 Agent 的 cwd 为准，建议使用绝对路径。
+`env` 和 `headers` 只接受环境变量引用（headers 可带 `Bearer ` 前缀），实际值来自工作区环境变量或 Web 服务进程环境，启动前检查是否存在。不要把密钥写入 command、args 或 URL。URL 不接受嵌入凭据、查询参数和片段。命令及参数保持 argv 形式；stdio server 的相对路径以 Agent 的 cwd 为准，建议使用绝对路径。
 
 每个会话都传入 `--mcp-config <snapshot>/mcp.json --strict-mcp-config`，空选择也生成空 `mcpServers`，不回退到系统或共享项目 MCP 配置。
+
+## 工作区环境变量
+
+工作区可声明一组环境变量，注入该工作区**所有角色**的运行环境，供 MCP 的 `${变量名}` 引用，也可供自定义命令读取。新建工作区对话框和绑定已有目录对话框都提供“环境变量（选填）”区块，点击“＋ 新增环境变量”可添加多行变量名/值；**全局设置 → 工作区配置 → 环境变量** 对已存在的工作区增删改。
+
+值按密钥对待，只写入 Web 私有状态目录的 `config.json`（0600，位于 0700 目录），按工作区 ID 区分，**绝不**写入工作区 `.sapper/` 或任何 Agent 可读文件。API 只写不回显：`GET /api/workspaces/:id/env` 仅返回变量名与 `has_value` 布尔，不返回值；保存时留空表示保留原值，`remove` 列表表示删除。日志、审计与运行记录中的值经 `redact()` 替换为 `[已隐藏密钥]`，审计只记变量名与删除项。启动用的 `launch.json` 为 0600 临时文件，spawn 后即删除，`run.json` 不持有环境。
+
+变量名须匹配 `[A-Za-z_][A-Za-z0-9_]{0,63}`；为保持 harness 控制与模型凭据路由的单一权威，拒绝 `SAPPER_`/`CLAUDE_`/`ANTHROPIC_` 前缀及 `PATH`、`OPENAI_API_KEY`、`DEEPSEEK_API_KEY` 等保留名。单工作区至多 50 个变量，单值至多 4096 字符且不含 NUL。`POST /api/workspaces/:id/env` 与创建/绑定请求体沿用 `expected_revision` 乐观并发；删除工作区会清理其环境变量。
+
+启动时环境分层叠加，优先级由低到高：**Web 服务进程环境 < 工作区环境变量 < sapper 控制变量（PATH、SAPPER_ROOT 等）< 会话原生环境（模型配置/协议桥接）**。因此工作区变量可覆盖服务进程的同名变量，但不会覆盖 harness 控制位或模型凭据。MCP 引用缺失时报错并提示“请在工作区配置 → 环境变量中填写，或为 Web 服务进程设置后重启”。
+
+```sh
+python3 -m unittest discover -s tests -p 'test_workspace_env.py' -q
+```
+
+该测试用临时工作区与真实子进程启动，验证创建/绑定存储、只写视图、校验与保留名、留空保留/删除/版本冲突、删除清理、日志脱敏，以及 MCP 引用缺失阻塞、自定义命令注入和工作区覆盖服务环境。
 
 ## Skills 与工作区说明
 

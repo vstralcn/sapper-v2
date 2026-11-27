@@ -326,6 +326,12 @@
     <p id="directory-status" class="field-help" role="status" aria-live="polite"></p>
     <div id="directory-workspace-fields" class="form-row"><label>显示名称 <span class="muted">选填</span><input name="name"></label><label>任务目标 <span class="muted">选填</span><input name="goal"></label></div>
     <fieldset id="bind-model-rows" class="workspace-model-fields" hidden disabled></fieldset>
+    <fieldset id="bind-env-fields" class="extension-picker workspace-env-picker" hidden disabled>
+      <legend>环境变量 <span class="muted">选填</span></legend>
+      <p class="field-help">注入此工作区所有角色的运行环境，可供 MCP 的 ${变量名} 引用。值仅保存在 Web 私有配置，不回显。</p>
+      <div id="bind-env-rows" class="env-var-rows"></div>
+      <button type="button" id="bind-env-add" class="text-button">＋ 新增环境变量</button>
+    </fieldset>
     <p class="field-help">这里显示运行 sapper 的机器上的文件夹。</p>
     <div class="dialog-actions"><button class="button dialog-close" type="button">取消</button><button id="directory-select" class="button primary" type="submit" disabled>选择此文件夹</button></div>
   </form></dialog>
@@ -369,6 +375,12 @@
     <label>任务附件 <span class="muted">选填</span><input id="create-files" type="file" multiple><span class="field-help">可选择多个文件，每个最多 16 MiB。选择后立即暂存，创建成功后可在工作区的 attachments/ 目录查看。</span></label>
     <ul id="create-file-list" aria-live="polite" hidden></ul>
     <div id="create-model-rows" class="workspace-model-fields"></div>
+    <fieldset class="extension-picker workspace-env-picker">
+      <legend>环境变量 <span class="muted">选填</span></legend>
+      <p class="field-help">注入此工作区所有角色的运行环境，可供 MCP 的 ${变量名} 引用。值仅保存在 Web 私有配置，不回显。</p>
+      <div id="create-env-rows" class="env-var-rows"></div>
+      <button type="button" id="create-env-add" class="text-button">＋ 新增环境变量</button>
+    </fieldset>
     <fieldset class="extension-picker">
       <legend>MCP 与 Skills</legend>
       <p class="field-help">勾选此工作区默认使用的资源。</p>
@@ -453,6 +465,9 @@
         </section>
         <section class="workspace-settings-section"><div class="panel-heading"><h3>MCP 与 Skills</h3><div><button type="button" id="extensions-select-all" class="text-button">全部启用</button><button type="button" id="extensions-select-none" class="text-button">全部关闭</button></div></div><p class="field-help">只加载勾选的资源。已有会话恢复时继续使用原快照。</p>
           <form id="extensions-defaults-form"><div id="extensions-default-options"></div><p id="extensions-selection-status" class="field-help" role="status"></p><div class="dialog-actions"><button id="extensions-reload" type="button" class="button">重新读取</button><button class="button primary" type="submit">保存资源选择</button></div></form>
+        </section>
+        <section class="workspace-settings-section"><div class="panel-heading"><h3>环境变量</h3><button type="button" id="workspace-env-add" class="text-button">＋ 新增环境变量</button></div><p class="field-help">注入此工作区新启动角色的运行环境，供 MCP 的 ${变量名} 引用。值只写不读：留空保留原值，删除行即移除。已有会话恢复时沿用原快照。</p>
+          <form id="workspace-env-form"><div id="workspace-env-rows" class="env-var-rows"></div><p id="workspace-env-status" class="field-help" role="status"></p><div class="dialog-actions"><button id="workspace-env-reload" class="button" type="button">重新读取</button><button class="button primary" type="submit">保存环境变量</button></div></form>
         </section>
       </div>
     </section>

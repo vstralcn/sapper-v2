@@ -69,6 +69,17 @@ KEYS = {"Enter", "Escape", "Tab", "BTab", "Up", "Down", "Left", "Right",
         "C-c", "C-d", "C-u", "C-l", "BSpace", "Space"}
 HIDDEN = {".git", ".claude", ".codex", ".sapper-web", "node_modules", "__pycache__",
           ".venv", "pane-env", ".sapper-agents"}
+# Workspace environment variables: user-supplied values injected into every
+# agent launch in that workspace (e.g. MCP ${KEY} references). Harness control
+# and model-credential routing stay single-authority, so those names are
+# rejected at save time rather than silently overridden at launch.
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+ENV_RESERVED_PREFIXES = ("SAPPER_", "CLAUDE_", "ANTHROPIC_")
+ENV_RESERVED_NAMES = {"PATH", "PYTHONUNBUFFERED", "CLAUDECODE", "IS_DEMO",
+                      "DISABLE_DOCTOR_COMMAND", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
+                      "BENCHMARK_TOKEN"}
+ENV_MAX_VARS = 50
+ENV_MAX_VALUE = 4096
 ANSI = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]")
 
 
@@ -243,7 +254,8 @@ class Console:
 
     def redaction_keys(self):
         """Collect fresh credentials once for a batch, never cache across requests."""
-        keys = [p.get("api_key", "") for p in self.config()["profiles"]]
+        cfg = self.config()
+        keys = [p.get("api_key", "") for p in cfg["profiles"]]
         for path in (self.state / "model-bridges").glob("*/ready.json"):
             with contextlib.suppress(OSError, ValueError):
                 keys.append(json.loads(path.read_text()).get("token", ""))
@@ -251,6 +263,10 @@ class Console:
             "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "SAPPER_CLAUDE_API_KEY", "OPENAI_API_KEY",
             "DEEPSEEK_API_KEY", "BENCHMARK_TOKEN")]
         keys.extend(self.workspaces.extensions.credential_values())
+        # Workspace env values may satisfy MCP ${KEY} refs without being present
+        # in os.environ, so credential_values() alone would miss them.
+        for values in cfg.get("workspace_env", {}).values():
+            keys.extend(values.values())
         return tuple(dict.fromkeys(key for key in keys if key))
 
     def redact(self, value, *, keys=None):
@@ -393,6 +409,7 @@ class Console:
                 raise WebError("目录已存在；已有图会自动出现在任务列表，请勿重复初始化", 409)
             cfg = self.config()
             assignments = self.new_workspace_models(cfg, data)
+            env_vars = self.validate_workspace_env(data["env"]) if "env" in data else None
             extensions = self.workspaces.extensions
             if "extensions" in data:
                 library = extensions.read()
@@ -432,11 +449,14 @@ class Console:
                 rollback.callback(private_json, extensions.path, library)
             if assignments is not None:
                 self.set_workspace_models(cfg, project["id"], assignments)
+            if env_vars is not None:
+                self.set_workspace_env(cfg, project["id"], env_vars)
+            if assignments is not None or env_vars is not None:
                 private_json(self.config_path, cfg)
             rollback.pop_all()
             for directory in claimed:
                 shutil.rmtree(directory, ignore_errors=True)
-        self.audit("project.created", name=name, title=title)
+        self.audit("project.created", name=name, title=title, env_names=sorted(env_vars or {}))
         return project
 
     def graph(self, pid):
@@ -610,6 +630,61 @@ class Console:
             private_json(self.config_path, cfg)
         self.audit("role_models.saved", workspace=pid, revision=revision + 1, assignments=assignments)
         return self.role_models(pid)
+
+    @staticmethod
+    def validate_workspace_env(env):
+        if not isinstance(env, dict) or len(env) > ENV_MAX_VARS:
+            raise WebError(f"环境变量须为对象，且最多 {ENV_MAX_VARS} 个")
+        for name, value in env.items():
+            if not isinstance(name, str) or not ENV_NAME.fullmatch(name):
+                raise WebError("环境变量名须以字母或下划线开头，仅含字母、数字、下划线，最多 64 字符")
+            if name.startswith(ENV_RESERVED_PREFIXES) or name in ENV_RESERVED_NAMES:
+                raise WebError(f"{name} 为 sapper 运行控制或模型凭据保留变量，请改用其他名称")
+            if not isinstance(value, str) or len(value) > ENV_MAX_VALUE or "\x00" in value:
+                raise WebError(f"{name} 的值须为最多 {ENV_MAX_VALUE} 字符的文本，不能包含空字符")
+        return dict(env)
+
+    @staticmethod
+    def set_workspace_env(cfg, pid, env):
+        cfg.setdefault("workspace_env", {})[pid] = env
+        cfg["workspace_env_revision"] = cfg.get("workspace_env_revision", 0) + 1
+
+    def workspace_env(self, pid):
+        """Write-only view: names and whether a value is set, never the value."""
+        self.project(pid)
+        cfg = self.config()
+        stored = cfg.get("workspace_env", {}).get(pid, {})
+        return {"vars": [{"name": name, "has_value": bool(value)} for name, value in sorted(stored.items())],
+                "revision": cfg.get("workspace_env_revision", 0)}
+
+    def save_workspace_env(self, data, pid):
+        self.project(pid)
+        updates = data.get("vars")
+        remove = data.get("remove", [])
+        if not isinstance(updates, dict):
+            raise WebError("vars 须为对象")
+        if not isinstance(remove, list) or any(not isinstance(n, str) for n in remove):
+            raise WebError("remove 须为变量名列表")
+        with self.config_lock():
+            cfg = self.config()
+            revision = cfg.get("workspace_env_revision", 0)
+            if type(data.get("expected_revision")) is not int or data["expected_revision"] != revision:
+                raise WebError("环境变量已被其他页面更新，请重新读取后再保存；当前输入仍保留", 409)
+            stored = cfg.get("workspace_env", {}).get(pid, {})
+            merged = {name: value for name, value in stored.items() if name not in remove}
+            for name, value in updates.items():
+                if value == "":
+                    # Write-only editing: an empty value keeps the stored secret.
+                    if name not in merged:
+                        raise WebError(f"{name} 尚未设置，请填写值")
+                else:
+                    merged[name] = value
+            merged = self.validate_workspace_env(merged)
+            self.set_workspace_env(cfg, pid, merged)
+            private_json(self.config_path, cfg)
+        self.audit("workspace.env.saved", workspace=pid, revision=revision + 1,
+                   names=sorted(merged), removed=sorted(set(remove) & set(stored)))
+        return self.workspace_env(pid)
 
     def role_profile_id(self, role, data, fallback="", *, workspace_id=None):
         cfg = self.config()
@@ -945,6 +1020,10 @@ class Console:
         env = dict(os.environ)
         if (native or {}).get("isolated_extensions"):
             clean_environment(env)
+        # Workspace-supplied variables sit above the service environment but
+        # below sapper's own control variables and the session's native env, so
+        # users can provide MCP ${KEY} values without overriding the harness.
+        env.update(self.config().get("workspace_env", {}).get(pid, {}))
         env.update(PATH=str(self.state / "bin") + os.pathsep + os.environ.get("PATH", ""),
                    PYTHONUNBUFFERED="1", SAPPER_ROOT=str(self.root),
                    SAPPER_GLOBAL_CONTEXT_FILE=str(self.context_path), SAPPER_CONTEXT_PROMPT_REVISION="")
@@ -964,7 +1043,8 @@ class Console:
             env.update(native.get("env", {}))
             missing = [name for name in native.get("mcp_env_refs", []) if not env.get(name)]
             if missing:
-                raise WebError("MCP 所需环境变量未配置：" + ", ".join(missing), 409)
+                raise WebError("MCP 所需环境变量未配置：" + ", ".join(missing)
+                               + "。请在工作区配置 → 环境变量中填写，或为 Web 服务进程设置后重启", 409)
             if native.get("isolated_extensions"):
                 api_environment(env)
         elif kind in ("auto", "dispatch"):
@@ -2028,6 +2108,8 @@ class Handler(BaseHTTPRequestHandler):
                     if method == "GET":
                         if action == "role-models":
                             return self.reply(200, app.role_models(wid))
+                        if action == "env":
+                            return self.reply(200, app.workspace_env(wid))
                         if action == "extensions":
                             return self.reply(200, app.workspaces.extensions.view(wid))
                         if action == "inspect":
@@ -2043,6 +2125,8 @@ class Handler(BaseHTTPRequestHandler):
                         data = self.body()
                         if action == "role-models":
                             return self.reply(200, app.save_role_models(data, wid))
+                        if action == "env":
+                            return self.reply(200, app.save_workspace_env(data, wid))
                         if action == "extensions":
                             return self.reply(200, app.workspaces.extensions.update(wid, data))
                         if action == "enable":
