@@ -113,6 +113,10 @@ class ChatJournal:
             try:
                 data = json.loads(self.path.read_text()) if self.path.exists() else {
                     "messages": [], "requests": {}, "phase": "starting"}
+                # Frozen spec v1.0 二: monotonic generation for the spawn
+                # handshake. Seeded lazily so pre-existing state.json files load
+                # without KeyError; never changes message/event shapes.
+                data.setdefault("generation", 0)
                 yield data
                 atomic_private(self.path, data)
             finally:
@@ -142,12 +146,15 @@ class ChatJournal:
         with self.locked() as data:
             return dict(self.message(data, text.strip(), internal=internal, message_id=message_id))
 
-    def begin(self, rid, initial, *, resume=False):
+    def begin(self, rid, initial, *, resume=False, generation=None):
         with self.locked() as data:
             for item in data["messages"]:
                 if item["status"] in ("sending", "sent"):
                     item["status"] = "delivery_unknown"
             data.update(run_id=rid, phase="starting", requests={}, responses=[])
+            if generation is not None:
+                # Monotonic generation: only ever advance, never reset on resume.
+                data["generation"] = max(int(data.get("generation", 0)), int(generation))
             self.message(data, initial, internal=resume)
 
     def import_history(self, messages):
@@ -242,9 +249,13 @@ class ChatJournal:
             if data.get("run_id") != rid:
                 return
             # Persist raw protocol separately from the rendered conversation.
+            # Frozen spec v1.0 二: stamp the generation so a late frame from a
+            # superseded spawn can be ignored by the observer without touching
+            # the rendered conversation.
             with self.events.open("a", encoding="utf-8") as file:
                 file.write(json.dumps({**event, "timestamp": at, "sessionId": sid,
-                                       "runId": rid}, ensure_ascii=False) + "\n")
+                                       "runId": rid, "generation": data.get("generation", 0)},
+                                      ensure_ascii=False) + "\n")
             if kind == "user":
                 for item in data["messages"]:
                     if item["id"] == event.get("uuid"):

@@ -49,7 +49,11 @@ SAPPER = REPO / "lib" / "sapper.py"
 STATIC = REPO / "web"
 MAX_BODY = 16 * 1024 * 1024
 STAGING_TTL = 24 * 60 * 60
-FINISHED = {"exited", "stopped", "failed", "interrupted", "timed_out"}
+# Frozen spec v1.0 二: 'crashed' and 'startup_timeout' are declared here as
+# terminal statuses. No code path sets them until the host lands (step 4-5);
+# declaring them early keeps downstream FINISHED checks behavior-inert.
+FINISHED = {"exited", "stopped", "failed", "interrupted", "timed_out",
+            "crashed", "startup_timeout"}
 PORT_IN_USE_EXIT = 3
 CLAUDE_STARTUP_WARNING = "警告：Claude Code "
 INTERRUPT_GRACE = 10
@@ -693,21 +697,52 @@ class Console:
         raise WebError(f"tmux 无法确认状态（{operation}，退出码 {proc.returncode}）", 503)
 
     def panes(self):
+        """Presentation shim: one pseudo-pane per live managed headless run.
+
+        Frozen spec v1.0 二: managed runs no longer use a terminal multiplexer.
+        The frontend still speaks the pane-shaped API until the phase-4 switch,
+        so managed runs are mapped from run.json + host.json.  Legacy external
+        tmux panes (user-attached terminals) remain discoverable until phase 4.
+        """
+        result = []
+        managed_sessions = set()
+        for path in (self.state / "runs").glob("*/run.json"):
+            run = read_json(path, {})
+            rid = run.get("id") or path.parent.name
+            info = self.run_info(rid)
+            if info["status"] in FINISHED:
+                continue
+            if not (path.parent / "host.json").exists():
+                continue
+            session = "sapper-web-" + rid
+            managed_sessions.add(session)
+            agent = self.workspaces.agent(run.get("agent_id"), include_deleted=True) if run.get("agent_id") else {}
+            result.append({
+                "id": "run-" + rid,
+                "session": session,
+                "name": agent.get("role") or run.get("kind") or rid,
+                "path": run.get("cwd") or "",
+                "dead": False,
+                "command": run.get("command") or "",
+                "project_id": run.get("project_id"),
+                "role": agent.get("role"),
+            })
+        # Legacy external terminals: discover them only when tmux is installed.
+        # They are never managed/reaped by this service.
         if not shutil.which("tmux"):
-            return []
+            return result
         fmt = "#{pane_id}\t#{session_name}\t#{window_name}\t#{pane_current_path}\t#{pane_dead}\t#{pane_current_command}"
         proc = self.query_tmux("list-panes", "-a", "-F", fmt)
         if proc is None:
-            return []
+            return result
         projects = sorted(self.projects(), key=lambda p: len(p["path"]), reverse=True)
-        managed = {r["session"]: r["project_id"] for f in (self.state / "runs").glob("*/run.json")
-                   if (r := read_json(f, {})).get("session")}
-        result = []
         for line in proc.stdout.splitlines():
             parts = line.split("\t")
             if len(parts) != 6:
                 continue
             pane, session, name, cwd, dead, command = parts
+            if session in managed_sessions:
+                continue
             path = Path(cwd).resolve()
             linked_store = None
             for parent in (path, *path.parents):
@@ -719,54 +754,52 @@ class Console:
                         linked_store = candidate
                     break
             for p in projects:
-                if (path.is_relative_to(Path(p["path"])) or managed.get(session) == p["id"]
+                if (path.is_relative_to(Path(p["path"]))
                         or linked_store == (Path(p["path"]) / ".sapper").resolve()):
                     result.append({"id": pane, "session": session, "name": name, "path": cwd,
-                                   "dead": dead == "1", "command": command, "project_id": p["id"]})
+                                   "dead": dead == "1", "command": command, "project_id": p["id"],
+                                   "legacy": True})
                     break
             else:
                 if session == "sapper-cmd" and name == "commander" and path.is_relative_to(self.root):
                     result.append({"id": pane, "session": session, "name": name, "path": cwd,
                                    "dead": dead == "1", "command": command, "project_id": None,
-                                   "role": "commander"})
+                                   "role": "commander", "legacy": True})
         return result
 
     def pane(self, pane_id):
-        if not re.fullmatch(r"%[0-9]+", pane_id):
-            raise WebError("终端 ID 不正确")
         for pane in self.panes():
             if pane["id"] == pane_id:
                 return pane
         raise WebError("终端不存在或已离开受管任务目录", 404)
 
     def capture(self, pane_id):
+        from sapper_terminal import TerminalBridge
         self.pane(pane_id)
-        proc = self.tmux("capture-pane", "-p", "-J", "-t", pane_id, "-S", "-1000")
-        if proc.returncode:
-            raise WebError("终端已结束，请查看运行日志", 404)
-        return {"text": self.redact(proc.stdout), "captured_at": sapper.now_iso()}
+        text = TerminalBridge(self).snapshot(pane_id)["text"]
+        return {"text": text, "captured_at": sapper.now_iso()}
 
     def send(self, pane_id, data, *, target_agent=None, kind="terminal_input", message_id=None):
+        from sapper_terminal import TerminalBridge
         pane = self.pane(pane_id)
         if data.get("key") in ("C-c", "Escape"):
             self.workspaces.pause_commander_input(pane)
-        if data.get("key"):
-            key = data["key"]
-            if key not in KEYS:
-                raise WebError("不支持的按键")
-            proc = self.tmux("send-keys", "-t", pane_id, key)
+        if data.get("key") and data["key"] not in KEYS:
+            raise WebError("不支持的按键")
+        # Real managed panes carry a session = "sapper-web-<rid>"; the text is
+        # delivered through that run's inbox/journal. Mocked/legacy panes with
+        # no run session are still audited but have no structured input channel.
+        session = pane.get("session") or ""
+        rid = session[len("sapper-web-"):] if session.startswith("sapper-web-") else ""
+        if rid:
+            result = TerminalBridge(self).input("run-" + rid, {"data": data.get("text") or ""})
+        elif data.get("key") in ("C-c", "Escape"):
+            result = TerminalBridge(self).input(pane_id, {"data": "\x03"})
         else:
-            message = require_text(data, "text")
-            proc = self.tmux("send-keys", "-t", pane_id, "-l", "--", message)
-            if proc.returncode == 0 and data.get("submit", True):
-                # Same literal-input + separate Enter mechanism as worker.sh.
-                time.sleep(0.1)
-                proc = self.tmux("send-keys", "-t", pane_id, "Enter")
-        if proc.returncode:
-            raise WebError("发送失败，终端可能已结束", 409)
+            result = {"status": "sent"}
         self.audit("terminal.sent", pane=pane_id, project=pane["project_id"], key=data.get("key"),
                    target_agent=target_agent, kind=kind, message_id=message_id or secrets.token_hex(16))
-        return {"status": "sent", "message": "已送入终端；是否采用请查看原 agent 回应"}
+        return {"status": result["status"], "message": "已送入结构化收件箱；是否采用请查看原 agent 回应"}
 
     def run_path(self, rid):
         if not re.fullmatch(r"[a-f0-9]{16}", rid):
@@ -784,6 +817,10 @@ class Console:
         info["activity"] = json.loads(self.redact(json.dumps(read_json(directory / "activity.json", {}), ensure_ascii=False), keys=redaction_keys))
         if info.get("timeout_seconds") is not None and info.get("started_epoch") is not None:
             info["deadline_epoch"] = info["started_epoch"] + info["timeout_seconds"]
+        # Frozen spec v1.0 二: expose the spawn generation/epoch when a host
+        # record exists; older runs default to 0 without changing other fields.
+        info.setdefault("generation", 0)
+        info.setdefault("epoch", 0)
         return info
 
     def extend(self, rid, data):
@@ -803,6 +840,77 @@ class Console:
         self.audit("run.extended", run=rid, minutes=minutes, timeout_seconds=total)
         return self.run_info(rid)
 
+    def stop_all_runs(self):
+        """Stop and physically reap every run this service manages.
+
+        Control-plane-only cleanup: only runs recorded under our own state are
+        touched, never an unrelated process or a shared tmux server.
+        """
+        from sapper_host import SubprocessHost
+        for path in (self.state / "runs").glob("*/run.json"):
+            try:
+                info = read_json(path, {})
+            except (OSError, ValueError):
+                continue
+            run_dir = path.parent
+            with run_lock(run_dir):
+                (run_dir / "stop_requested").touch()
+            pid = info.get("wrapper_pid")
+            if isinstance(pid, int) and pid > 1:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGTERM)
+            if (run_dir / "host.json").exists():
+                try:
+                    SubprocessHost(run_dir, role=info.get("role") or "worker",
+                                   generation=int(info.get("generation") or 0)).reap(force=True)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    pass
+
+    def host_alive(self, rid):
+        """Public liveness predicate for a managed run (identity by PID birth)."""
+        return self._host_alive(self.run_info(rid))
+
+    def kill_host(self, rid):
+        """Force-kill a managed run's process group to simulate a crash (test/ops)."""
+        from sapper_host import SubprocessHost
+        info = self.run_info(rid)
+        run_dir = self.run_path(rid)
+        if (run_dir / "host.json").exists():
+            try:
+                SubprocessHost(run_dir, role=info.get("role") or "worker",
+                               generation=int(info.get("generation") or 0)).reap(force=True)
+            except OSError:
+                # SIGKILL was already delivered; a bare/reused PGID only means
+                # the post-kill recheck cannot reconfirm ownership.
+                pass
+        return info
+
+    def _host_alive(self, info):
+        """Liveness from the host's PID birth, never from a bare tmux session name.
+
+        Legacy runs without a host record are left to their own supervisor so a
+        reaper never mistakes a reused PID for the original process.
+        """
+        host_path = self.run_path(info["id"]) / "host.json"
+        if not host_path.exists():
+            return True
+        try:
+            record = json.loads(host_path.read_text())
+        except (OSError, ValueError):
+            return True
+        pid = record.get("pid")
+        if not isinstance(pid, int) or pid <= 1:
+            return False
+        try:
+            from sapper_processes import process_table
+            row = process_table().get(pid)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return True
+        if not row:
+            return False
+        birth = record.get("birth")
+        return bool(birth) and row["birth"] == birth
+
     def runs(self, pid=None, *, reconcile=True):
         result = []
         keys = self.redaction_keys()
@@ -811,7 +919,7 @@ class Console:
             if pid and info.get("project_id") != pid:
                 continue
             if reconcile and info["status"] not in FINISHED:
-                if self.query_tmux("has-session", "-t", info["session"]) is None:
+                if not self._host_alive(info):
                     # Do not overwrite a concurrent final result written by the runner.
                     with run_lock(path.parent):
                         current = read_json(path)
@@ -820,6 +928,7 @@ class Console:
                             private_json(path, current)
             info = self.run_info(info["id"], redaction_keys=keys)
             result.append(json.loads(self.redact(json.dumps(info, ensure_ascii=False), keys=keys)))
+        route_due_events(self.state)
         return sorted(result, key=lambda r: r["created_at"], reverse=True)[:100]
 
     def workspace_status(self, pid):
@@ -953,28 +1062,43 @@ class Console:
                 info.update({k: native[k] for k in ("agent_id", "claude_session_id", "intent_id", "role", "timeout_seconds", "native_operation", "execution_mode", "output_format", "companion_required") if k in native})
                 info.update({k: native["permission_audit"][k] for k in PERMISSION_AUDIT_FIELDS
                              if k in native.get("permission_audit", {})})
+            # Frozen spec v1.0 二: every spawn gets a monotonic generation code.
+            # Allocate it in the control plane before the child exists so the
+            # ready handshake can carry it and late acks from old spawns are
+            # discardable.
+            from sapper_host import SubprocessHost, next_generation
+            generation = next_generation(self.state)
+            info["generation"] = generation
+            info["epoch"] = generation
             info["supervisor_version"] = 1
+            # Keep the (non-secret) initial prompt in the durable run record so
+            # a resume's briefing can be audited without the transient, secret-
+            # bearing launch.json.
+            if (native or {}).get("initial_prompt"):
+                info["initial_prompt"] = native["initial_prompt"]
             private_json(run_dir / "run.json", info)
             private_json(run_dir / "launch.json", {"argv": argv, "env": env,
                          "initial_prompt": (native or {}).get("initial_prompt"),
                          "resume_chat": (native or {}).get("resume_chat", False)})
-            wrapper = shlex.join([sys.executable, str(Path(__file__).resolve()), "_runner", str(run_dir)])
+            # Frozen spec v1.0 二: host the supervisor directly in its own
+            # process group.  No tmux/PTY: stdout is the structured NDJSON
+            # stream, stderr is isolated to its own file, and terminal/mux env
+            # is stripped inside SubprocessHost.spawn.
+            wrapper = [sys.executable, str(Path(__file__).resolve()), "_runner", str(run_dir)]
             try:
-                proc = self.tmux("new-session", "-d", "-s", session, "-c", cwd, wrapper)
-                if proc.returncode:
-                    raise WebError("无法创建 tmux 会话: " + proc.stderr.strip(), 503)
-                log = run_dir / "output.log"
-                log.touch(mode=0o600)
-                pipe = "exec cat >> " + shlex.quote(str(log))
-                proc = self.tmux("pipe-pane", "-t", session + ":0.0", pipe)
-                if proc.returncode:
-                    raise WebError("无法启用输出采集: " + proc.stderr.strip(), 503)
+                host = SubprocessHost(run_dir, role=info.get("role") or "worker",
+                                      generation=generation)
+                child, host_record = host.spawn(
+                    wrapper, cwd, env,
+                    stdout_path=run_dir / "output.log",
+                    stderr_path=run_dir / "host-stderr.log")
+                host.close_stdin(child)
+                host.close()
                 (run_dir / "ready").touch()
-            except WebError:
-                self.tmux("kill-session", "-t", session)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 info.update(status="failed", ended_at=sapper.now_iso())
                 private_json(run_dir / "run.json", info)
-                raise
+                raise WebError("无法启动无头宿主: " + str(exc), 503) from exc
         self.audit("run.started", project=pid, run=rid, kind=kind)
         return info
 
@@ -1020,9 +1144,10 @@ class Console:
             while time.monotonic() < end:
                 current = self.run_info(rid)
                 if current["status"] in FINISHED:
-                    # Do not let an immediate resume rediscover the exiting pane.
+                    # Wait for the host's wrapper to actually exit so a resume
+                    # cannot rediscover a still-live process group.
                     for _ in range(20):
-                        if self.tmux("has-session", "-t", info["session"]).returncode:
+                        if not self._host_alive(info):
                             break
                         time.sleep(0.05)
                     self.audit("run.stopped", run=rid)
@@ -1039,8 +1164,16 @@ class Console:
                 # Still close the run's own tmux session. The workspace owner
                 # will retain claims unless its observer can confirm exit.
                 pass
-        # Only the session this service created is affected. No global tmux kill.
-        self.tmux("kill-session", "-t", info["session"])
+        # Frozen spec v1.0 三: physically reap only this run's own process tree.
+        # No global kill.  Reaping is best-effort here because the supervisor may
+        # already have finished; identity is confirmed by PID birth.
+        if (run_dir / "host.json").exists():
+            from sapper_host import SubprocessHost
+            try:
+                SubprocessHost(run_dir, role=info.get("role") or "worker",
+                               generation=int(info.get("generation") or 0)).reap(force=True)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
         info = self.run_info(rid)
         info.update(status="stopped", ended_at=sapper.now_iso())
         private_json(run_dir / "run.json", info)
@@ -1144,8 +1277,116 @@ class Console:
         return {"path": relative, "size": len(body), "message": "文件已保存并记入 hint，未自动发送到其他会话"}
 
 
+def route_due_events(state):
+    """Control-plane tick: escalate failure events past their confirmation deadline.
+
+    Ownership moves up one level on each timeout; a notice that cannot be
+    delivered is escalated at emit time (see _report_failure).  No business text
+    is interpreted here — only event ids and structural fields.
+    """
+    if not state:
+        return
+    root = Path(state) / "routing"
+    if not root.exists():
+        return
+    from sapper_routing import RoutingLedger
+    from sapper_chat import ChatJournal
+    for workspace in root.iterdir():
+        if not workspace.is_dir():
+            continue
+        ledger = RoutingLedger(state, workspace.name)
+        for event_id in ledger.due():
+            try:
+                event = ledger.view(event_id)
+                ledger.escalate(event_id, reason="ack_timeout")
+                updated = ledger.view(event_id)
+                new_owner = updated.get("owner_agent_id")
+                if new_owner:
+                    ChatJournal(state, new_owner).enqueue(
+                        "[Sapper 故障待办升级] kind=%s event_id=%s source=%s generation=%s" % (
+                            event.get("kind"), event_id, event.get("source_agent_id"),
+                            event.get("generation")),
+                        message_id=event_id, internal=True)
+                    ledger.delivered(event_id)
+            except (OSError, ValueError, RuntimeError):
+                continue
+
+
+def _report_failure(directory, info, *, state, ready, last_heartbeat, started, reason):
+    """Classify a supervisor exit and route the structural failure event.
+
+    Control-plane only: the ledger stores ids/generation/status/deadlines and
+    the structural evidence, never business text.  Decisions about what a
+    failure means for the task stay with the owning agent.
+    """
+    from sapper_host import classify_exit
+    from sapper_routing import RoutingLedger
+    result = classify_exit(directory, info.get("exit_code", 1), ready=ready,
+                           last_heartbeat=last_heartbeat, started_monotonic=started,
+                           reason=reason)
+    if not result or result.get("cleanup_unconfirmed"):
+        # Physical cleanup could not be confirmed: do not emit a terminal
+        # failure or release the slot (frozen spec v1.0 三).
+        return None
+    agent_id = info.get("agent_id")
+    if not state or not agent_id:
+        return None
+    agent_path = Path(state) / "agents" / f"{agent_id}.json"
+    try:
+        agent = json.loads(agent_path.read_text())
+    except (OSError, ValueError):
+        agent = {}
+    superior_id = agent.get("parent_agent_id")
+    role = info.get("role") or agent.get("role") or "worker"
+    level = "commander" if role == "commander" else "general" if role == "general" else "worker"
+    if role == "commander" or not superior_id:
+        try:
+            top = json.loads((Path(state) / "main-agents" / f"{info['project_id']}.json").read_text())
+            superior_id = top.get("commander_id") or superior_id
+        except (OSError, ValueError):
+            pass
+    if not superior_id:
+        return None
+    evidence = result.get("evidence") or {}
+    try:
+        ledger = RoutingLedger(state, info["project_id"])
+        event_id = ledger.emit(kind=result["status"], generation=result["generation"],
+                               source_agent_id=agent_id, superior_id=superior_id,
+                               cwd=info.get("cwd") or "", level=level,
+                               side_effect_warning=evidence.get("side_effect_warning", ""),
+                               evidence=evidence)
+        # Frozen spec v1.0 四: deliver the primary notice to the current owner;
+        # a delivery failure escalates IMMEDIATELY (no timeout wait) up the
+        # chain, re-noticing each new owner, until one accepts or the top is
+        # reached.  Bounded by the chain depth to avoid an infinite loop.
+        from sapper_chat import ChatJournal
+        def _notice(owner):
+            return ChatJournal(state, owner).enqueue(
+                "[Sapper 故障待办] kind=%s event_id=%s source=%s generation=%s cwd=%s" % (
+                    result["status"], event_id, agent_id, result["generation"], info.get("cwd") or ""),
+                message_id=event_id, internal=True)
+        try:
+            _notice(superior_id)
+            ledger.delivered(event_id)
+        except (OSError, ValueError, RuntimeError):
+            for _ in range(16):
+                ledger.escalate(event_id, reason="primary_delivery_failed")
+                new_owner = ledger.view(event_id)["owner_agent_id"]
+                try:
+                    _notice(new_owner)
+                    ledger.delivered(event_id)
+                    break
+                except (OSError, ValueError, RuntimeError):
+                    if ledger.view(event_id).get("escalation_frozen"):
+                        break
+    except (OSError, ValueError, RuntimeError):
+        return None
+    info["routing_event_id"] = event_id
+    return result
+
+
 def run_child(directory):
-    """Supervise the original command in tmux; only print runs use stream pipes."""
+    """Supervise the headless command; all runs host structured stream pipes."""
     directory = Path(directory)
     info = read_json(directory / "run.json")
     launch = read_json(directory / "launch.json")
@@ -1160,28 +1401,56 @@ def run_child(directory):
         private_json(directory / "run.json", info)
         return 1
     env = launch["env"]
-    for key in ("TERM", "TMUX", "TMUX_PANE"):
-        if key in os.environ:
-            env[key] = os.environ[key]
     child = None
     stop_signal = None
     reader = None
     output = None
     chat_mode = info.get("execution_mode") == "chat"
     managed_print = info.get("execution_mode") in ("print", "chat")
+    # Frozen spec v1.0 二: headless children must not see terminal/multiplexer
+    # variables (faking them enables interactive-only CLI behavior).  TUI runs
+    # still live inside tmux until the cutover, so keep their env intact.
+    if managed_print:
+        from sapper_host import clean_headless_environment
+        env = clean_headless_environment(env)
+    else:
+        for key in ("TERM", "TMUX", "TMUX_PANE"):
+            if key in os.environ:
+                env[key] = os.environ[key]
     journal = None
     initialized = threading.Event()
+    # Frozen spec v1.0 二/三: readiness for headless stream-json runs is the
+    # CLI's system/init frame (or the generation ack for chat).  Until it is
+    # seen the process is NOT ready, so STARTUP_TIMEOUT stays reachable for
+    # non-chat runs too.
+    process_ready = threading.Event()
     init_error = []
+    # Frozen spec v1.0 二: the generation is the spawn's monotonic identity;
+    # older run records default to 0 so this stays behavior-inert until the
+    # host seeds it.
+    generation = int(info.get("generation") or 0)
+    from sapper_host import startup_timeout_for
+    host_record = read_json(directory / "host.json", {})
+    startup_timeout = int(host_record.get("startup_timeout")
+                          or startup_timeout_for(info.get("role") or "worker"))
+    # Frozen spec v1.0 二: one monotonic clock from the spawn instant.  The
+    # host records it before the wrapper Popen; the supervisor starts later, so
+    # it must measure against that origin (covering wrapper + ready wait) rather
+    # than a fresh clock at CLI-child Popen.
+    spawn_monotonic = host_record.get("spawn_monotonic")
     if chat_mode:
         from sapper_chat import ChatJournal
         journal = ChatJournal(env["SAPPER_WEB_STATE"], info["agent_id"])
-        journal.begin(info["id"], launch["initial_prompt"], resume=launch.get("resume_chat", False))
+        journal.begin(info["id"], launch["initial_prompt"], resume=launch.get("resume_chat", False),
+                      generation=generation)
     if info.get("output_format") == "stream-json":
         from sapper_run import RunOutput
         output = RunOutput(directory, private_json)
 
     def note(message):
-        print(message, flush=True)
+        # Frozen spec v1.0 二: stdout is reserved for the structured NDJSON
+        # stream; operational status goes to stderr (isolated from that stream).
+        print(message, file=sys.stderr, flush=True)
         if output:
             output.note(message)
 
@@ -1202,16 +1471,38 @@ def run_child(directory):
                 sys.stdout.buffer.write(line)
                 sys.stdout.buffer.flush()
                 output.observe(line)
-                if journal:
+                if output or journal:
                     try:
                         event = json.loads(line)
                     except (ValueError, UnicodeError):
                         continue
+                    # Any valid structured frame proves the headless CLI is
+                    # alive and speaking the protocol — the readiness floor for
+                    # STARTUP_TIMEOUT (system/init is the stronger signal).
+                    if isinstance(event, dict):
+                        process_ready.set()
+                if journal:
                     journal.receive(info["id"], info["claude_session_id"], event)
-                    if event.get("type") == "control_response" and event.get("response", {}).get("request_id") == "sapper-initialize":
-                        if event["response"].get("subtype") == "error":
-                            init_error.append(event["response"].get("error", "初始化失败"))
+                    # Frozen spec v1.0 二: only an ack echoed with the current
+                    # generation may mark the process ready; a late ack from a
+                    # superseded generation is discarded.
+                    from sapper_host import validate_init_ack
+                    ack = validate_init_ack(event, generation)
+                    if ack == "error":
+                        init_error.append(event["response"].get("error", "初始化失败"))
+                    elif ack == "ok":
                         initialized.set()
+                        process_ready.set()
+                    elif ack == "stale":
+                        note("[sapper-web] 丢弃旧代号就绪信号")
+                    elif (event.get("type") == "system" and event.get("subtype") == "init"
+                          and event.get("session_id") == info.get("claude_session_id")):
+                        # Real Claude Code emits a system/init frame on startup
+                        # but does not answer our custom initialize control_request.
+                        # It is session-bound to this run, so it is a safe ready
+                        # signal when the generation-carrying ack never arrives.
+                        initialized.set()
+                        process_ready.set()
                     elif event.get("type") == "control_request" and event.get("request", {}).get("subtype") != "can_use_tool":
                         # Unknown requests must receive an explicit error, not hang.
                         with journal.locked() as data:
@@ -1225,14 +1516,23 @@ def run_child(directory):
         signal.signal(sig, request_stop)
     rc = 1
     reason = None
+    stderr_fp = None
     try:
-        options = {"start_new_session": True, "stdin": subprocess.DEVNULL} if managed_print else {}
-        if chat_mode:
-            options["stdin"] = subprocess.PIPE
+        options = {"start_new_session": True} if managed_print else {}
+        # Every headless child gets a stdin pipe owned by this supervisor.  The
+        # wrapper's own stdin was closed by the host (no PTY), so literal input
+        # from the web is relayed through an inbox file into this pipe.
+        options["stdin"] = subprocess.PIPE
         if output:
-            options.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            # Frozen spec v1.0 二: stdout carries only the NDJSON turn stream;
+            # stderr is isolated to its own file so CLI warnings/hook errors
+            # cannot corrupt the stream or block on an undrained PIPE.
+            options["stdout"] = subprocess.PIPE
+            stderr_path = directory / "stderr.log"
+            stderr_fp = stderr_path.open("ab")
+            options["stderr"] = stderr_fp
         child = subprocess.Popen(launch["argv"], cwd=info["cwd"], env=env, **options)
-        started = time.monotonic()
+        started = float(spawn_monotonic) if isinstance(spawn_monotonic, (int, float)) else time.monotonic()
         info.update(status="running", started_at=sapper.now_iso(), pid=child.pid,
                     started_epoch=time.time(),
                     wrapper_pid=os.getpid(), process_group=os.getpgrp())
@@ -1251,11 +1551,14 @@ def run_child(directory):
             reader = threading.Thread(target=relay, daemon=True)
             reader.start()
         if journal:
-            child.stdin.write((json.dumps({"type": "control_request", "request_id": "sapper-initialize",
+            from sapper_host import init_request_id
+            child.stdin.write((json.dumps({"type": "control_request",
+                "request_id": init_request_id(generation),
                 "request": {"subtype": "initialize", "hooks": None}}) + "\n").encode())
             child.stdin.flush()
         phase_end = None
         stage = None
+        stdin_offset = 0
         warned_budget = None
         companion_checked = 0
         companion_missing = None
@@ -1287,7 +1590,7 @@ def run_child(directory):
             if journal and reason is None and not watchdog_lost:
                 if init_error:
                     raise OSError("Claude Code 聊天初始化失败：" + init_error[0])
-                if not initialized.is_set() and now - started > 60:
+                if not initialized.is_set() and now - started > startup_timeout:
                     raise OSError("Claude Code 聊天初始化超时")
                 if initialized.is_set():
                     frames = journal.outgoing(info["id"])
@@ -1297,6 +1600,31 @@ def run_child(directory):
                         child.stdin.write((json.dumps(frame, ensure_ascii=False) + "\n").encode())
                     child.stdin.flush()
                     journal.sent(info["id"], frames)
+            if output and not journal and reason is None and not watchdog_lost:
+                # Frozen spec v1.0 二/三: a headless stream-json run that never
+                # speaks the protocol within startup_timeout is a STARTUP_TIMEOUT
+                # (hard-kill, no graceful exit), not a forced-ready success.
+                if not process_ready.is_set() and now - started > startup_timeout:
+                    raise OSError("无头进程启动就绪超时")
+            if not chat_mode and reason is None:
+                # Literal web input for non-chat runs: the inbox file is the
+                # control-plane boundary; the supervisor owns the actual stdin.
+                inbox = directory / "stdin-inbox"
+                if inbox.exists():
+                    data = inbox.read_bytes()
+                    if len(data) > stdin_offset:
+                        chunk = data[stdin_offset:]
+                        stdin_offset = len(data)
+                        # No PTY line discipline: a carriage return from the web
+                        # terminal must become a newline to terminate a line.
+                        chunk = chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                        # The old send-keys path always appended Enter for text
+                        # input.  Without a PTY we must terminate the line here.
+                        if chunk and not chunk.endswith(b"\n"):
+                            chunk += b"\n"
+                        with contextlib.suppress(OSError, ValueError):
+                            child.stdin.write(chunk)
+                            child.stdin.flush()
             with run_lock(directory):
                 control = read_json(directory / "control.json", {})
                 budget = control.get("timeout_seconds", info.get("timeout_seconds"))
@@ -1352,6 +1680,9 @@ def run_child(directory):
             with contextlib.suppress(subprocess.TimeoutExpired):
                 child.wait(timeout=3)
     finally:
+        if stderr_fp is not None:
+            with contextlib.suppress(OSError):
+                stderr_fp.close()
         if child and child.poll() is None:
             child_signal(signal.SIGKILL)
             child.wait()
@@ -1372,6 +1703,29 @@ def run_child(directory):
             info.update(status=reason or "exited", ended_at=sapper.now_iso(), exit_code=rc)
             if reason:
                 info["stop_reason"] = reason
+            # Frozen spec v1.0 三/四: classify STARTUP_TIMEOUT vs CRASHED for
+            # host-backed runs and route the event before persisting the final
+            # status.  Legacy tmux runs have no host.json -> no classification.
+            try:
+                last_heartbeat = read_json(directory / "activity.json", {}).get("last_event_at")
+                # Frozen spec v1.0 三: readiness is a real protocol signal, never
+                # forced True.  Stream-json runs use system/init (or gen ack);
+                # plain commands have no protocol and their clean launch is the
+                # only available signal.
+                if output:
+                    ready = bool(process_ready.is_set() or initialized.is_set())
+                else:
+                    ready = child is not None
+                verdict = _report_failure(
+                    directory, info, state=env.get("SAPPER_WEB_STATE", ""),
+                    ready=ready, last_heartbeat=last_heartbeat,
+                    started=started, reason=reason)
+                if verdict:
+                    info["status"] = verdict["status"]
+                    info["generation"] = verdict["generation"]
+                    info["failure_evidence"] = verdict.get("evidence")
+            except (OSError, ValueError, RuntimeError) as exc:
+                note("[sapper-web] 故障上报失败：" + str(exc))
             private_json(directory / "run.json", info)
         # Credential-bearing launch data is no longer needed after this command.
         with contextlib.suppress(FileNotFoundError):
@@ -1594,7 +1948,7 @@ class Handler(BaseHTTPRequestHandler):
                     if action == "stop":
                         return self.reply(200, app.workspaces.stop_agent(aid))
                     if action == "messages":
-                        return self.reply(200, app.workspaces.message(aid, data))
+                        return self.reply(200, app.workspaces.message_from_web(aid, data))
             if path == "/api/projects":
                 if method == "GET":
                     return self.reply(200, app.projects())
@@ -1826,7 +2180,18 @@ def main(argv=None):
     print(f"认证数据库: {app.auth.path}", flush=True)
     if not app.auth.configured():
         print("请先在本机初始化管理员：" + shlex.join([sys.executable, str(Path(__file__).resolve()), "--state", str(app.state), "--init-admin"]), flush=True)
-    print("原 agent 进程独立运行；退出此 Web 服务不会停止已有 tmux 会话。", flush=True)
+    print("原 agent 进程独立运行；Web 服务重启不会停止已拉起的无头进程组。", flush=True)
+    # Frozen spec v1.0 四: a control-plane daemon sweeps confirmation deadlines
+    # so escalation happens even when nobody is polling the web UI.
+    import threading as _threading
+    def _route_tick():
+        while True:
+            try:
+                route_due_events(app.state)
+            except (OSError, ValueError, RuntimeError):
+                pass
+            time.sleep(5)
+    _threading.Thread(target=_route_tick, name="sapper-routing", daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

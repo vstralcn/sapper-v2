@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import sapper
 import sapper_roles
 from sapper_web import Console, WebServer, WebError
-from sapper_workspace import WorkspaceError, START_MARK
+from sapper_workspace import WorkspaceError, START_MARK, default_execution_mode
 from sapper_terminal import TerminalBridge
 from sapper_chat import ChatJournal
 
@@ -28,7 +28,7 @@ import json,os,sys,subprocess,signal,time
 from pathlib import Path
 args=sys.argv[1:]
 if '--help' in args:
-    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt --input-format --replay-user-messages --init-only')
+    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt --init-only')
     raise SystemExit(0)
 if '--version' in args:
     print('2.1.318 (fixture)')
@@ -90,7 +90,7 @@ from datetime import datetime,timezone
 from pathlib import Path
 args=sys.argv[1:]
 if '--help' in args:
-    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt --input-format --replay-user-messages')
+    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt')
     raise SystemExit(0)
 if '--version' in args:
     print('2.1.318 (fixture)')
@@ -172,19 +172,25 @@ class WorkspaceBindingTests(unittest.TestCase):
         manager._capabilities = dict(available=True, session_id=True, resume=True, append_system=True,
                                      mcp_config=True, strict_mcp_config=True, plugin_dir=True,
                                      setting_sources=True, settings=True, skill_isolation=True)
-        saved = {"id": "a" * 16, "role": "commander", "workspace_id": pid,
-                 "claude_session_id": str(uuid.uuid4()), "cwd": str(self.question),
-                 "skip_permissions": True, "mission": "fixture", "run_ids": []}
-        for data, existing in (({"role": "commander", "skip_permissions": True}, None),
-                               ({"role": "worker", "skip_permissions": False}, None),
-                               ({}, saved)):
-            with self.subTest(data=data, existing=bool(existing)), \
+        # Frozen spec v1.0 二: only a subordinate's full-auto bypass is rejected
+        # under root. The commander never bypasses (approval channel by role),
+        # so it must NOT trip the root guard even if the caller asks for it.
+        for data, existing in (({"role": "worker", "skip_permissions": False}, None),
+                               ({"role": "general", "skip_permissions": False}, None)):
+            with self.subTest(data=data), \
                     mock.patch("sapper_workspace.os.geteuid", return_value=0), \
                     mock.patch.object(self.app, "panes", return_value=[]), \
                     mock.patch.object(self.app, "start", side_effect=WorkspaceError("fixture reached start")) as start:
                 with self.assertRaisesRegex(WorkspaceError, "root.*跳过逐次审批"):
                     manager.create_session(pid, data, existing=existing)
                 start.assert_not_called()
+        # A commander requested with skip=True is silently clamped to the
+        # approval channel, so root startup is allowed to proceed to start().
+        with mock.patch("sapper_workspace.os.geteuid", return_value=0), \
+                mock.patch.object(self.app, "panes", return_value=[]), \
+                mock.patch.object(self.app, "start", side_effect=WorkspaceError("fixture reached start")):
+            with self.assertRaisesRegex(WorkspaceError, "fixture reached start"):
+                manager.create_session(pid, {"role": "commander", "skip_permissions": True})
 
     def test_assignment_launch_failure_releases_same_intent_for_retry(self):
         manager = self.app.workspaces
@@ -375,11 +381,11 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.app.workspaces.enable(self.pid, {})
 
     def tearDown(self):
-        # tmux death signals runners asynchronously. Wait for their final writes
-        # before removing the state directory (not just the server socket).
+        # Stop and physically reap every managed host (never a shared tmux
+        # server). Wait for final writes before removing the state directory.
         runners = [json.loads(p.read_text()).get('wrapper_pid')
                    for p in (self.app.state / 'runs').glob('*/run.json')]
-        self.app.tmux("kill-server")
+        self.app.stop_all_runs()
         until = time.monotonic() + 5
         while runners and time.monotonic() < until:
             alive = []
@@ -424,7 +430,7 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.assertEqual(resumed["claude_session_id"], one["claude_session_id"])
         self.assertIn("--resume", resumed["command"])
         self.assertNotIn("--continue", resumed["command"])
-        self.assertEqual(self.app.tmux("has-session", "-t", two["session"]).returncode, 0)
+        self.assertTrue(self.app.host_alive(two["id"]))
         reloaded = Console(self.app.root, self.app.state, self.socket, workspace_roots=[self.question.parent], claude_bin=str(self.bin))
         self.assertEqual(len([a for a in reloaded.workspaces.agents(self.pid) if a.get("pane_id")]), 2)
 
@@ -469,7 +475,7 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.app.workspaces.agent(aid)['run_ids'], [run['id']])
         self.assertEqual(monitor.view(aid)['last_board']['run_id'], run['id'])
         # Actual process loss, not a merely quiet model/tool.
-        self.app.tmux('kill-session', '-t', run['session'])
+        self.app.kill_host(run['id'])
         self.until(lambda: not next(a for a in self.app.workspaces.agents(self.pid) if a['id'] == aid)['pane_id'])
         monitor.tick(aid, self.app.workspaces.agents(self.pid))
         new_run = self.app.workspaces.agent(aid)['run_id']
@@ -511,7 +517,7 @@ class NativeWorkspaceTests(unittest.TestCase):
             run = self.app.workspaces.create_session(self.pid, {"from": basis, "execution_mode": "print", "mission": "WAIT_FOR_INTERRUPT"})
         rid, aid = run["id"], run["agent_id"]
         self.until(lambda: self.app.run_info(rid)["status"] == "timed_out")
-        self.until(lambda: self.app.tmux("has-session", "-t", run["session"]).returncode != 0)
+        self.until(lambda: not self.app.host_alive(run["id"]))
         self.launch(role="commander")
         time.sleep(3.2)
         self.assertEqual(self.app.workspaces.agent(aid)["run_ids"], [rid])
@@ -571,8 +577,8 @@ class NativeWorkspaceTests(unittest.TestCase):
         released = self.app.store(self.pid).get_intent(run["intent_id"])
         self.assertEqual((released["worker"], released["status"], released["to"]), (None, "open", None))
         self.assertEqual(self.app.run_info(run["id"])["status"], "stopped")
-        self.assertNotEqual(self.app.tmux("has-session", "-t", run["session"]).returncode, 0)
-        self.assertEqual(self.app.tmux("has-session", "-t", survivor["session"]).returncode, 0)
+        self.assertFalse(self.app.host_alive(run["id"]))
+        self.assertTrue(self.app.host_alive(survivor["id"]))
         self.assertFalse(any(a["id"] == aid for a in self.app.workspaces.agents()))
         self.assertFalse(any(a["id"] == aid for a in self.app.overview()["agents"]))
         self.assertEqual((directory / "evidence.txt").read_text(), "keep this result")
@@ -598,7 +604,7 @@ class NativeWorkspaceTests(unittest.TestCase):
         a = self.app.workspaces.agent(child["agent_id"])
         self.assertIsNone(a["parent_agent_id"])
         self.assertEqual(a["deleted_parent_agent_id"], parent["agent_id"])
-        self.assertEqual(self.app.tmux("has-session", "-t", child["session"]).returncode, 0)
+        self.assertTrue(self.app.host_alive(child["id"]))
         self.app.workspaces.stop_agent(a["id"])
         resumed = self.app.workspaces.resume(a["id"], {})
         self.until(lambda: "NATIVE_READY" in self.app.log(resumed["id"])["text"])
@@ -771,7 +777,7 @@ class NativeWorkspaceTests(unittest.TestCase):
         self.app.workspaces.stop_workspace(self.pid)
         self.assertEqual(self.app.run_info(first["id"])["status"], "stopped")
         self.assertEqual(self.app.workspaces.agent(commander["agent_id"])["desired_state"], "stopped")
-        self.assertEqual(self.app.tmux("has-session", "-t", second["session"]).returncode, 0)
+        self.assertTrue(self.app.host_alive(second["id"]))
         self.assertEqual(self.app.workspaces.agent(second["agent_id"])["desired_state"], "running")
 
     def test_authenticated_terminal_http_and_sse_reconnect(self):
@@ -842,6 +848,63 @@ class NativeWorkspaceTests(unittest.TestCase):
             r.read(); c.close()
         finally:
             server.shutdown(); server.server_close(); thread.join()
+
+
+class ControlPlaneEntryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="cp entry ")
+        self.base = Path(self.temp.name)
+        self.bin = self.base / "fixture"
+        self.bin.write_text(FIXTURE); self.bin.chmod(0o700)
+        self.question = self.base / "q"; self.question.mkdir()
+        (self.question / "c.txt").write_text("x")
+        self.env = dict(os.environ)
+        os.environ["ANTHROPIC_API_KEY"] = "fixture"
+        os.environ["SAPPER_TEST_REPO"] = str(Path(sapper.__file__).resolve().parents[1])
+        self.app = Console(self.base / "runs", self.base / "state", None, claude_bin=str(self.bin))
+        self.project = self.app.workspaces.bind({"path": str(self.question), "goal": "g"})
+        self.pid = self.project["id"]
+        self.app.workspaces.enable(self.pid, {})
+
+    def tearDown(self):
+        self.app.stop_all_runs()
+        os.environ.clear(); os.environ.update(self.env)
+        self.temp.cleanup()
+
+    def until(self, fn, timeout=10):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if fn():
+                return True
+            time.sleep(.05)
+        self.fail("timed out waiting for fixture")
+
+    def test_web_message_entry_only_addresses_top_commander(self):
+        main = self.app.workspaces.dispatch(self.pid, {"role": "commander"})
+        self.until(lambda: "NATIVE_READY" in self.app.log(main["id"])["text"])
+        basis = self.app.store(self.pid).add_fact("supplied file", "user")["id"]
+        child = self.app.workspaces.create_session(self.pid, {"parent_agent_id": main["agent_id"], "from": basis, "mission": "m"})
+        self.until(lambda: "NATIVE_READY" in self.app.log(child["id"])["text"])
+        # Web human entry may message the top commander.
+        result = self.app.workspaces.message_from_web(main["agent_id"], {"text": "web order"})
+        self.assertIn(result["status"], ("queued", "saved", "sent"))
+        # But may NOT message a non-commander agent directly.
+        with self.assertRaisesRegex(WorkspaceError, "仅可与顶层指挥官"):
+            self.app.workspaces.message_from_web(child["agent_id"], {"text": "sibling spoof"})
+
+
+class DefaultExecutionModeTests(unittest.TestCase):
+    def test_headless_is_default_but_incapable_cli_falls_back_to_tui(self):
+        # Frozen spec v1.0: the single decision point defaults every role to the
+        # headless chat pipe; a CLI lacking structured input/receipt capability
+        # falls back to tui rather than being silently upgraded.
+        for role in ("commander", "worker", "scout", "general", "verifier", "custom"):
+            self.assertEqual(default_execution_mode(role), "chat")
+            self.assertEqual(default_execution_mode(role, {}), "tui")
+        capable = {"stream_input": True, "replay_user": True}
+        self.assertEqual(default_execution_mode("worker", capable), "chat")
+        partial = {"stream_input": True, "replay_user": False}
+        self.assertEqual(default_execution_mode("worker", partial), "tui")
 
 
 if __name__ == "__main__":

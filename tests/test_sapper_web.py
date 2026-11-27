@@ -81,26 +81,21 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 503)
         self.assertNotIn("private", str(caught.exception))
 
-    def test_tmux_query_failure_is_distinct_from_confirmed_absence(self):
+    def test_host_liveness_distinguishes_alive_dead_and_legacy_runs(self):
         rid = "a" * 16
-        path = self.app.run_path(rid) / "run.json"
-        private_json(path, {"id": rid, "project_id": self.pid, "status": "running",
-                            "session": "fixture", "created_at": sapper.now_iso()})
-        failure = subprocess.CompletedProcess([], 1, "", "error connecting to /tmp/fixture (Permission denied)")
-        with mock.patch.object(self.app, "tmux", return_value=failure), \
-                mock.patch("sapper_web.shutil.which", return_value="/fixture/tmux"):
-            with self.assertRaisesRegex(WebError, "list-panes"):
-                self.app.panes()
-            with self.assertRaisesRegex(WebError, "has-session"):
-                self.app.runs()
+        run_dir = self.app.run_path(rid)
+        private_json(run_dir / "run.json", {"id": rid, "project_id": self.pid, "status": "running",
+                        "session": "sapper-web-" + rid, "created_at": sapper.now_iso()})
+        # No host record: legacy run is left to its own supervisor, not marked dead.
+        self.assertTrue(self.app.host_alive(rid))
         self.assertEqual(self.app.run_info(rid)["status"], "running")
-        no_session = subprocess.CompletedProcess([], 1, "", "can't find session: fixture")
-        with mock.patch.object(self.app, "tmux", return_value=no_session):
-            self.assertEqual(self.app.runs()[0]["status"], "interrupted")
-        no_server = subprocess.CompletedProcess([], 1, "", "no server running on /tmp/fixture")
-        with mock.patch.object(self.app, "tmux", return_value=no_server), \
-                mock.patch("sapper_web.shutil.which", return_value="/fixture/tmux"):
-            self.assertEqual(self.app.panes(), [])
+        # Host record with a dead PID: confirmed absence reconciles to interrupted.
+        private_json(run_dir / "host.json", {"pid": 999999, "birth": "fixture", "generation": 1})
+        self.assertFalse(self.app.host_alive(rid))
+        self.app.runs()
+        self.assertEqual(self.app.run_info(rid)["status"], "interrupted")
+        # Legacy runs never had panes; the host-based shim reports none.
+        self.assertEqual(self.app.panes(), [])
 
     def test_create_project_uses_workspace_name_as_title(self):
         named = self.app.create_project({"title": "登录绕过分析", "goal": "Find the bypass"})
@@ -808,7 +803,7 @@ class TmuxTests(unittest.TestCase):
         self.pid = self.project["id"]
 
     def tearDown(self):
-        self.app.tmux("kill-server")
+        self.app.stop_all_runs()
         self.temp.cleanup()
 
     def until(self, predicate, timeout=10):

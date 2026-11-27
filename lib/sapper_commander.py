@@ -453,7 +453,7 @@ class WorkerMonitor(CommanderMonitor):
             if row and row.get("run_id") != agent.get("run_id"):
                 return
             if (agent.get("role") == "commander" or agent.get("desired_state") != "running"
-                    or agent.get("legacy") or agent.get("execution_mode") != "tui"
+                    or agent.get("legacy") or agent.get("execution_mode") not in ("tui", "chat")
                     or agent.get("native_operation") or not row.get("pane_id")):
                 return
             run = self.app.run_info(agent["run_id"])
@@ -474,18 +474,25 @@ class WorkerMonitor(CommanderMonitor):
                     delay = min(WORKER_MAX_BACKOFF, WORKER_ACK_SECONDS * (2 ** max(0, attempt - 1)))
                     if now - wake["sent_at"] < delay:
                         return
-                pane = self.app.capture(row["pane_id"])["text"]
-                prompts = re.findall(r"^\s*❯(.*)$", pane, re.M)
-                if not prompts or prompts[-1].strip():
-                    data["attention"] = "API 错误后等待空闲输入框；未发送恢复指令"
-                    return
+                if agent.get("execution_mode") != "chat":
+                    pane = self.app.capture(row["pane_id"])["text"]
+                    prompts = re.findall(r"^\s*❯(.*)$", pane, re.M)
+                    if not prompts or prompts[-1].strip():
+                        data["attention"] = "API 错误后等待空闲输入框；未发送恢复指令"
+                        return
                 token = uuid.uuid4().hex
                 data["wake"] = {"id": token, "run_id": run["id"], "sent_at": now,
                                 "attempt": attempt + 1 if pending else 1, "status": "sent"}
                 data.update(verification="recovery_sent")
                 data.pop("attention", None)
                 atomic_private(self.path(aid), data)
-                self.app.send(row["pane_id"], {"text": self.prompt(token)}, target_agent=aid,
-                              kind="wake", message_id=token)
+                if agent.get("execution_mode") == "chat":
+                    from sapper_chat import ChatJournal
+                    item = ChatJournal(self.app.state, aid).enqueue(self.prompt(token), internal=True)
+                    message_id = item["id"]
+                else:
+                    message_id = token
+                    self.app.send(row["pane_id"], {"text": self.prompt(token)}, target_agent=aid,
+                                  kind="wake", message_id=message_id)
                 self.app.audit("worker.recovery_sent", agent=aid, run=run["id"], wake=token,
-                               request_id=token, target_agent=aid, kind="wake", message_id=token)
+                               request_id=token, target_agent=aid, kind="wake", message_id=message_id)

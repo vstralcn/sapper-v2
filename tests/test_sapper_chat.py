@@ -206,33 +206,30 @@ class ChatLifecycleTests(unittest.TestCase):
 
     def start_chat(self):
         self.bin.write_text(CHAT_FIXTURE)
+        # Capabilities were cached by setUp's enable() using the tui fixture;
+        # refresh them now that the chat-capable fixture is installed.
+        self.app.workspaces._capabilities = None
         run = self.app.workspaces.dispatch(self.pid, {"role":"commander", "execution_mode":"chat", "request_id":str(uuid.uuid4())})
         self.until(lambda: any(m["role"] == "assistant" for m in self.app.workspaces.chat_view(self.pid)["messages"]))
         return run
 
-    def test_resume_updates_and_preserves_permission_setting(self):
-        run = self.app.workspaces.dispatch(self.pid, {"role": "commander"})
+    def test_commander_always_keeps_approval_channel_across_resume(self):
+        # Frozen spec v1.0 二: permission is tiered strictly by role. A commander
+        # may never opt into --dangerously-skip-permissions, even on resume.
+        run = self.app.workspaces.dispatch(self.pid, {"role": "commander", "skip_permissions": True})
         self.until(lambda: "NATIVE_READY" in self.app.log(run["id"])["text"])
         aid = run["agent_id"]
-        self.app.workspaces.stop_agent(aid)
-        enabled = self.app.workspaces.dispatch(self.pid, {"role": "commander", "skip_permissions": True})
-        self.until(lambda: "NATIVE_READY" in self.app.log(enabled["id"])["text"])
-        self.assertEqual(enabled["claude_session_id"], run["claude_session_id"])
-        self.assertIn("--dangerously-skip-permissions", enabled["command"])
-        self.assertTrue(self.app.workspaces.agent(aid)["skip_permissions"])
-        calls = [json.loads(line) for line in (self.base / "calls.jsonl").read_text().splitlines()]
-        self.assertIn("[Sapper 指挥官职责 · commander]", calls[-1]["argv"][-1])
-        self.assertIn("不得亲自查询比赛平台", calls[-1]["argv"][-1])
-        self.assertIn("原任务：", calls[-1]["argv"][-1])
-        self.app.workspaces.stop_agent(aid)
-        retained = self.app.workspaces.resume(aid, {})
-        self.until(lambda: "NATIVE_READY" in self.app.log(retained["id"])["text"])
-        self.assertIn("--dangerously-skip-permissions", retained["command"])
-        self.app.workspaces.stop_agent(aid)
-        disabled = self.app.workspaces.resume(aid, {"skip_permissions": False})
-        self.until(lambda: "NATIVE_READY" in self.app.log(disabled["id"])["text"])
-        self.assertNotIn("--dangerously-skip-permissions", disabled["command"])
+        self.assertNotIn("--dangerously-skip-permissions", run["command"])
         self.assertFalse(self.app.workspaces.agent(aid)["skip_permissions"])
+        calls = [json.loads(line) for line in (self.base / "calls.jsonl").read_text().splitlines()]
+        argv_text = " ".join(calls[-1]["argv"])
+        self.assertIn("Sapper 指挥官职责", argv_text)
+        self.app.workspaces.stop_agent(aid)
+        retained = self.app.workspaces.resume(aid, {"skip_permissions": True})
+        self.until(lambda: "NATIVE_READY" in self.app.log(retained["id"])["text"])
+        self.assertNotIn("--dangerously-skip-permissions", retained["command"])
+        self.assertFalse(self.app.workspaces.agent(aid)["skip_permissions"])
+        self.assertEqual(retained["claude_session_id"], run["claude_session_id"])
 
     def test_native_question_answer_and_restart_preserve_one_main_and_watchdog(self):
         run = self.start_chat()
@@ -256,10 +253,10 @@ class ChatLifecycleTests(unittest.TestCase):
         resumed = self.app.workspaces.dispatch(self.pid, {"role":"commander", "execution_mode":"chat"})
         self.assertEqual(resumed["claude_session_id"], run["claude_session_id"])
         self.assertEqual(resumed["agent_id"], main)
-        launch = json.loads((self.app.state / "runs" / resumed["id"] / "launch.json").read_text())
-        self.assertIn("[Sapper 指挥官职责 · commander]", launch["initial_prompt"])
-        self.assertIn("不得亲自查询比赛平台", launch["initial_prompt"])
-        self.assertIn("原任务：", launch["initial_prompt"])
+        resumed_info = self.app.run_info(resumed["id"])
+        self.assertIn("[Sapper 指挥官职责 · commander]", resumed_info["initial_prompt"])
+        self.assertIn("不得亲自查询比赛平台", resumed_info["initial_prompt"])
+        self.assertIn("原任务：", resumed_info["initial_prompt"])
         self.until(lambda: self.app.workspaces.chat_view(self.pid)["phase"] == "idle")
         self.assertEqual(sum(s["status"] in ("starting","running") for s in self.app.workspaces.services(self.pid)), 1)
         with self.assertRaisesRegex(Exception, "问题已结束"):
@@ -283,20 +280,21 @@ class ChatLifecycleTests(unittest.TestCase):
         previous = self.start_chat()
         basis = self.app.store(self.pid).add_fact("supplied file", "user")["id"]
         child = self.app.workspaces.create_session(self.pid, {"parent_agent_id":previous["agent_id"], "from":basis, "mission":"continue independently"})
-        run = self.app.workspaces.dispatch(self.pid, {"role":"commander"})
+        run = self.app.workspaces.dispatch(self.pid, {"role":"commander", "execution_mode": "tui"})
         self.until(lambda: "NATIVE_READY" in self.app.log(run["id"])["text"])
         self.assertEqual(run["execution_mode"], "tui")
         self.assertEqual(run["agent_id"], previous["agent_id"])
         self.assertEqual(run["claude_session_id"], previous["claude_session_id"])
         self.assertEqual(self.app.run_info(child["id"])["status"], "running")
         self.assertEqual(sum(s["status"] in ("starting", "running") for s in self.app.workspaces.services(self.pid)), 1)
-        again = self.app.workspaces.dispatch(self.pid, {"role":"worker", "mission":"inspect another input"})
+        again = self.app.workspaces.dispatch(self.pid, {"role":"worker", "execution_mode": "tui", "mission":"inspect another input"})
         self.assertEqual(again["id"], run["id"])
         self.until(lambda: "inspect another input" in self.app.log(run["id"])["text"])
         self.assertEqual(len(self.app.workspaces.agents(self.pid)), 2)
 
     def test_failed_watchdog_launch_rolls_back_main_process(self):
         self.bin.write_text(CHAT_FIXTURE)
+        self.app.workspaces._capabilities = None
         with mock.patch.object(self.app.workspaces, "start_watchdog", side_effect=WorkspaceError("fixture watchdog failure")):
             with self.assertRaisesRegex(WorkspaceError, "watchdog failure"):
                 self.app.workspaces.dispatch(self.pid, {"role":"commander", "execution_mode":"chat"})

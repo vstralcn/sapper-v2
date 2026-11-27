@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from sapper_permission_audit import FIELDS, permission_audit
+from sapper_host import SubprocessHost
 from sapper_workspace import worker
 import test_sapper_workspaces as fixtures
 
@@ -51,15 +52,17 @@ class PermissionAuditTests(unittest.TestCase):
         self.prepare()
         seen = []
 
-        def tmux(*args, **kwargs):
-            if args[0] == "new-session":
-                files = list((self.app.state / "runs").glob("*/run.json"))
+        real_spawn = SubprocessHost.spawn
+        def spawn(self_host, *args, **kwargs):
+            files = list((self_app.state / "runs").glob("*/run.json"))
+            if files:
                 run = json.loads(max(files, key=lambda p: p.stat().st_mtime_ns).read_text())
                 self.assertTrue(set(FIELDS) <= set(run))
                 seen.append(run)
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return real_spawn(self_host, *args, **kwargs)
+        self_app = self.app
 
-        with mock.patch.object(self.app, "tmux", side_effect=tmux), mock.patch.object(self.app, "panes", return_value=[]):
+        with mock.patch.object(SubprocessHost, "spawn", spawn), mock.patch.object(self.app, "panes", return_value=[]):
             run = self.manager.create_session(self.pid, {"role": "scout", "execution_mode": "tui", "skip_permissions": True,
                                                        "request_id": "first"})
             agent = self.manager.agent(run["agent_id"])
@@ -67,8 +70,10 @@ class PermissionAuditTests(unittest.TestCase):
             inherited = self.manager.resume(agent["id"], {"request_id": "second"})
             disabled = self.manager.resume(agent["id"], {"skip_permissions": False, "request_id": "third"})
         self.assertEqual([r["request_id"] for r in seen], ["first", "second", "third"])
+        # Frozen spec v1.0 二: a scout is a subordinate, hence always full-auto;
+        # even a resume requesting skip_permissions=False is clamped to True.
         self.assertIn("--dangerously-skip-permissions", inherited["command"])
-        self.assertNotIn("--dangerously-skip-permissions", disabled["command"])
+        self.assertIn("--dangerously-skip-permissions", disabled["command"])
         rows = [json.loads(s) for s in (self.app.state / "actions.jsonl").read_text().splitlines()]
         events = [r for r in rows if r["action"] in ("agent.started", "agent.resumed", "agent.dispatched")]
         for event in events:

@@ -160,7 +160,7 @@ class NativeIntegrationTests(unittest.TestCase):
         self.profile = self.app.save_profile({"name": "native-test", "model": "fixture-model", "engine_prefix": shlex.quote(str(self.engine)), "api_key": "synthetic-native-key"})
 
     def tearDown(self):
-        self.app.tmux("kill-server")
+        self.app.stop_all_runs()
         self.environment.stop()
         self.temp.cleanup()
 

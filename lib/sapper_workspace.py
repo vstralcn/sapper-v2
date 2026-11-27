@@ -32,7 +32,24 @@ REPO = Path(__file__).resolve().parent.parent
 ROLES = sapper_roles.ROLES
 START_MARK = "<!-- sapper-workspace:start -->"
 END_MARK = "<!-- sapper-workspace:end -->"
-TERMINAL_STATES = {"exited", "failed", "stopped", "interrupted", "timed_out"}
+TERMINAL_STATES = {"exited", "failed", "stopped", "interrupted", "timed_out",
+                   "crashed", "startup_timeout"}
+EXECUTION_MODES = ("tui", "print", "chat")
+
+
+def default_execution_mode(role, capabilities=None):
+    """Single decision point for the default execution mode.
+
+    Frozen spec v1.0 五: default is collected here.  Phase-2 cutover flipped it
+    from "tui" to "chat" so every new Claude session runs on the headless
+    bidirectional stream-json pipe (no tmux/PTY).  A Claude CLI that lacks the
+    structured input/receipt capability cannot run headless, so it falls back to
+    tui — the control plane never silently upgrades an incapable CLI.
+    """
+    if capabilities is not None and not all(
+            capabilities.get(k) for k in ("stream_input", "replay_user")):
+        return "tui"
+    return "chat"
 
 
 def agent_observation(agent, pane):
@@ -472,7 +489,7 @@ class Workspaces:
         role = data.get("role", "commander")
         if role not in ROLES:
             raise WorkspaceError("角色不正确")
-        mode = data.get("execution_mode", "tui")
+        mode = data.get("execution_mode", default_execution_mode(role, self.capabilities()))
         if mode not in ("tui", "chat"):
             raise WorkspaceError("主 agent 需要交互式会话")
         new_session = data.get("new_session", False)
@@ -772,15 +789,20 @@ class Workspaces:
         role = (existing or {}).get("role") or data.get("role", "worker")
         if role not in ROLES:
             raise WorkspaceError("角色不正确")
-        mode = (data.get("execution_mode") if existing and role == "commander" else None) or (existing or {}).get("execution_mode") or data.get("execution_mode", "tui")
-        if mode not in ("tui", "print", "chat") or (mode == "chat" and role != "commander"):
+        mode = (data.get("execution_mode") if existing and role == "commander" else None) or (existing or {}).get("execution_mode") or data.get("execution_mode", default_execution_mode(role, cap))
+        if mode not in EXECUTION_MODES:
             raise WorkspaceError("执行形式不正确")
         if role == "commander" and mode == "print":
             raise WorkspaceError("主 agent 需要持续会话，请使用网页聊天或交互式会话")
         skip_permissions = data.get("skip_permissions", (existing or {}).get("skip_permissions", False))
         if type(skip_permissions) is not bool:
             raise WorkspaceError("skip_permissions 必须为布尔值")
-        if role == "worker":
+        # Frozen spec v1.0 二: permission is tiered strictly by ROLE, never by
+        # request or transport. The commander always owns the controlled
+        # approval channel; every subordinate is full-auto.
+        if role == "commander":
+            skip_permissions = False
+        else:
             skip_permissions = True
         if skip_permissions and os.geteuid() == 0:
             raise WorkspaceError("Sapper Web 正以 root 运行，Claude Code 拒绝跳过逐次审批", 409)
@@ -928,8 +950,16 @@ class Workspaces:
             if mode == "print":
                 argv += ["-p", "--output-format", "stream-json", "--verbose"]
             if mode == "chat":
+                # Frozen spec v1.0 二: permission is tiered by ROLE, not by the
+                # transport.  Only the commander owns the controlled approval
+                # channel (control_request over stdio).  Workers run full-auto via
+                # --dangerously-skip-permissions and MUST NOT get stdio approval,
+                # otherwise every tool call emits control_request and hangs waiting
+                # for a human decision that unattended workers never receive.
                 argv += ["-p", "--output-format", "stream-json", "--input-format", "stream-json",
-                         "--permission-prompt-tool", "stdio", "--replay-user-messages", "--verbose"]
+                         "--replay-user-messages", "--verbose"]
+                if role == "commander":
+                    argv += ["--permission-prompt-tool", "stdio"]
             continuation = mission
             if not existing or mode in ("print", "chat") or role == "commander":
                 continuation = mission
@@ -985,6 +1015,10 @@ class Workspaces:
         self.save_agent(record)
         if role == "commander":
             sapper.atomic_write_json(self.app.state / "main-agents" / f"{pid}.json", {"agent_id": aid})
+            # Frozen spec v1.0 四: the top commander is the final fallback owner
+            # for any escalated failure event in this workspace.
+            from sapper_routing import RoutingLedger
+            RoutingLedger(self.app.state, pid).set_top(aid)
             try:
                 self.start_watchdog(pid)
             except Exception:
@@ -1213,26 +1247,103 @@ class Workspaces:
         a = self.agent(aid)
         a.update(deleted_at=sapper.now_iso(), desired_state="stopped")
         self.save_agent(a)
-        # Surviving children become independent roles and remain resumable.
-        # Retain the original relationship for historical attribution.
+        # Frozen spec v1.0 四: a failed superior's subordinates and all its
+        # pending events move UP to its own parent (ultimately the top
+        # commander), never become ownerless.  Retain the original relation for
+        # historical attribution only.
+        new_owner = a.get("parent_agent_id")
+        if not new_owner:
+            try:
+                top = read(self.app.state / "main-agents" / (a["workspace_id"] + ".json"), {})
+                new_owner = top.get("agent_id")
+            except (OSError, ValueError):
+                new_owner = None
+        if new_owner == aid:
+            new_owner = None
         detached = []
         for path in (self.app.state / "agents").glob("*.json"):
             child = read(path)
             if (child.get("parent_agent_id") == aid and child.get("workspace_id") == a["workspace_id"]
                     and not child.get("deleted_at")):
-                child.update(parent_agent_id=None, deleted_parent_agent_id=aid)
+                child.update(parent_agent_id=new_owner, deleted_parent_agent_id=aid)
                 self.save_agent(child)
                 detached.append(child["id"])
-        self.app.audit("agent.deleted", agent=aid, workspace=a["workspace_id"], detached_children=detached)
+        # Upshift any pending failure events owned by the failed agent.
+        try:
+            from sapper_routing import RoutingLedger
+            ledger = RoutingLedger(self.app.state, a["workspace_id"])
+            if new_owner:
+                ledger.upshift(aid, new_owner)
+        except (OSError, ValueError):
+            pass
+        self.app.audit("agent.deleted", agent=aid, workspace=a["workspace_id"],
+                       detached_children=detached, upshifted_to=new_owner)
         return {"deleted_agent": aid}
 
-    def message(self, aid, data, *, kind="command"):
+    def check_command_relation(self, target, sender_id):
+        """Validate one command-chain edge at the control-plane message entry.
+
+        Frozen spec v1.0 一/二: every message entry point checks the
+        parent_agent_id tree; siblings (and strangers) may not message each
+        other — that is the loop that makes two headless agents ping-pong.
+
+        Returns "up" when target is the sender's direct parent (a report),
+        "down" when the sender is an ancestor of target (an order), "self"
+        for a same-agent write. Any other relation raises 403.
+        """
+        if not sender_id or not target or target["id"] == sender_id:
+            return "self"
+        sender = self.agent(sender_id, include_deleted=True)
+        if sender["workspace_id"] != target["workspace_id"]:
+            raise WorkspaceError("不能跨工作区发送消息", 403)
+        reporting_up = sender.get("parent_agent_id") == target["id"]
+        ancestor = target.get("parent_agent_id")
+        seen = set()
+        while ancestor and ancestor not in seen and ancestor != sender_id:
+            seen.add(ancestor)
+            record = self.agent(ancestor, include_deleted=True)
+            if record["workspace_id"] != target["workspace_id"]:
+                ancestor = None
+                break
+            ancestor = record.get("parent_agent_id")
+        if ancestor == sender_id:
+            return "down"
+        if reporting_up:
+            return "up"
+        raise WorkspaceError("目标角色不在当前角色的指挥关系中", 403)
+
+    def message_from_web(self, aid, data):
+        """Web human entry: only the workspace's top commander is addressable.
+
+        Frozen spec v1.0 二: the web talks to the top commander only; every
+        non-commander agent is read-only there.  Agent-to-agent traffic uses the
+        CLI path with a trusted sender_id (SAPPER_AGENT_ID), never this entry.
+        """
+        target = self.agent(aid)
+        main = self.main_agent(target["workspace_id"])
+        if not main or main["id"] != aid:
+            raise WorkspaceError("网页端仅可与顶层指挥官对话", 403)
+        return self.message(aid, data)
+
+    def message(self, aid, data, *, kind="command", sender_id=None):
+        """Deliver one message to a role.
+
+        Frozen spec v1.0 一/二: the command-chain check is enforced at every
+        entry and uses a TRUSTED sender (the control-plane-derived agent id
+        passed explicitly by the CLI runner), never a request-body field that
+        a client could spoof to pose as the target's superior.
+        """
         a = next((a for a in self.agents() if a["id"] == aid), None)
+        relation = None
+        if a and sender_id:
+            # Enforced for ALL transports (chat/print/tui/native), not just chat.
+            relation = self.check_command_relation(a, sender_id)
         if a and a.get("execution_mode") == "chat":
-            if data.get("sender_id"):
+            if sender_id:
+                label = "汇报" if relation == "up" else "指令"
                 item = ChatJournal(self.app.state, aid).enqueue(
-                    f"[来自工作区角色 {data['sender_id']} 的汇报；作为证据核对]\n" + text(data, "text"), internal=True)
-                return {"status": "queued", "message": "汇报已进入主 agent 消息队列", "id": item["id"]}
+                    f"[来自工作区角色 {sender_id} 的{label}；作为证据核对]\n" + text(data, "text"), internal=True)
+                return {"status": "queued", "message": "消息已进入目标 agent 收件箱", "id": item["id"]}
             return self.chat_message(a["workspace_id"], data)
         if a and a.get("native_operation"):
             self.app.store(a["workspace_id"]).add_hint(text(data, "text"), "web-user")
@@ -1379,7 +1490,7 @@ def console_from_environment():
 
 def worker(argv):
     parser = argparse.ArgumentParser(description="原 worker CLI 的显式本地工作区接入")
-    parser.add_argument("action", choices=["spawn", "kill", "msg", "peek", "list", "board", "hint", "extend", "resume", "control", "inbox", "release", "reassign"])
+    parser.add_argument("action", choices=["spawn", "kill", "msg", "peek", "list", "board", "hint", "extend", "resume", "control", "inbox", "release", "reassign", "routing"])
     parser.add_argument("target", nargs="?")
     parser.add_argument("body", nargs="?")
     parser.add_argument("--mission", default="")
@@ -1401,6 +1512,9 @@ def worker(argv):
     parser.add_argument("--request-id", default=None)
     parser.add_argument("--to", dest="target_agent")
     parser.add_argument("--expected-owner", default=None, help="预期持有者；none 表示开放意图")
+    parser.add_argument("--resolves", dest="resolves_event", default=None,
+                        help="routing 确认所解决的 event_id；reassign/close 必需")
+    parser.add_argument("--event", dest="event_id", default=None, help="routing 操作的 event_id")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--p", "-p", action="store_true")
     modes.add_argument("--tui", action="store_true")
@@ -1418,6 +1532,58 @@ def worker(argv):
         if manager.agent(parent)["role"] == "commander":
             raise WorkspaceError("主 agent 的消息由网页对话通道投递，请在会话中处理")
         print(json.dumps(ChatJournal(app.state, parent).inbox(), ensure_ascii=False))
+        return 0
+    if args.action == "routing":
+        # Frozen spec v1.0 四: explicit confirmation primitives.  The actor is
+        # the control-plane-provided agent identity, never a request-body field.
+        from sapper_routing import RoutingLedger
+        if not parent:
+            raise WorkspaceError("routing 需要当前受管角色身份")
+        operation = args.target or "view"
+        eid = args.event_id or args.body or ""
+        ledger = RoutingLedger(app.state, wid)
+        if operation in ("claim", "close", "reassign", "destroy"):
+            if not eid:
+                raise WorkspaceError("routing %s 需要 event_id" % operation)
+            resolves = args.resolves_event or eid
+            destroyed = None
+            if operation == "claim":
+                ledger.claim(eid, parent)
+            elif operation == "close":
+                ledger.close(eid, resolves_event_id=resolves, actor=parent)
+            elif operation == "destroy":
+                # Frozen spec v1.0 二: task completion / destruction timing and
+                # action are decided by the DIRECT superior and triggered by it.
+                # The control plane only checks the chain and performs the
+                # physical reap; it never interprets why the superior decided.
+                event = ledger.view(eid)
+                source = event.get("source_agent_id")
+                if not source:
+                    raise WorkspaceError("事件无来源角色，无法销毁", 409)
+                relation = manager.check_command_relation(manager.agent(source), parent)
+                if relation != "down":
+                    raise WorkspaceError("只有直属上级可以销毁该 Worker", 403)
+                ledger.close(eid, resolves_event_id=resolves, actor=parent)
+                destroyed = manager.stop_agent(source)
+            else:
+                if not args.target_agent:
+                    raise WorkspaceError("routing reassign 需要 --to <agent-id>")
+                ledger.reassign(eid, resolves_event_id=resolves, actor=parent,
+                                new_owner_id=args.target_agent)
+            app.audit("routing.confirmed", workspace=wid, event=eid,
+                      operation=operation, actor=parent,
+                      destroyed=destroyed["agent"] if isinstance(destroyed, dict) and destroyed.get("agent") else None)
+            if destroyed is not None:
+                print(json.dumps({"event": ledger.view(eid), "destroyed": destroyed}, ensure_ascii=False))
+                return 0
+        elif operation == "trace":
+            if not eid:
+                raise WorkspaceError("routing trace 需要 event_id")
+            print(json.dumps(ledger.trace(eid), ensure_ascii=False))
+            return 0
+        elif operation != "view":
+            raise WorkspaceError("不支持的 routing 操作")
+        print(json.dumps(ledger.view(eid) if eid else {"pending": ledger.due()}, ensure_ascii=False))
         return 0
     if args.action == "list":
         rows, seen = [], set()
@@ -1458,7 +1624,7 @@ def worker(argv):
             selection = {"profile_id": chosen["id"]}
         run = manager.create_session(candidates[0]["id"], {
             "role": role, "parent_agent_id": parent,
-            "execution_mode": "print" if args.p else "tui", "minutes": args.minutes if args.minutes is not None else 10,
+            "execution_mode": "print" if args.p else default_execution_mode(role, manager.capabilities()), "minutes": args.minutes if args.minutes is not None else 10,
             "task_label": args.task_label, "mission": args.mission, "from": args.from_ids, "intent_id": args.intent, "name": args.name or "",
             **selection,
             "request_id": args.request_id or uuid.uuid4().hex,
@@ -1515,7 +1681,7 @@ def worker(argv):
             raise WorkspaceError("本地工作区没有平台实例，不执行 --close 或自动交卷")
         print(json.dumps(manager.stop_agent(a["id"])))
     elif args.action == "msg":
-        result = manager.message(a["id"], {"text": args.body or "", "sender_id": parent},
+        result = manager.message(a["id"], {"text": args.body or ""}, sender_id=parent,
                                  kind="report" if reporting_up else "command")
         print(json.dumps(result, ensure_ascii=False))
     elif args.action == "peek":
@@ -1570,7 +1736,7 @@ def watch():
             if a.get("desired_state") != "running":
                 continue
             if a.get("pane_id"):
-                if a.get("execution_mode") == "tui":
+                if a.get("execution_mode") in ("tui", "chat"):
                     try:
                         app.workspaces.worker.tick(a["id"], rows)
                         line = status_log.line(a["id"], app.workspaces.worker.view(a["id"]))

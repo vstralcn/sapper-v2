@@ -1,12 +1,14 @@
-"""Authenticated terminal transport over SSE output and literal HTTP input.
+"""Structured-output stream transport over SSE and literal HTTP input.
 
-The PTY remains owned by tmux. Existing external pipe-pane subscriptions are
-never replaced; those panes use an explicitly labelled snapshot fallback.
+Frozen spec v1.0: there is no tmux and no PTY.  A "pane" here is a presentation
+shim over a managed headless run.  Output is the run's structured stdout file;
+input is delivered to that run's ChatJournal or as a control signal.  The wire
+protocol stays compatible with the existing xterm frontend until the phase-4 UI
+switch, but no terminal state is invented or injected into an agent context.
 """
 import base64
 import contextlib
 import json
-import shlex
 import time
 
 from sapper_workspace import WorkspaceError
@@ -17,77 +19,76 @@ class TerminalBridge:
     def __init__(self, app):
         self.app = app
 
+    def _run(self, pane):
+        rid = pane[4:] if pane.startswith("run-") else pane
+        try:
+            info = self.app.run_info(rid)
+        except Exception as exc:
+            raise WorkspaceError("终端不存在或已结束", 404) from exc
+        return rid, info
+
     def dimensions(self, pane):
-        self.app.pane(pane)
-        result = self.app.tmux("display-message", "-p", "-t", pane,
-                               "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y} #{pane_pid} #{pane_pipe} #{window_panes}")
-        if result.returncode:
-            raise WorkspaceError("终端已结束", 404)
-        cols, rows, x, y, pid, pipe, count = result.stdout.strip().split()
-        return {"cols": int(cols), "rows": int(rows), "x": int(x), "y": int(y),
-                "pid": pid, "pipe": pipe == "1", "pane_count": int(count)}
+        from sapper_web import read_json
+        rid, _ = self._run(pane)
+        stored = read_json(self.app.run_path(rid) / "terminal-dims.json", {})
+        # No PTY: logical dimensions are presentation-only state.
+        return {"cols": int(stored.get("cols", 80)), "rows": int(stored.get("rows", 24)),
+                "x": 0, "y": 0, "pid": "0", "pipe": True, "pane_count": 1}
 
     def prepare(self, pane):
-        owner = self.app.pane(pane)
-        dims = self.dimensions(pane)
-        for path in (self.app.state / "runs").glob("*/run.json"):
-            run = json.loads(path.read_text())
-            if run.get("session") == owner["session"]:
-                return {"path": path.parent / "output.log", "owned": True, "mode": "stream", **dims}
-        stream_dir = self.app.state / "terminal-streams"
-        stream_dir.mkdir(exist_ok=True, mode=0o700)
-        path = stream_dir / f"pane-{pane[1:]}-{dims['pid']}.log"
-        if dims["pipe"]:
-            # Reuse only our own manifest for this exact pane process.
-            if path.exists():
-                return {"path": path, "owned": False, "mode": "stream", **dims}
-            return {"path": None, "owned": False, "mode": "snapshot", **dims}
-        path.touch(mode=0o600)
-        result = self.app.tmux("pipe-pane", "-o", "-t", pane, "exec cat >> " + shlex.quote(str(path)))
-        if result.returncode:
-            raise WorkspaceError("无法采集原终端输出", 409)
-        return {"path": path, "owned": False, "mode": "stream", **dims}
+        rid, info = self._run(pane)
+        return {"path": self.app.run_path(rid) / "output.log", "owned": True,
+                "mode": "stream", **self.dimensions(pane)}
 
     def input(self, pane, data):
-        owner = self.app.pane(pane)
         value = data.get("data")
         if not isinstance(value, str) or not value or len(value) > 32768 or "\x00" in value:
             raise WorkspaceError("终端输入不正确")
         if "\x03" in value or value == "\x1b":
-            self.app.workspaces.pause_commander_input(owner)
-        result = self.app.tmux("send-keys", "-t", pane, "-l", "--", value)
-        if result.returncode:
-            raise WorkspaceError("终端已结束", 409)
-        # Do not record typed text or passwords in the management audit.
+            # A native interrupt is also an explicit pause of commander turns.
+            # Work from the pane dict so this guard never needs a live run.
+            self.app.workspaces.pause_commander_input(self.app.pane(pane))
+            return {"status": "interrupted"}
+        rid, info = self._run(pane)
+        if info.get("execution_mode") == "chat" and info.get("agent_id"):
+            from sapper_chat import ChatJournal
+            ChatJournal(self.app.state, info["agent_id"]).enqueue(value)
+        else:
+            # Non-chat runs receive literal input through the run's inbox, which
+            # the supervisor relays into the child's stdin pipe.
+            inbox = self.app.run_path(rid) / "stdin-inbox"
+            with inbox.open("ab") as handle:
+                handle.write(value.encode("utf-8"))
         return {"status": "sent"}
 
     def resize(self, pane, data):
-        dimensions = self.dimensions(pane)
         cols, rows = data.get("cols"), data.get("rows")
         if (isinstance(cols, bool) or isinstance(rows, bool) or not isinstance(cols, int)
                 or not isinstance(rows, int) or not 20 <= cols <= 400 or not 5 <= rows <= 150):
             raise WorkspaceError("终端尺寸不正确")
-        if dimensions["pane_count"] != 1:
-            raise WorkspaceError("该窗口有多个 pane，保留原布局；请使用原 tmux 调整", 409)
-        window = self.app.tmux("display-message", "-p", "-t", pane, "#{window_id}").stdout.strip()
-        result = self.app.tmux("resize-window", "-t", window, "-x", str(cols), "-y", str(rows))
-        if result.returncode:
-            raise WorkspaceError("终端尺寸调整失败", 409)
+        # No PTY to resize; dimensions are presentational state only.
+        rid, _ = self._run(pane)
+        from sapper import atomic_write_json
+        atomic_write_json(self.app.run_path(rid) / "terminal-dims.json", {"cols": cols, "rows": rows})
         return {"cols": cols, "rows": rows}
 
     def snapshot(self, pane):
-        result = self.app.tmux("capture-pane", "-p", "-e", "-t", pane)
-        if result.returncode:
-            raise WorkspaceError("终端已结束", 404)
-        return {"text": self.app.redact(result.stdout), **self.dimensions(pane)}
+        path = self.prepare(pane)["path"]
+        text = ""
+        if path.exists():
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - 200 * 1024))
+                text = handle.read().decode("utf-8", "replace")
+        return {"text": self.app.redact(text), **self.dimensions(pane)}
 
     def stream(self, handler, pane, session, cursor=""):
         with self.app.lock:
             source = self.prepare(pane)
         path = source["path"]
-        # A stream ID includes the pane process and log name. A cursor from a
-        # reused tmux pane/server can never accidentally skip another session.
-        stream_id = f"{source['pid']}-{path.parent.name if path else 'snapshot'}"
+        rid = pane[4:] if pane.startswith("run-") else pane
+        # A cursor is scoped to one run so a reused ID can never skip another
+        # session's output.
+        stream_id = "run-%s" % rid
         previous = handler.headers.get("Last-Event-ID") or cursor
         offset = 0
         continuing = False
@@ -95,7 +96,7 @@ class TerminalBridge:
             with contextlib.suppress(ValueError):
                 offset = int(previous.rsplit(":", 1)[1])
                 continuing = offset >= 0
-        size = path.stat().st_size if path and path.exists() else 0
+        size = path.stat().st_size if path.exists() else 0
         if offset > size:
             continuing = False
         handler.send_response(200)
@@ -113,43 +114,30 @@ class TerminalBridge:
         try:
             send({"type": "mode", "mode": source["mode"], "cols": source["cols"], "rows": source["rows"]})
             if not continuing:
-                if source["owned"] and size <= 2 * 1024 * 1024:
+                if size <= 2 * 1024 * 1024:
                     offset = 0
                     send({"type": "reset"})
                 else:
                     offset = size
                     send({"type": "snapshot", **self.snapshot(pane)}, f"{stream_id}:{offset}")
-            previous_snapshot = None
             heartbeat = time.monotonic()
             last_check = 0
-            # Persistent sessions are loaded as fresh records, not shared objects.
-            # Recheck on each cycle so logout, reset and expiry also close SSE.
             while handler.session() == session:
-                if source["mode"] == "snapshot":
-                    snap = self.snapshot(pane)
-                    if snap["text"] != previous_snapshot:
-                        send({"type": "snapshot", **snap})
-                        previous_snapshot = snap["text"]
-                    time.sleep(0.8)
+                with path.open("rb") as file:
+                    file.seek(offset)
+                    chunk = file.read(65536)
+                if chunk:
+                    offset += len(chunk)
+                    send({"type": "output", "data": base64.b64encode(chunk).decode()}, f"{stream_id}:{offset}")
                 else:
-                    with path.open("rb") as file:
-                        file.seek(offset)
-                        chunk = file.read(65536)
-                    if chunk:
-                        offset += len(chunk)
-                        send({"type": "output", "data": base64.b64encode(chunk).decode()}, f"{stream_id}:{offset}")
-                    else:
-                        time.sleep(0.08)
+                    time.sleep(0.08)
                 now = time.monotonic()
                 if now - last_check > 1:
                     try:
-                        current = self.dimensions(pane)
-                        if current["pid"] != source["pid"]:
-                            break
+                        if self.app.run_info(rid)["status"] in self.app_finished():
+                            if not chunk:
+                                break
                     except WorkspaceError:
-                        # The final log chunk may arrive just after the PTY exits.
-                        if path and path.exists() and path.stat().st_size > offset:
-                            continue
                         break
                     last_check = now
                 if now - heartbeat >= 10:
@@ -159,3 +147,8 @@ class TerminalBridge:
             send({"type": "ended"})
         except (AuthError, BrokenPipeError, ConnectionResetError, OSError, WorkspaceError):
             pass
+
+    @staticmethod
+    def app_finished():
+        from sapper_web import FINISHED
+        return FINISHED

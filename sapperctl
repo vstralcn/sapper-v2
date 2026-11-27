@@ -221,15 +221,27 @@ def launch_web(state, config):
 
 
 def live_runs(state, config):
-    records = [read_json(p) for p in (state / "runs").glob("*/run.json")]
-    if not records:
+    """Live runs are those whose managed host PID still matches its recorded birth."""
+    from sapper_processes import process_table
+    try:
+        rows = process_table()
+    except (OSError, ValueError, subprocess.SubprocessError):
         return []
-    args = ["tmux", "-L", config["socket"], "list-sessions", "-F", "#{session_name}"]
-    result = subprocess.run(args, capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}, timeout=10)
-    if result.returncode and not any(s in result.stderr for s in ("no server running", "No such file or directory", "no sessions")):
-        raise RuntimeError(f"无法核实 tmux 会话：{result.stderr.strip()}")
-    sessions = set(result.stdout.splitlines())
-    return [r for r in records if r["session"] == "sapper-web-" + r["id"] and r["session"] in sessions]
+    live = []
+    for path in (state / "runs").glob("*/run.json"):
+        record = read_json(path, {})
+        host_path = path.parent / "host.json"
+        if not host_path.exists():
+            continue  # legacy run predating the headless host
+        try:
+            host = read_json(host_path, {})
+        except (OSError, ValueError):
+            continue
+        pid, birth = host.get("pid"), host.get("birth")
+        row = rows.get(pid) if isinstance(pid, int) else None
+        if row and (not birth or row["birth"] == birth) and record.get("status") not in FINISHED:
+            live.append(record)
+    return live
 
 
 def stop_managed(state, config):
@@ -244,11 +256,11 @@ def stop_managed(state, config):
             for run in sorted(runs, key=lambda r: r.get("role") != "watchdog"):
                 if run["status"] not in FINISHED:
                     app.stop(run["id"])
-                else:
-                    # A finished runner can leave a dead/remain-on-exit pane.
-                    app.tmux("kill-session", "-t", "=" + run["session"])
+            # Physically reap every managed host record, including finished runs
+            # that may have left orphan tool processes.
+            app.stop_all_runs()
             if live_runs(state, config):
-                raise RuntimeError("仍有受管 tmux 会话，模型桥保留；可重新执行 stop。")
+                raise RuntimeError("仍有受管无头进程，模型桥保留；可重新执行 stop。")
     for bridge in sapper_models.bridge_operation(state):
         sapper_models.bridge_operation(state, bridge["id"])
     for ready in (state / "model-bridges").glob("*/ready.json"):
@@ -318,7 +330,7 @@ def main():
             pids = web_pids(state, config)
             print("Web：" + (", ".join(map(str, pids)) if pids else "未发现匹配进程"))
             print(f"目录：{state}\n地址：http://127.0.0.1:{config['port']}/")
-            print(f"受管 tmux 会话：{len(live_runs(state, config))}（socket {config['socket']}）")
+            print(f"受管无头进程：{len(live_runs(state, config))}（socket {config['socket']}）")
             print(f"在线模型桥：{len(sapper_models.bridge_operation(state))}")
             return
         if args.action in ("restart", "stop", "stop-web"):
