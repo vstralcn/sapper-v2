@@ -42,6 +42,7 @@ from sapper_native import NativeSurface, NativeError
 from sapper_permission_audit import FIELDS as PERMISSION_AUDIT_FIELDS
 from sapper_extensions import ExtensionError, clean_environment, api_environment
 import sapper_models
+from sapper_turns import iter_frames, read_events
 from sapper_auth import AuthError, AuthStore, SESSION_SECONDS, manage_credentials
 
 REPO = Path(__file__).resolve().parent.parent
@@ -82,6 +83,18 @@ def require_text(data, key, limit=20000, default=None):
 def number(data, key, default, low, high):
     value = data.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise WebError(f"{key} 必须在 {low}–{high} 之间")
+    return value
+
+
+def query_number(raw, key, default, low, high):
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise WebError(f"{key} 必须是整数")
+    if not low <= value <= high:
         raise WebError(f"{key} 必须在 {low}–{high} 之间")
     return value
 
@@ -911,6 +924,29 @@ class Console:
         birth = record.get("birth")
         return bool(birth) and row["birth"] == birth
 
+    @staticmethod
+    def _close_orphan_turn(directory, info):
+        """Crash takeover: a dead supervisor cannot settle its own turn."""
+        if not (directory / "frames.jsonl").exists() or not (directory / "turns.jsonl").exists():
+            return
+        from sapper_turns import TurnStream
+        try:
+            stream = TurnStream(directory)
+            if stream.settled:
+                return
+            status = info.get("status") or info.get("stop_reason") or ""
+            if status in ("timed_out", "startup_timeout"):
+                terminal = "timeout"
+            elif status == "crashed":
+                terminal = "crashed"
+            elif status in ("stopped", "interrupted"):
+                terminal = "interrupted"
+            else:
+                terminal = "failed"
+            stream.settle(terminal)
+        except (OSError, ValueError):
+            pass
+
     def runs(self, pid=None, *, reconcile=True):
         result = []
         keys = self.redaction_keys()
@@ -926,6 +962,7 @@ class Console:
                         if current["status"] not in FINISHED:
                             current.update(status=current.get("stop_reason", "interrupted"), ended_at=sapper.now_iso())
                             private_json(path, current)
+                            self._close_orphan_turn(path.parent, current)
             info = self.run_info(info["id"], redaction_keys=keys)
             result.append(json.loads(self.redact(json.dumps(info, ensure_ascii=False), keys=keys)))
         route_due_events(self.state)
@@ -1180,9 +1217,50 @@ class Console:
         self.audit("run.stopped", run=rid)
         return info
 
+    @staticmethod
+    def _render_turn_event(event):
+        kind = event.get("type")
+        if kind == "tool_call":
+            detail = json.dumps({"name": event.get("name"), "input": event.get("input", {})},
+                                ensure_ascii=False)
+        elif kind == "tool_result":
+            detail = event.get("text") or event.get("attachment_path") or json.dumps(
+                {"media": event.get("media", []), "total_bytes": event.get("total_bytes", 0),
+                 "total_lines": event.get("total_lines", 0)}, ensure_ascii=False)
+        elif kind == "turn_settlement":
+            detail = json.dumps({"terminal_state": event.get("terminal_state"),
+                                 "usage": event.get("usage", {}),
+                                 "result": event.get("result_preview", "")}, ensure_ascii=False)
+        else:
+            detail = event.get("text", "")
+        return "[%s turn=%s seq=%s] %s" % (kind, event.get("turn_id"), event.get("seq"), detail)
+
+    def _turn_log_text(self, directory):
+        events = []
+        after = 0
+        while True:
+            page = read_events(directory / "turns.jsonl", after, 1000)
+            events.extend(page["events"])
+            if not page["has_more"] or not page["events"]:
+                break
+            after = page["next_after_seq"]
+        return "\n".join(self._render_turn_event(event) for event in events)
+
     def log(self, rid, offset=0):
         info = self.run_info(rid)
         directory = self.run_path(rid)
+        if (directory / "turns.jsonl").exists():
+            # Frozen spec v1.0 阶段三: for structured runs the normalized event
+            # stream is the only consumed source, even through the old read API.
+            raw = self._turn_log_text(directory).encode("utf-8")
+            size = len(raw)
+            offset = min(max(0, offset), size)
+            chunk = raw[offset:offset + 128 * 1024]
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            decoded = decoder.decode(chunk, final=info["status"] in FINISHED and offset + len(chunk) >= size)
+            pending = decoder.getstate()[0]
+            return {"text": self.redact(ANSI.sub("", decoded)),
+                    "offset": offset + len(chunk) - len(pending), "size": size}
         path = directory / "activity.log"
         if not path.exists():
             path = directory / "output.log"
@@ -1200,6 +1278,15 @@ class Console:
         pending = decoder.getstate()[0]
         return {"text": self.redact(ANSI.sub("", decoded)),
                 "offset": offset + len(chunk) - len(pending), "size": size}
+
+    def turn_events(self, rid, after_seq=0, limit=None):
+        """Stage three canonical read: strict seq cursor over turns.jsonl."""
+        self.run_info(rid)
+        # Same credential boundary as the legacy log: disk keeps the original
+        # payload, but every read API must redact configured secrets.
+        keys = self.redaction_keys()
+        result = read_events(self.run_path(rid) / "turns.jsonl", after_seq, limit)
+        return json.loads(self.redact(json.dumps(result, ensure_ascii=False), keys=keys))
 
     def file(self, pid, relative):
         project_dir = Path(self.project(pid)["path"])
@@ -1445,7 +1532,10 @@ def run_child(directory):
                       generation=generation)
     if info.get("output_format") == "stream-json":
         from sapper_run import RunOutput
-        output = RunOutput(directory, private_json)
+        # Frozen spec v1.0 阶段三: only the bidirectional headless (chat) mode
+        # joins the structured contract.  One-way print runs keep their log.
+        output = RunOutput(directory, private_json,
+                           structured=info.get("execution_mode") == "chat")
 
     def note(message):
         # Frozen spec v1.0 二: stdout is reserved for the structured NDJSON
@@ -1467,22 +1557,41 @@ def run_child(directory):
 
     def relay():
         try:
-            for line in child.stdout:
+            # Frozen spec v1.0 三: a single oversized protocol frame must not be
+            # truncated by line buffering; unterminated tail fragments are
+            # isolated into diagnostics instead of entering the ledger.
+            for line in iter_frames(child.stdout):
+                if not line.endswith(b"\n"):
+                    if output and output.structured:
+                        output.stream.diagnose(line, "crash_fragment", "stdout")
+                    continue
+                event = None
+                if output and output.structured:
+                    # Validate before forwarding: protocol noise must not reach
+                    # the host stdout capture (output.log) or the old /log read
+                    # path. It is isolated into diagnostics only.
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        event = None
+                    if not (isinstance(event, dict) and isinstance(event.get("type"), str)):
+                        output.stream.diagnose(line, "invalid_json" if event is None else "not_a_protocol_frame", "stdout")
+                        continue
                 sys.stdout.buffer.write(line)
                 sys.stdout.buffer.flush()
                 output.observe(line)
-                if output or journal:
+                if event is None and (output or journal):
                     try:
                         event = json.loads(line)
                     except (ValueError, UnicodeError):
                         continue
-                    # Any valid structured frame proves the headless CLI is
-                    # alive and speaking the protocol — the readiness floor for
-                    # STARTUP_TIMEOUT (system/init is the stronger signal).
-                    if isinstance(event, dict):
-                        process_ready.set()
+                # Any valid structured frame proves the headless CLI is alive
+                # and speaking the protocol — the readiness floor for
+                # STARTUP_TIMEOUT (system/init is the stronger signal).
+                if isinstance(event, dict):
+                    process_ready.set()
                 if journal:
-                    journal.receive(info["id"], info["claude_session_id"], event)
+                    journal.receive(info["id"], info.get("claude_session_id", ""), event)
                     # Frozen spec v1.0 二: only an ack echoed with the current
                     # generation may mark the process ready; a late ack from a
                     # superseded generation is discarded.
@@ -1706,6 +1815,7 @@ def run_child(directory):
             # Frozen spec v1.0 三/四: classify STARTUP_TIMEOUT vs CRASHED for
             # host-backed runs and route the event before persisting the final
             # status.  Legacy tmux runs have no host.json -> no classification.
+            verdict = None
             try:
                 last_heartbeat = read_json(directory / "activity.json", {}).get("last_event_at")
                 # Frozen spec v1.0 三: readiness is a real protocol signal, never
@@ -1726,6 +1836,25 @@ def run_child(directory):
                     info["failure_evidence"] = verdict.get("evidence")
             except (OSError, ValueError, RuntimeError) as exc:
                 note("[sapper-web] 故障上报失败：" + str(exc))
+            # Frozen spec v1.0 阶段三: never leave a zombie in-progress turn.
+            # A normal result frame already settled the turn; every other exit
+            # path must synthesize an explicit abnormal terminal state.
+            if output and not output.settled:
+                status = verdict.get("status") if isinstance(verdict, dict) else None
+                if reason == "timed_out" or status == "startup_timeout":
+                    terminal = "timeout"
+                elif status == "crashed":
+                    terminal = "crashed"
+                elif reason in ("stopped", "interrupted"):
+                    terminal = "interrupted"
+                elif rc not in (0, None):
+                    terminal = "failed"
+                else:
+                    terminal = "completed"
+                try:
+                    output.settle(terminal)
+                except (OSError, ValueError) as exc:
+                    note("[sapper-web] 异常轮次结算补写失败：" + str(exc))
             private_json(directory / "run.json", info)
         # Credential-bearing launch data is no longer needed after this command.
         with contextlib.suppress(FileNotFoundError):
@@ -2027,6 +2156,10 @@ class Handler(BaseHTTPRequestHandler):
                         return self.reply(200, text, "text/plain; charset=utf-8", headers={
                             "Content-Disposition": f'attachment; filename="sapper-{rid}.log"'})
                     return self.reply(200, app.log(rid, int(q("offset", "0"))))
+                if len(parts) == 5 and parts[4] == "turns" and method == "GET":
+                    after_seq = query_number(q("after_seq"), "after_seq", 0, 0, 2 ** 31 - 1)
+                    limit = query_number(q("limit"), "limit", None, 1, 1000)
+                    return self.reply(200, app.turn_events(rid, after_seq, limit))
             if path == "/api/knowledge" and method == "GET":
                 kb = KnowledgeBase.default_root()
                 knowledge = KnowledgeBase(kb)

@@ -257,9 +257,24 @@ class ChatJournal:
                                        "runId": rid, "generation": data.get("generation", 0)},
                                       ensure_ascii=False) + "\n")
             if kind == "user":
-                for item in data["messages"]:
-                    if item["id"] == event.get("uuid"):
-                        item["status"] = "accepted"
+                # Frozen spec v1.0 阶段三: a tool_result-only user frame is not
+                # a real user message.  It must never produce an "accepted"
+                # receipt, even when its uuid matches a queued message.
+                message = event.get("message") or {}
+                blocks = message.get("content", []) if isinstance(message, dict) else []
+                if isinstance(blocks, str):
+                    blocks = [{"type": "text", "text": blocks}]
+                if not isinstance(blocks, list):
+                    blocks = []
+                has_user_text = any(
+                    isinstance(block, dict) and block.get("type") == "text"
+                    and isinstance(block.get("text"), str) and block["text"].strip()
+                    for block in blocks
+                )
+                if has_user_text:
+                    for item in data["messages"]:
+                        if item["id"] == event.get("uuid"):
+                            item["status"] = "accepted"
             elif kind == "assistant":
                 msg = event.get("message") or {}
                 blocks = msg.get("content", [])

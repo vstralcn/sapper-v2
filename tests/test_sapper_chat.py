@@ -100,6 +100,21 @@ class JournalTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "问题已结束"):
             self.journal.answer("q", rid, answers={"Which?":"B"})
 
+    def test_tool_result_only_user_frame_never_acknowledges_delivery(self):
+        rid, sid = "b" * 16, "session-1"
+        self.journal.begin(rid, "goal")
+        mid = str(uuid.uuid4())
+        self.journal.enqueue("real user message", mid)
+        self.journal.outgoing(rid)
+        self.journal.receive(rid, sid, {"type": "user", "uuid": mid, "message": {
+            "role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "tool output"}]}})
+        status = next(m["status"] for m in self.journal.view()["messages"] if m["id"] == mid)
+        self.assertEqual(status, "sending")
+        self.journal.receive(rid, sid, {"type": "user", "uuid": mid, "message": {
+            "role": "user", "content": [{"type": "text", "text": "real user message echoed"}]}})
+        status = next(m["status"] for m in self.journal.view()["messages"] if m["id"] == mid)
+        self.assertEqual(status, "accepted")
+
     def test_inbox_is_private_and_pagination_retains_old_messages(self):
         for i in range(105):
             self.journal.enqueue(str(i))
@@ -211,6 +226,12 @@ class ChatLifecycleTests(unittest.TestCase):
         self.app.workspaces._capabilities = None
         run = self.app.workspaces.dispatch(self.pid, {"role":"commander", "execution_mode":"chat", "request_id":str(uuid.uuid4())})
         self.until(lambda: any(m["role"] == "assistant" for m in self.app.workspaces.chat_view(self.pid)["messages"]))
+        # Frozen spec v1.0 阶段三: the commander uses the same structured
+        # contract as workers, with the full envelope on every event.
+        events = self.app.turn_events(run["id"], 0, 1000)["events"]
+        self.assertTrue(any(e["type"] == "assistant_text" for e in events))
+        required = {"schema_version", "seq", "source_frame_seq", "turn_id", "message_id", "timestamp"}
+        self.assertTrue(all(required <= set(e) for e in events))
         return run
 
     def test_commander_always_keeps_approval_channel_across_resume(self):

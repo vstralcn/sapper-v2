@@ -27,6 +27,27 @@ import sapper
 from sapper_web import Console, WebError, WebServer, main, private_json
 
 
+CHAT_HANG_FIXTURE = r'''#!/usr/bin/env python3
+import json,sys,time
+args=sys.argv[1:]
+if '--help' in args:
+    print('--mcp-config --strict-mcp-config --plugin-dir --setting-sources --settings --session-id --resume --add-dir --append-system-prompt --input-format --output-format --replay-user-messages')
+    raise SystemExit(0)
+if '--version' in args:
+    print('2.1.318 (fixture)')
+    raise SystemExit(0)
+sid=args[args.index('--resume' if '--resume' in args else '--session-id')+1]
+def emit(event): print(json.dumps(event,ensure_ascii=False),flush=True)
+emit({'type':'system','subtype':'init','session_id':sid})
+emit({'type':'assistant','message':{'id':'open-turn','content':[{'type':'tool_use','id':'t1','name':'Bash','input':{'command':'sleep'}}]}})
+for line in sys.stdin:
+    frame=json.loads(line)
+    if frame.get('type')=='control_request':
+        emit({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{}}})
+while True: time.sleep(.1)
+'''
+
+
 class WebStartupTests(unittest.TestCase):
     def test_startup_checks_configured_claude_version(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -286,6 +307,56 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(first["text"] + second["text"], expected)
         self.assertEqual(second["offset"], len(expected.encode()))
 
+    def test_structured_reads_redact_configured_credentials(self):
+        rid = "d" * 16
+        directory = self.app.run_path(rid)
+        self.app.save_profile({"name": "t", "model": "m", "api_key": "SECRET_TOKEN_123"})
+        private_json(directory / "run.json", {"id": rid, "status": "exited"})
+        (directory / "frames.jsonl").touch()
+        (directory / "turns.jsonl").write_text(json.dumps({
+            "schema_version": 1, "seq": 1, "source_frame_seq": 1, "turn_id": 1,
+            "message_id": "m", "type": "assistant_text", "timestamp": "2026-01-01T00:00:00Z",
+            "text": "token=SECRET_TOKEN_123"}) + "\n")
+        self.assertNotIn("SECRET_TOKEN_123", json.dumps(self.app.turn_events(rid, 0, 1000)))
+        rendered = self.app.log(rid)["text"]
+        self.assertIn("token=", rendered)
+        self.assertNotIn("SECRET_TOKEN_123", rendered)
+
+    def test_structured_log_is_rendered_from_events_not_raw_stdout(self):
+        rid = "e" * 16
+        directory = self.app.run_path(rid)
+        private_json(directory / "run.json", {"id": rid, "status": "exited"})
+        (directory / "frames.jsonl").touch()
+        (directory / "turns.jsonl").write_text(json.dumps({
+            "schema_version": 1, "seq": 1, "source_frame_seq": 1, "turn_id": 1,
+            "message_id": "m", "type": "assistant_text", "timestamp": "2026-01-01T00:00:00Z",
+            "text": "结构化正文"}) + "\n")
+        (directory / "output.log").write_text("[noise] should not be consumed\n")
+        rendered = self.app.log(rid)["text"]
+        self.assertIn("结构化正文", rendered)
+        self.assertNotIn("should not be consumed", rendered)
+
+    def test_dead_host_takeover_closes_orphan_turn(self):
+        rid = "f" * 16
+        directory = self.app.run_path(rid)
+        private_json(directory / "run.json", {"id": rid, "project_id": "p", "status": "running",
+                                              "stop_reason": "crashed", "created_at": "2026-01-01T00:00:00Z"})
+        private_json(directory / "host.json", {"pid": 99999999, "birth": " Mon Nov 27 00:00:00 2000",
+                                               "generation": 1, "role": "commander"})
+        (directory / "frames.jsonl").write_text(json.dumps({
+            "type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "x"}],
+                                             "usage": {"input_tokens": 3, "output_tokens": 1}}}) + "\n")
+        (directory / "turns.jsonl").write_text(json.dumps({
+            "schema_version": 1, "seq": 1, "source_frame_seq": 1, "turn_id": 1,
+            "message_id": "m1", "type": "assistant_text", "timestamp": "2026-01-01T00:00:00Z",
+            "text": "x"}) + "\n")
+        record = next(item for item in self.app.runs() if item["id"] == rid)
+        self.assertEqual(record["status"], "crashed")
+        settlement = json.loads((directory / "turns.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(settlement["type"], "turn_settlement")
+        self.assertEqual(settlement["terminal_state"], "crashed")
+        self.assertEqual(settlement["usage"], {"input_tokens": 3, "output_tokens": 1})
+
     def test_run_list_collects_credentials_once_and_refreshes_them_next_batch(self):
         self.app.save_profile({"name": "test", "model": "fixture", "api_key": "fixture-profile-secret"})
         private_json(self.app.state / "agents" / ("b" * 16 + ".json"),
@@ -374,6 +445,31 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.cookie = headers["Set-Cookie"].split(";", 1)[0]
         self.csrf = json.loads(body)["csrf"]
+
+    def test_turns_route_uses_strict_seq_cursor_and_bounded_pages(self):
+        self.login()
+        rid = "c" * 16
+        directory = self.app.run_path(rid)
+        private_json(directory / "run.json", {"id": rid, "status": "exited"})
+        events = [{"schema_version": 1, "seq": number, "source_frame_seq": number,
+                   "turn_id": 1, "message_id": "m", "type": "assistant_text",
+                   "timestamp": "2026-01-01T00:00:00Z", "text": f"t{number}"}
+                  for number in range(1, 6)]
+        (directory / "turns.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+        status, _, body = self.request(f"/api/runs/{rid}/turns?limit=2")
+        self.assertEqual(status, 200, body)
+        page = json.loads(body)
+        self.assertEqual([e["seq"] for e in page["events"]], [1, 2])
+        self.assertEqual(page["next_after_seq"], 2)
+        self.assertTrue(page["has_more"])
+        status, _, body = self.request(f"/api/runs/{rid}/turns?after_seq=2&limit=2")
+        page = json.loads(body)
+        self.assertEqual([e["seq"] for e in page["events"]], [3, 4])
+        status, _, body = self.request(f"/api/runs/{rid}/turns?after_seq=4")
+        page = json.loads(body)
+        self.assertEqual([e["seq"] for e in page["events"]], [5])
+        self.assertFalse(page["has_more"])
+        self.assertEqual(self.request(f"/api/runs/{rid}/turns?limit=0")[0], 400)
 
     def test_staged_uploads_follow_only_the_creating_workspace(self):
         self.login()
@@ -818,10 +914,35 @@ class TmuxTests(unittest.TestCase):
     def finished(self, rid):
         return self.until(lambda: (r if (r := self.app.run_info(rid))["status"] in {"exited", "failed", "stopped", "timed_out"} else None))
 
+    def turn_events(self, rid):
+        return self.app.turn_events(rid, 0, 1000)["events"]
+
     def print_run(self, code, timeout=1):
         return self.app.start(self.pid, {"kind": "claude-native"}, native={
             "argv": [sys.executable, "-u", "-c", code], "cwd": self.project["path"],
             "execution_mode": "print", "output_format": "stream-json", "timeout_seconds": timeout})
+
+    def chat_run(self, code, timeout=1):
+        with mock.patch.dict(os.environ, {"SAPPER_WEB_STATE": str(self.app.state)}):
+            return self.app.start(self.pid, {"kind": "claude-native"}, native={
+                "argv": [sys.executable, "-u", "-c", code, "--session-id", "chat-fixture-session"],
+                "cwd": self.project["path"],
+                "agent_id": "c" * 16, "claude_session_id": "chat-fixture-session",
+                "execution_mode": "chat", "output_format": "stream-json",
+                "timeout_seconds": timeout})
+
+    def test_chat_turn_is_closed_after_forced_timeout(self):
+        run = self.chat_run(CHAT_HANG_FIXTURE, timeout=0.6)
+        rid = run["id"]
+        info = self.finished(rid)
+        self.assertEqual(info["status"], "timed_out")
+        events = self.turn_events(rid)
+        self.assertTrue(any(e["type"] == "tool_call" for e in events))
+        settlement = events[-1]
+        self.assertEqual(settlement["type"], "turn_settlement")
+        self.assertEqual(settlement["terminal_state"], "timeout")
+        self.assertFalse(settlement["authoritative"])
+        self.assertFalse((self.app.run_path(rid) / "activity.log").exists())
 
     def test_stream_activity_and_live_extension_survive_original_deadline_and_reload(self):
         code = """import json,signal,time
@@ -849,6 +970,10 @@ while True: time.sleep(.1)
         self.assertTrue(stopped["activity"]["result_received"])
         self.assertIn("保存完成", self.app.log(rid)["text"])
         self.until(lambda: '"type": "assistant"' in (self.app.run_path(rid) / "output.log").read_text())
+        # One-way print runs stay on the legacy readable log; the new contract
+        # is reserved for bidirectional chat runs.
+        self.assertTrue((self.app.run_path(rid) / "activity.log").exists())
+        self.assertFalse((self.app.run_path(rid) / "turns.jsonl").exists())
 
     def test_timeout_interrupt_preserves_final_result_and_file_without_killing_other_panes(self):
         marker = self.base / "checkpoint.txt"
@@ -886,10 +1011,11 @@ while True:
     Path({str(marker)!r}).write_text(str(time.time()))
     time.sleep(.1)
 """
-        code = f"""import signal,time,subprocess,sys
+        code = f"""import json,signal,time,subprocess,sys
 signal.signal(signal.SIGINT,signal.SIG_IGN)
 signal.signal(signal.SIGTERM,signal.SIG_IGN)
 subprocess.Popen([sys.executable,'-u','-c',{tool!r}])
+print(json.dumps({{'type':'assistant','message':{{'content':[{{'type':'tool_use','id':'t','name':'Bash','input':{{}}}}]}}}}),flush=True)
 print('uncooperative fixture ready',flush=True)
 while True: time.sleep(.1)
 """
@@ -904,6 +1030,9 @@ while True: time.sleep(.1)
         saved = marker.read_text()
         time.sleep(0.3)
         self.assertEqual(marker.read_text(), saved)
+        # One-way print runs keep their legacy raw stdout capture and readable
+        # log; the structured contract does not apply to them.
+        self.assertIn("uncooperative fixture ready", (self.app.run_path(rid) / "output.log").read_text())
         self.assertIn("SIGTERM", self.app.log(rid)["text"])
 
     def test_original_dispatch_is_used_with_per_run_model_profile(self):
