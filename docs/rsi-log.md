@@ -69,3 +69,19 @@
 - **实际改动**　`lib/sapper_commander.py` 新增 `WorkerMonitor`，状态独立保存在 Web 私有目录 `worker-monitor/`。它复用原生 JSONL 增量观测，仅对 `isApiErrorMessage` 后的空闲且空输入框发送关联唤醒。提示让 worker 依据原 mission、当前 intent、共享图和已有产物，自主选择并立即执行一个具体工具动作；对应唤醒后的真实 `tool_use` 才确认 `work_confirmed`。无响应或再次失败按 120／240／480 秒退避，封顶 900 秒，无永久停发上限；真实用户输入优先。`lib/sapper_workspace.py` 将在线受管 TUI worker 接入现有 watch 循环，崩溃重启路径保持不变。
 - **验证与结果**　`tests/test_sapper_worker_recovery.py` 新增 8 项：正常空闲不唤醒、工具确认、文字承诺不重确认、四次重试无硬上限、工具运行不中断、真实用户优先、未提交输入保护、停止／超时保护及 watch 接线。`tests/test_sapper_workspaces.py` 新增真实 fixture CLI＋tmux＋watchdog 集成：worker 首轮写入 API 错误，watchdog 实际注入一次恢复，收到工具事件后确认，run 与会话未重启。相关 74 项通过；全量 `python3 -m unittest discover -s tests -q` 316 项通过；`git diff --check`、Python 编译及 shell 语法检查通过。
 - **决策与下一轮**　采纳为 workspace 受管 TUI worker 的恢复机制。原比赛 shell 分支、print 和 native_operation 未扩展。尚未验证真实模型长时间运行下的恢复率、误唤醒率及分数收益；下一轮用真实或归档故障序列比较“注入→真实工具→有效 fact／提交”的链路，而不是以发送成功或文字回复作为收益。
+
+### 2026-11-27 · 006 无终端化架构阶段一至四（冻结规范 v1.0）
+
+- **问题与预期**　全部 Claude Code 会话依赖 TUI 与 tmux，传输（send-keys）、唤醒、会话记忆、人工观察都绑在 pane 上，且角色权限与传输方式耦合、兄弟角色可互发消息。预期按《Sapper 无终端化与无头多 Agent 协作架构规范（冻结版 v1.0）》四阶段改造：控制面与上级 Agent 分权，宿主改为 `subprocess.Popen` 无头进程加 stream-json 双向管道，指挥官空闲唤醒与 worker 故障恢复形成闭环，网页端切到结构化轮次视图。
+- **实际改动**
+  - 阶段一、二 `fc3a26e`（阶段一改动并入）：`lib/sapper_workspace.py` 新增 `default_execution_mode()` 单一决策点，chat 模式对所有角色开放并按角色分级权限；新增 `lib/sapper_host.py`（SubprocessHost：独立进程组、代号握手、STARTUP_TIMEOUT／CRASHED、物理回收）与 `lib/sapper_routing.py`（RoutingLedger：event_id 路由、显式确认、超时升级、归属上移）。
+  - 阶段三 `cac8624`：新增 `lib/sapper_turns.py` 结构化轮次流（`frames.jsonl`、`turns.jsonl`、`attachments/`、`diagnostics.jsonl`）与 `GET /api/runs/<rid>/turns`。
+  - 阶段四 `12c5040`：新增 `web/turn-stream.js` 结构化视图与 chat tab，删除 xterm 终端面板、后端 tmux 二进制调用和三个 docker tmux 文件。附带两项修复：`lib/sapper_commander.py` 的 `not_before()` 按整秒比较回显时间与 `sent_at`；`lib/sapper-hook.py` 的 `_managed_messages()` 不再排空 chat 模式 agent 的收件队列。
+- **验证与结果**
+  - 自动化：`python3 -m unittest discover -s tests -p "test_*.py"` 373 项通过，`tests/*.cjs` 通过（2026-11-27）。
+  - 真实 CLI 冒烟（claude 2.1.330 加自有模型网关，supervisor 与 watchdog 均为生产代码）：指挥官唤醒链实测 `wake_sent → responded → board_confirmed`，`last_board.wake_id` 与 wake id 一致。
+  - 同秒回显未复现：6 个样本的回显延迟为 2.9–12.1 秒，全部落在发送的下一秒或更晚，新旧规则都通过。`not_before()` 在生产只是防御性的，它直接解决的是夹具同进程 1ms 回显导致的 4 项失败。
+  - hook 修复经对照确认必要：去掉修复时 worker 的 mission 在 170ms 内由 `queued` 变 `provided`，此后没有任何一轮；保留修复时 `queued → sent → accepted` 并得到模型回复。
+  - 中途撤销的尝试：曾为「外发帧不在 events.jsonl」加 `ChatJournal.record_outgoing()` 镜像外发 user 帧，未进入提交。生产 argv 自带 `--replay-user-messages`，CLI 自己会回显，镜像帧会造成重复并伪造 `input_accepted`。
+  - 待验证：带工具调用的多角色长流程、浏览器可视验收、真实模型长时间运行。
+- **决策与下一轮**　四阶段保留。未纳入本轮的清理项登记为阶段五：`print` 模式仍有活跃调用方未触碰，`docker/commander/*.sh` 内残留 tmux 分支，`worker.sh inbox` 的主动拉取在 chat 模式下仍会排空队列。本轮可复用的教训：夹具的时序不能代表真实 CLI，由夹具现象推出的根因需要真实 CLI 复核后才能写成结论。
